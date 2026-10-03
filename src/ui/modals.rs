@@ -2,7 +2,7 @@ use super::*;
 
 impl GitBuddy {
     pub(super) fn submit_modal(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy() && !matches!(self.modal, Some(Modal::Open | Modal::Init | Modal::Clone)) {
             return;
         }
         let a = self.form_a.read(cx).value().to_string();
@@ -15,41 +15,20 @@ impl GitBuddy {
         match modal {
             Modal::Open | Modal::Init | Modal::Clone => {
                 if a.is_empty() || (matches!(modal, Modal::Clone) && b.is_empty()) {
-                    self.active.notice = "请填写完整的仓库地址 / 路径".into();
-                    self.active.error = true;
+                    self.modal_error = Some("请填写完整的仓库地址 / 路径".into());
                     cx.notify();
                     return;
                 }
-                self.modal = None;
-                let label = if self.active.repo.is_some() {
-                    ""
-                } else {
-                    "Preparing repository…"
-                };
-                self.dispatch(
-                    label,
-                    move |progress| {
-                        let repo = match modal {
-                            Modal::Open => Repository::open(expand_path(&a))?,
-                            Modal::Init => Repository::init(&expand_path(&a))?,
-                            _ => Repository::clone_repo_with_progress(
-                                &a,
-                                &expand_path(&b),
-                                progress,
-                            )?,
-                        };
-                        Loaded::read(
-                            repo,
-                            Selection::Work,
-                            HISTORY_PAGE_SIZE,
-                            "Repository ready".into(),
-                            false,
-                            false,
-                            true,
-                        )
+                self.modal_error = None;
+                let preparation = match modal {
+                    Modal::Open => tasks::Preparation::Open(expand_path(&a)),
+                    Modal::Init => tasks::Preparation::Init(expand_path(&a)),
+                    _ => tasks::Preparation::Clone {
+                        url: a,
+                        destination: expand_path(&b),
                     },
-                    cx,
-                );
+                };
+                self.prepare_repository(preparation, cx);
             }
             Modal::Branch => self.perform(Operation::CreateBranch(a), cx),
             Modal::Tag => self.perform(Operation::Tag(a), cx),
@@ -66,6 +45,7 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        let preparation = matches!(modal, Modal::Open | Modal::Init | Modal::Clone);
         if matches!(modal, Modal::FileTools) {
             return self.file_tools_modal(cx);
         }
@@ -151,6 +131,7 @@ impl GitBuddy {
                     )
                     .child(
                         self.button("modal-close", "×")
+                            .disabled(false)
                             .ghost()
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.modal = None;
@@ -172,7 +153,16 @@ impl GitBuddy {
         if matches!(modal, Modal::Open) {
             card = card.child(
                 self.button("browse", "Browse folders…")
+                    .disabled(false)
                     .on_click(cx.listener(|this, _, _, cx| this.browse(cx))),
+            );
+        }
+        if let Some(error) = &self.modal_error {
+            card = card.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xf0a4aa))
+                    .child(error.clone()),
             );
         }
         let is_compare = matches!(modal, Modal::Compare);
@@ -388,24 +378,26 @@ impl GitBuddy {
             card = card.child(self.compare_choices(cx));
         }
         if !submit.is_empty() {
-            card = card.child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .mt_2()
-                    .child(self.button("cancel", "Cancel").on_click(cx.listener(
-                        |this, _, w, cx| {
-                            this.modal = None;
-                            this.focus.focus(w, cx);
-                            cx.notify();
-                        },
-                    )))
-                    .child(
-                        self.button("submit", submit)
-                            .primary()
-                            .on_click(cx.listener(|this, _, _, cx| this.submit_modal(cx))),
-                    ),
-            );
+            card =
+                card.child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .mt_2()
+                        .child(self.button("cancel", "Cancel").disabled(false).on_click(
+                            cx.listener(|this, _, w, cx| {
+                                this.modal = None;
+                                this.focus.focus(w, cx);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            self.button("submit", submit)
+                                .disabled(self.busy() && !preparation)
+                                .primary()
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_modal(cx))),
+                        ),
+                );
         }
         div()
             .absolute()

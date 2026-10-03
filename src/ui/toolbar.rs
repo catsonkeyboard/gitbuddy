@@ -5,11 +5,14 @@ impl GitBuddy {
         let name = self
             .repo
             .as_ref()
-            .and_then(|r| r.root.file_name())
+            .map(|r| &r.root)
+            .or(self.active.preparing.as_ref())
+            .and_then(|path| path.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "GitBuddy".into());
         let focus = self.focus.clone();
         let has_repo = self.repo.is_some();
+        let busy = self.busy();
         let has_head = self.snapshot.head_id.is_some();
         let has_conflicts = self.snapshot.files.iter().any(|f| f.conflict())
             || self.snapshot.conflict_operation != git::ConflictOperation::None;
@@ -41,6 +44,7 @@ impl GitBuddy {
             )
             .child(
                 self.button("repository-menu", "Repository")
+                    .disabled(false)
                     .ghost()
                     .icon(IconName::ChevronDown)
                     .dropdown_menu(move |menu, _, _| {
@@ -65,45 +69,45 @@ impl GitBuddy {
                                 "Resolve conflicts…",
                                 IconName::FileText,
                                 Box::new(OpenConflicts),
-                                !has_conflicts,
+                                busy || !has_conflicts,
                             )
                             .menu_with_icon_and_disabled(
                                 "File history / Blame…",
                                 IconName::FileText,
                                 Box::new(OpenFileTools),
-                                !has_head,
+                                busy || !has_head,
                             )
                             .menu_with_icon_and_disabled(
                                 "Compare commits / branches…",
                                 IconName::Copy,
                                 Box::new(CompareRevisions),
-                                !has_head,
+                                busy || !has_head,
                             )
                             .separator()
                             .menu_with_icon_and_disabled(
                                 "Amend latest commit…",
                                 IconName::FileText,
                                 Box::new(AmendCommit),
-                                !has_head,
+                                busy || !has_head,
                             )
                             .menu_with_icon_and_disabled(
                                 "Undo latest commit…",
                                 IconName::ArrowLeft,
                                 Box::new(UndoCommit),
-                                !has_head,
+                                busy || !has_head,
                             )
                             .menu_with_icon_and_disabled(
                                 "Reflog / Recover…",
                                 IconName::RotateCw,
                                 Box::new(OpenReflog),
-                                !has_repo,
+                                busy || !has_repo,
                             )
                             .separator()
                             .menu_with_icon_and_disabled(
                                 "Commit identity…",
                                 IconName::User,
                                 Box::new(EditIdentity),
-                                !has_repo,
+                                busy || !has_repo,
                             )
                     }),
             )
@@ -221,8 +225,9 @@ impl GitBuddy {
                         let active = self.active_index == Some(index);
                         let name = tab
                             .repo
-                            .as_ref()?
-                            .root
+                            .as_ref()
+                            .map(|r| &r.root)
+                            .or(tab.preparing.as_ref())?
                             .file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
@@ -230,7 +235,9 @@ impl GitBuddy {
                         let tooltip = tab
                             .repo
                             .as_ref()
-                            .map(|repo| repo.root.display().to_string())
+                            .map(|r| &r.root)
+                            .or(tab.preparing.as_ref())
+                            .map(|path| format!("{}\n{}", path.display(), tab.notice))
                             .unwrap_or_default();
                         Some(
                             h_flex()
@@ -246,6 +253,7 @@ impl GitBuddy {
                                 .when(active, |tab| tab.border_t_2().border_color(rgb(ACCENT)))
                                 .child(
                                     self.button(("repo-tab", index), name)
+                                        .disabled(false)
                                         .ghost()
                                         .flex_1()
                                         .min_w_0()
@@ -254,8 +262,30 @@ impl GitBuddy {
                                             this.activate_tab(index, cx)
                                         })),
                                 )
+                                .when(
+                                    self.tasks.get(tab.id).is_some() || tab.task_finished,
+                                    |row| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(if tab.error {
+                                                    0xf0a4aa
+                                                } else {
+                                                    ACCENT
+                                                }))
+                                                .child(if self.tasks.get(tab.id).is_some() {
+                                                    "◌"
+                                                } else if tab.error {
+                                                    "!"
+                                                } else {
+                                                    "✓"
+                                                }),
+                                        )
+                                    },
+                                )
                                 .child(
                                     self.button(("close-repo-tab", index), "×")
+                                        .disabled(self.tasks.get(tab.id).is_some())
                                         .ghost()
                                         .tooltip("Close repository tab")
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -267,6 +297,7 @@ impl GitBuddy {
             )
             .child(
                 self.button("add-repo-tab", "+")
+                    .disabled(false)
                     .ghost()
                     .tooltip("Open another repository · ⌘O")
                     .on_click(

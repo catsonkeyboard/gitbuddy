@@ -26,7 +26,7 @@ pub(super) struct ConflictViewState {
 }
 impl GitBuddy {
     pub(super) fn open_conflicts(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
-        if self.busy || self.repo.is_none() {
+        if self.busy() || self.repo.is_none() {
             return;
         }
         self.modal = None;
@@ -101,7 +101,7 @@ impl GitBuddy {
         cx.notify();
     }
     fn choose_conflict(&mut self, path: PathBuf, reload: bool, cx: &mut Context<Self>) {
-        if self.busy || self.active.conflicts.loading {
+        if self.busy() || self.active.conflicts.loading {
             return;
         }
         self.active.conflicts.selected = Some(path.clone());
@@ -173,15 +173,15 @@ impl GitBuddy {
         cx.notify();
     }
     fn choose_result(&mut self, choice: ResultChoice, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         let Some(path) = self.active.conflicts.selected.clone() else {
             return;
         };
         let Some(draft) = self.active.conflicts.drafts.get_mut(&path) else {
             return;
         };
-        if self.busy {
-            return;
-        }
         draft.text = match choice {
             ResultChoice::Ours => draft
                 .context
@@ -240,10 +240,10 @@ impl GitBuddy {
         v_flex().flex_1().min_h_0()
             .child(h_flex().h(px(38.)).px_3().gap_2().bg(rgb(PANEL)).border_b_1().border_color(rgb(BORDER))
                 .child(div().flex_1().text_xs().child(format!("{} · {count} unresolved files", operation.label())))
-                .child(self.button("reload-conflicts","Refresh list").ghost().disabled(self.busy).on_click(cx.listener(|this,_,_,cx|this.reload_conflicts(None,cx))))
-                .when(operation.can_continue(), |row| row.child(self.button("continue-conflict",format!("Continue {}…", operation.label())).primary().disabled(self.busy || count != 0 || self.active.conflicts.loading)
+                .child(self.button("reload-conflicts","Refresh list").ghost().disabled(self.busy()).on_click(cx.listener(|this,_,_,cx|this.reload_conflicts(None,cx))))
+                .when(operation.can_continue(), |row| row.child(self.button("continue-conflict",format!("Continue {}…", operation.label())).primary().disabled(self.busy() || count != 0 || self.active.conflicts.loading)
                     .on_click(cx.listener(|this,_,w,cx| { if let Some(session)=this.active.conflicts.session.clone() {this.show_modal(Modal::Confirm(format!("Complete {} using all staged changes?\n\n{}",session.operation.label(),session.message.trim()),Operation::ContinueConflict(session)),w,cx);} }))))
-                .when(operation.can_continue(), |row| row.child(self.button("abort-conflict","Abort…").disabled(self.busy).on_click(cx.listener(|this,_,w,cx| {
+                .when(operation.can_continue(), |row| row.child(self.button("abort-conflict","Abort…").disabled(self.busy()).on_click(cx.listener(|this,_,w,cx| {
                     let op = match this.active.conflicts.session.as_ref().map(|s|s.operation) { Some(git::ConflictOperation::CherryPick)=>Operation::AbortCherryPick,Some(git::ConflictOperation::Revert)=>Operation::AbortRevert,_=>Operation::AbortMerge };
                     this.show_modal(Modal::Confirm("Abort this operation and reset tracked files to HEAD? Saved resolutions and other tracked edits made during the operation will be discarded.".into(),op),w,cx);
                 })))))
@@ -302,21 +302,21 @@ impl GitBuddy {
         v_flex().flex_1().min_w_0().h_full().min_h_0()
             .child(h_flex().px_3().py_1().gap_2().border_b_1().border_color(rgb(BORDER))
                 .child(div().flex_1().min_w_0().truncate().text_sm().child(format!("{}{}",path.display(),if draft.dirty {" · unsaved result"} else {""})))
-                .child(self.button("reload-conflict-file","Reload file").ghost().disabled(self.busy).on_click(cx.listener(move|this,_,_,cx|this.choose_conflict(path.clone(),true,cx)))))
+                .child(self.button("reload-conflict-file","Reload file").ghost().disabled(self.busy()).on_click(cx.listener(move|this,_,_,cx|this.choose_conflict(path.clone(),true,cx)))))
             .child(h_flex().h(px(200.)).w_full().items_start().border_b_1().border_color(rgb(BORDER))
                 .child(conflict_side("Ours · current side",context.ours.as_ref(),"ours-lines",0x2b423d))
                 .child(conflict_side("Base · ancestor",context.base.as_ref(),"base-lines",0x303846))
                 .child(conflict_side("Theirs · incoming side",context.theirs.as_ref(),"theirs-lines",0x44353b)))
             .child(h_flex().px_3().py_1().gap_1().bg(rgb(PANEL))
-                .child(self.button("use-ours",if context.ours.is_some(){"Use ours"}else{"Ours: delete"}).ghost().disabled(self.busy||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Ours,cx))))
-                .child(self.button("use-theirs",if context.theirs.is_some(){"Use theirs"}else{"Theirs: delete"}).ghost().disabled(self.busy||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Theirs,cx))))
-                .child(self.button("use-worktree","Use working file").ghost().disabled(self.busy||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Worktree,cx))))
-                .child(self.button("resolve-deletion","Delete result").ghost().disabled(self.busy||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Delete,cx)))))
+                .child(self.button("use-ours",if context.ours.is_some(){"Use ours"}else{"Ours: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Ours,cx))))
+                .child(self.button("use-theirs",if context.theirs.is_some(){"Use theirs"}else{"Theirs: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Theirs,cx))))
+                .child(self.button("use-worktree","Use working file").ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Worktree,cx))))
+                .child(self.button("resolve-deletion","Delete result").ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Delete,cx)))))
             .child(h_flex().px_3().py_1().gap_2()
                 .child(div().flex_1().text_xs().text_color(rgb(if has_markers {0xe9a3a9}else{MUTED})).child(description))
-                .child(self.button("save-conflict","Save & mark resolved").primary().disabled(self.busy||self.active.conflicts.loading||self.active.conflicts.loading_file||!can_save).on_click(cx.listener(|this,_,w,cx|this.save_conflict(w,cx)))))
+                .child(self.button("save-conflict","Save & mark resolved").primary().disabled(self.busy()||self.active.conflicts.loading||self.active.conflicts.loading_file||!can_save).on_click(cx.listener(|this,_,w,cx|this.save_conflict(w,cx)))))
             .child(if context.editable && !deletion {
-                Editor::new(&self.conflict_editor).aria_label("Conflict result").appearance(false).bordered(false).readonly(self.busy).h(relative(1.)).flex_1().min_h_0().into_any_element()
+                Editor::new(&self.conflict_editor).aria_label("Conflict result").appearance(false).bordered(false).readonly(self.busy()).h(relative(1.)).flex_1().min_h_0().into_any_element()
             } else {
                 div().flex_1().p_3().text_xs().text_color(rgb(MUTED)).child(if deletion {"The file will be removed when you save."}else{"The selected complete version will be saved without text conversion. You can also edit externally, reload, and choose Use working file."}).into_any_element()
             })

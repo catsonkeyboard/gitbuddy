@@ -180,6 +180,7 @@ impl GitBuddy {
                                 .to_string_lossy()
                                 .into_owned(),
                         )
+                        .disabled(false)
                         .ghost()
                         .tooltip(path.display().to_string())
                         .on_click(cx.listener(move |this, _, _, cx| this.open(path.clone(), cx)))

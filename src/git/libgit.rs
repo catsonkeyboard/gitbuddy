@@ -277,51 +277,59 @@ fn hash_worktree_metadata(path: &Path, hasher: &mut impl Hasher) -> Result<()> {
 /// SSH agent / credential helper auth, plus optional transfer progress for
 /// the status bar. Progress messages are rate-limited to one per 100ms so a
 /// fast transfer cannot flood the UI thread.
-fn network_callbacks_with_progress<'a>(progress: Option<ProgressSink>) -> RemoteCallbacks<'a> {
+fn network_callbacks<'a>(control: NetworkControl) -> RemoteCallbacks<'a> {
     let mut callbacks = RemoteCallbacks::new();
-    if let Some(sink) = progress {
-        let sideband_last = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-        let sideband_sink = sink.clone();
-        callbacks.sideband_progress(move |data: &[u8]| {
-            let throttle = {
-                let mut last = sideband_last.lock().unwrap();
-                if last.elapsed() < std::time::Duration::from_millis(100) {
-                    false
-                } else {
-                    *last = std::time::Instant::now();
-                    true
-                }
-            };
-            if throttle && let Ok(mut sink) = sideband_sink.lock() {
-                let text = String::from_utf8_lossy(data);
-                sink(text.trim_end());
-            }
-            true
-        });
-        let transfer_last = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-        let transfer_sink = sink;
-        callbacks.transfer_progress(move |stats: git2::Progress| {
-            let throttle = {
-                let mut last = transfer_last.lock().unwrap();
-                if last.elapsed() < std::time::Duration::from_millis(100) {
-                    false
-                } else {
-                    *last = std::time::Instant::now();
-                    true
-                }
-            };
-            if throttle && let Ok(mut sink) = transfer_sink.lock() {
-                sink(&format!(
-                    "Transfer: {} / {} objects ({})",
-                    stats.received_objects(),
-                    stats.total_objects(),
-                    percent(stats.received_objects(), stats.total_objects())
-                ));
-            }
-            true
-        });
-    }
-    callbacks.credentials(|url, username, allowed| {
+    let sideband = control.clone();
+    callbacks.sideband_progress(move |data| {
+        sideband.progress(String::from_utf8_lossy(data).trim_end());
+        !sideband.cancellation.is_requested()
+    });
+    let transfer = control.clone();
+    let mut first_transfer = true;
+    callbacks.transfer_progress(move |stats| {
+        if first_transfer {
+            first_transfer = false;
+            transfer.phase("Transfer: receiving objects…");
+        }
+        transfer.progress(&format!(
+            "Transfer: {} / {} objects ({})",
+            stats.received_objects(),
+            stats.total_objects(),
+            percent(stats.received_objects(), stats.total_objects())
+        ));
+        !transfer.cancellation.is_requested()
+    });
+    let tips = control.clone();
+    callbacks.update_tips(move |_, _, _| !tips.cancellation.is_requested());
+    let negotiation = control.clone();
+    callbacks.push_negotiation(move |_| {
+        negotiation.phase("Push: preparing upload…");
+        // git2's upload progress callback cannot return an abort signal. Stop
+        // accepting cancellation before upload; never claim a remote write
+        // was rolled back merely because the user clicked Cancel too late.
+        negotiation.cancellation.finish().map_err(|_| {
+            git2::Error::new(
+                ErrorCode::User,
+                git2::ErrorClass::Callback,
+                "Operation cancelled",
+            )
+        })?;
+        negotiation.phase("Push: uploading; waiting for remote confirmation…");
+        Ok(())
+    });
+    let upload = control.clone();
+    callbacks.push_transfer_progress(move |done, total, bytes| {
+        upload.progress(&format!(
+            "Push: {done} / {total} objects ({}) · {bytes} bytes",
+            percent(done, total)
+        ))
+    });
+    let packing = control.clone();
+    callbacks.pack_progress(move |_, done, total| {
+        packing.progress(&format!("Push: preparing {done} / {total} objects"))
+    });
+    callbacks.credentials(move |url, username, allowed| {
+        control.check_git()?;
         if allowed.contains(CredentialType::SSH_KEY)
             && let Some(username) = username
             && let Ok(credential) = Cred::ssh_key_from_agent(username)
@@ -357,7 +365,7 @@ impl Repository {
         let root = repo
             .workdir()
             .context("目前不支持裸仓库作为工作区")?
-            .to_path_buf();
+            .canonicalize()?;
         Ok(Self { root })
     }
     pub fn init(path: &Path) -> Result<Self> {
@@ -378,16 +386,87 @@ impl Repository {
         destination: &Path,
         progress: Option<ProgressSink>,
     ) -> Result<Self> {
-        ensure!(!url.trim().is_empty(), "请输入仓库 URL");
-        if let Some(parent) = destination.parent() {
+        Self::clone_repo_with_control(
+            url,
+            destination,
+            NetworkControl::new(progress, CancellationToken::default()),
+        )
+    }
+    pub fn clone_repo_with_control(
+        url: &str,
+        destination: &Path,
+        control: NetworkControl,
+    ) -> Result<Self> {
+        let result = (|| {
+            control.check()?;
+            ensure!(!url.trim().is_empty(), "请输入仓库 URL");
+            let destination = if destination.is_absolute() {
+                destination.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(destination)
+            };
+            let parent = destination.parent().context("Missing destination parent")?;
             fs::create_dir_all(parent)?;
-        }
-        let mut fetch = FetchOptions::new();
-        fetch.remote_callbacks(network_callbacks_with_progress(progress));
-        let mut builder = RepoBuilder::new();
-        builder.fetch_options(fetch);
-        builder.clone(url, destination)?;
-        Self::open(destination)
+            // Reserve an empty destination. Cleanup never recursively removes
+            // this user-visible path or deletes a directory that predated us.
+            let created = match fs::create_dir(&destination) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure!(
+                        fs::symlink_metadata(&destination)?.file_type().is_dir(),
+                        "Clone destination must be a directory, not a file or symbolic link"
+                    );
+                    ensure!(
+                        fs::read_dir(&destination)?.next().is_none(),
+                        "Clone destination must be empty"
+                    );
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
+            struct EmptyReservation(PathBuf, bool);
+            impl Drop for EmptyReservation {
+                fn drop(&mut self) {
+                    if self.1 {
+                        let _ = fs::remove_dir(&self.0);
+                    }
+                }
+            }
+            let _reservation = EmptyReservation(destination.clone(), created);
+            let staging = tempfile::tempdir_in(parent)?;
+            let clone_path = staging.path().join("repository");
+            let mut fetch = FetchOptions::new();
+            fetch.remote_callbacks(network_callbacks(control.clone()));
+            // Unlike an existing working tree, this isolated checkout can safely
+            // stop midway and be discarded with its owned temporary directory.
+            let checkout_control = control.clone();
+            let mut first_checkout = true;
+            let mut checkout = CheckoutBuilder::new();
+            checkout
+                .notify_on(git2::CheckoutNotificationType::all())
+                .notify(move |_, _, _, _, _| {
+                    if first_checkout {
+                        first_checkout = false;
+                        checkout_control.phase("Clone: checking out files…");
+                    }
+                    !checkout_control.cancellation.is_requested()
+                });
+            let mut builder = RepoBuilder::new();
+            builder
+                .fetch_options(fetch)
+                .with_checkout(checkout)
+                .clone_local(git2::build::CloneLocal::None);
+            control.phase("Clone: connecting…");
+            control.check()?;
+            builder.clone(url, &clone_path)?;
+            control.cancellation.finish()?;
+            control.phase("Clone: installing repository…");
+            #[cfg(windows)]
+            fs::remove_dir(&destination)?;
+            fs::rename(&clone_path, &destination)?;
+            Self::open(destination)
+        })();
+        control.normalize(result)
     }
     /// Cheap change detection for the refresh timer: hashes HEAD, repository
     /// state, references, statuses, indexed blobs, and changed-file metadata.
@@ -633,274 +712,299 @@ impl Repository {
         operation: Operation,
         progress: Option<ProgressSink>,
     ) -> Result<String> {
-        let mut repo = raw(self)?;
-        match operation {
-            Operation::Amend { context, message } => self.amend(&context, &message),
-            Operation::UndoLast(expected) => self.undo_last(&expected),
-            Operation::RestoreReflog { expected, target } => {
-                self.restore_reflog(&expected, &target)
+        self.execute_with_control(
+            operation,
+            NetworkControl::new(progress, CancellationToken::default()),
+        )
+    }
+    pub fn execute_with_control(
+        &self,
+        operation: Operation,
+        control: NetworkControl,
+    ) -> Result<String> {
+        let result = (|| {
+            if operation.is_network() {
+                control.check()?;
             }
-            Operation::RecoverBranch { target, name } => self.recover_branch(&target, &name),
-            Operation::ApplyPartial { patch, selection } => self.apply_partial(&patch, &selection),
-            Operation::ResolveConflict {
-                context,
-                resolution,
-            } => self.resolve_conflict(&context, resolution),
-            Operation::ContinueConflict(session) => self.continue_conflict(&session),
-            Operation::Stage(paths) => {
-                ensure!(!paths.is_empty(), "没有选择文件");
-                let mut index = repo.index()?;
-                for path in paths {
-                    if self.root.join(&path).exists() {
-                        index.add_path(&path)?;
-                    } else {
-                        index.remove_path(&path)?;
-                    }
+            let mut repo = raw(self)?;
+            match operation {
+                Operation::Amend { context, message } => self.amend(&context, &message),
+                Operation::UndoLast(expected) => self.undo_last(&expected),
+                Operation::RestoreReflog { expected, target } => {
+                    self.restore_reflog(&expected, &target)
                 }
-                index.write()?;
-                Ok("Files staged".into())
-            }
-            Operation::StageAll => {
-                let mut index = repo.index()?;
-                index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
-                index.update_all(["*"], None)?;
-                index.write()?;
-                Ok("All changes staged".into())
-            }
-            Operation::Unstage(paths) => {
-                ensure!(!paths.is_empty(), "没有选择文件");
-                unstage_paths(&repo, &paths)?;
-                Ok("Files unstaged".into())
-            }
-            Operation::UnstageAll => {
-                if let Ok(head) = repo.head() {
-                    let object = head.peel(git2::ObjectType::Commit)?;
-                    repo.reset(&object, ResetType::Mixed, None)?;
-                } else {
+                Operation::RecoverBranch { target, name } => self.recover_branch(&target, &name),
+                Operation::ApplyPartial { patch, selection } => {
+                    self.apply_partial(&patch, &selection)
+                }
+                Operation::ResolveConflict {
+                    context,
+                    resolution,
+                } => self.resolve_conflict(&context, resolution),
+                Operation::ContinueConflict(session) => self.continue_conflict(&session),
+                Operation::Stage(paths) => {
+                    ensure!(!paths.is_empty(), "没有选择文件");
                     let mut index = repo.index()?;
-                    index.clear()?;
+                    for path in paths {
+                        if self.root.join(&path).exists() {
+                            index.add_path(&path)?;
+                        } else {
+                            index.remove_path(&path)?;
+                        }
+                    }
                     index.write()?;
+                    Ok("Files staged".into())
                 }
-                Ok("All files unstaged".into())
-            }
-            Operation::Discard(path) => {
-                let index = repo.index()?;
-                ensure!(
-                    index.get_path(&path, 0).is_some(),
-                    "只能丢弃已跟踪文件的工作区修改"
-                );
-                let mut checkout = CheckoutBuilder::new();
-                checkout.force().disable_pathspec_match(true).path(&path);
-                repo.checkout_index(None, Some(&mut checkout))?;
-                Ok("Working tree changes discarded".into())
-            }
-            Operation::Commit(message) => commit_index(&repo, &message, None),
-            Operation::CreateBranch(name) => {
-                validate_branch(&name)?;
-                let head = repo.head()?.peel_to_commit()?;
-                repo.branch(&name, &head, false)?;
-                checkout_branch(&repo, &name, BranchType::Local)?;
-                Ok(format!("Switched to {name}"))
-            }
-            Operation::Checkout(name) => {
-                validate_branch(&name)?;
-                checkout_branch(&repo, &name, BranchType::Local)?;
-                Ok(format!("Switched to {name}"))
-            }
-            Operation::TrackBranch(name) => {
-                validate_branch(&name)?;
-                let remote = repo.find_branch(&name, BranchType::Remote)?;
-                let local_name = name.split_once('/').map(|(_, part)| part).unwrap_or(&name);
-                let commit = remote.get().peel_to_commit()?;
-                let mut local = repo.branch(local_name, &commit, false)?;
-                local.set_upstream(Some(&name))?;
-                checkout_branch(&repo, local_name, BranchType::Local)?;
-                Ok(format!("Tracking {name}"))
-            }
-            Operation::DeleteBranch(name) => {
-                validate_branch(&name)?;
-                let mut branch = repo.find_branch(&name, BranchType::Local)?;
-                ensure!(!branch.is_head(), "不能删除当前分支");
-                let head = repo.head()?.target().context("HEAD 不存在")?;
-                let branch_id = branch.get().target().context("分支引用无效")?;
-                ensure!(
-                    repo.graph_descendant_of(head, branch_id)? || head == branch_id,
-                    "分支尚未合并"
-                );
-                branch.delete()?;
-                Ok(format!("Deleted branch {name}"))
-            }
-            Operation::Merge(name) => {
-                validate_branch(&name)?;
-                let branch = repo
-                    .find_branch(&name, BranchType::Local)
-                    .or_else(|_| repo.find_branch(&name, BranchType::Remote))?;
-                let target = branch.get().target().context("目标分支没有提交")?;
-                merge_target(&repo, target, &name, false)
-            }
-            Operation::AbortMerge | Operation::AbortRevert | Operation::AbortCherryPick => {
-                abort_operation(&repo)?;
-                Ok("Operation aborted".into())
-            }
-            Operation::Revert(id) => {
-                ensure!(
-                    file_changes(&repo)?.is_empty(),
-                    "Revert 前请先提交、Stash 或丢弃现有修改"
-                );
-                let commit = repo.find_commit(oid(&id)?)?;
-                repo.revert(&commit, None)?;
-                if repo.index()?.has_conflicts() {
-                    bail!("Revert has conflicts; resolve or abort");
+                Operation::StageAll => {
+                    let mut index = repo.index()?;
+                    index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
+                    index.update_all(["*"], None)?;
+                    index.write()?;
+                    Ok("All changes staged".into())
                 }
-                let message = format!(
-                    "Revert \"{}\"",
-                    commit.summary().ok().flatten().unwrap_or_default()
-                );
-                commit_index(&repo, &message, None)
-            }
-            Operation::CherryPick(id) => {
-                ensure!(
-                    file_changes(&repo)?.is_empty(),
-                    "Cherry-pick 前请先提交、Stash 或丢弃现有修改"
-                );
-                let commit = repo.find_commit(oid(&id)?)?;
-                repo.cherrypick(&commit, None)?;
-                if repo.index()?.has_conflicts() {
-                    bail!("Cherry-pick has conflicts; resolve or abort");
+                Operation::Unstage(paths) => {
+                    ensure!(!paths.is_empty(), "没有选择文件");
+                    unstage_paths(&repo, &paths)?;
+                    Ok("Files unstaged".into())
                 }
-                commit_index(&repo, commit.message().ok().unwrap_or("Cherry-pick"), None)
-            }
-            Operation::ContinueCherryPick | Operation::ContinueRevert => {
-                let state = repo.state();
-                ensure!(
-                    matches!(state, RepositoryState::CherryPick | RepositoryState::Revert),
-                    "没有待继续的操作"
-                );
-                let message = fs::read_to_string(repo.path().join("MERGE_MSG"))
-                    .unwrap_or_else(|_| "Continue operation".into());
-                commit_index(&repo, &message, None)
-            }
-            Operation::SetIdentity(name, email) => {
-                ensure!(
-                    !name.trim().is_empty() && !email.trim().is_empty(),
-                    "请输入姓名和邮箱"
-                );
-                let mut config = repo.config()?;
-                config.set_str("user.name", &name)?;
-                config.set_str("user.email", &email)?;
-                Ok("Commit identity saved".into())
-            }
-            Operation::Fetch => {
-                fetch_all(&repo, progress.clone())?;
-                Ok("Remotes fetched".into())
-            }
-            Operation::Pull => {
-                let head = repo.head()?;
-                let local_name = head.shorthand().context("当前不在分支上")?.to_string();
-                let local = repo.find_branch(&local_name, BranchType::Local)?;
-                let upstream = local.upstream().context("当前分支没有上游")?;
-                let upstream_name = upstream.name()?.context("上游名称无效")?.to_string();
-                let remote_name = upstream_name
-                    .split('/')
-                    .next()
-                    .context("上游远程名称无效")?;
-                fetch_one(&repo, remote_name, progress.clone())?;
-                let updated = repo.find_branch(&upstream_name, BranchType::Remote)?;
-                let target = updated.get().target().context("上游没有提交")?;
-                merge_target(&repo, target, &upstream_name, true)
-            }
-            Operation::Push => {
-                let head = repo.head()?;
-                ensure!(head.is_branch(), "请先切换到本地分支再推送");
-                let source = head.name()?.to_string();
-                let name = head.shorthand().context("当前不在分支上")?.to_string();
-                // Read configuration directly: a tracking ref may be absent,
-                // and neither the remote nor its branch can be inferred by splitting '/'.
-                let (remote_name, target, set_upstream) = match (
-                    repo.branch_upstream_remote(&source),
-                    repo.branch_upstream_merge(&source),
-                ) {
-                    (Ok(remote), Ok(target)) => (
-                        remote.as_str().context("远程名称编码无效")?.to_string(),
-                        target.as_str().context("上游分支编码无效")?.to_string(),
-                        false,
-                    ),
-                    (Err(remote), Err(target))
-                        if remote.code() == ErrorCode::NotFound
-                            && target.code() == ErrorCode::NotFound =>
-                    {
-                        ("origin".into(), source.clone(), true)
+                Operation::UnstageAll => {
+                    if let Ok(head) = repo.head() {
+                        let object = head.peel(git2::ObjectType::Commit)?;
+                        repo.reset(&object, ResetType::Mixed, None)?;
+                    } else {
+                        let mut index = repo.index()?;
+                        index.clear()?;
+                        index.write()?;
                     }
-                    (Err(error), _) | (_, Err(error)) => {
-                        return Err(error).context(
-                            "上游配置不完整或无法读取，请检查分支的 remote 和 merge 配置",
-                        );
-                    }
-                };
-                ensure!(
-                    target.starts_with("refs/heads/") && git2::Reference::is_valid_name(&target),
-                    "上游目标不是有效的分支引用"
-                );
-                let mut remote = repo.find_remote(&remote_name)?;
-                let mut callbacks = network_callbacks_with_progress(progress);
-                let push_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-                let error_slot = push_error.clone();
-                callbacks.push_update_reference(move |_, status| {
-                    if let Some(status) = status {
-                        *error_slot.lock().unwrap() = Some(status.to_string());
-                    }
-                    Ok(())
-                });
-                let mut options = PushOptions::new();
-                options.remote_callbacks(callbacks);
-                remote.push(&[format!("{source}:{target}")], Some(&mut options))?;
-                if let Some(error) = push_error.lock().unwrap().take() {
-                    bail!("Push rejected: {error}");
+                    Ok("All files unstaged".into())
                 }
-                if set_upstream {
-                    let mut local = repo.find_branch(&name, BranchType::Local)?;
-                    local.set_upstream(Some(&format!("{remote_name}/{name}")))?;
+                Operation::Discard(path) => {
+                    let index = repo.index()?;
+                    ensure!(
+                        index.get_path(&path, 0).is_some(),
+                        "只能丢弃已跟踪文件的工作区修改"
+                    );
+                    let mut checkout = CheckoutBuilder::new();
+                    checkout.force().disable_pathspec_match(true).path(&path);
+                    repo.checkout_index(None, Some(&mut checkout))?;
+                    Ok("Working tree changes discarded".into())
                 }
-                Ok("Push completed".into())
+                Operation::Commit(message) => commit_index(&repo, &message, None),
+                Operation::CreateBranch(name) => {
+                    validate_branch(&name)?;
+                    let head = repo.head()?.peel_to_commit()?;
+                    repo.branch(&name, &head, false)?;
+                    checkout_branch(&repo, &name, BranchType::Local)?;
+                    Ok(format!("Switched to {name}"))
+                }
+                Operation::Checkout(name) => {
+                    validate_branch(&name)?;
+                    checkout_branch(&repo, &name, BranchType::Local)?;
+                    Ok(format!("Switched to {name}"))
+                }
+                Operation::TrackBranch(name) => {
+                    validate_branch(&name)?;
+                    let remote = repo.find_branch(&name, BranchType::Remote)?;
+                    let local_name = name.split_once('/').map(|(_, part)| part).unwrap_or(&name);
+                    let commit = remote.get().peel_to_commit()?;
+                    let mut local = repo.branch(local_name, &commit, false)?;
+                    local.set_upstream(Some(&name))?;
+                    checkout_branch(&repo, local_name, BranchType::Local)?;
+                    Ok(format!("Tracking {name}"))
+                }
+                Operation::DeleteBranch(name) => {
+                    validate_branch(&name)?;
+                    let mut branch = repo.find_branch(&name, BranchType::Local)?;
+                    ensure!(!branch.is_head(), "不能删除当前分支");
+                    let head = repo.head()?.target().context("HEAD 不存在")?;
+                    let branch_id = branch.get().target().context("分支引用无效")?;
+                    ensure!(
+                        repo.graph_descendant_of(head, branch_id)? || head == branch_id,
+                        "分支尚未合并"
+                    );
+                    branch.delete()?;
+                    Ok(format!("Deleted branch {name}"))
+                }
+                Operation::Merge(name) => {
+                    validate_branch(&name)?;
+                    let branch = repo
+                        .find_branch(&name, BranchType::Local)
+                        .or_else(|_| repo.find_branch(&name, BranchType::Remote))?;
+                    let target = branch.get().target().context("目标分支没有提交")?;
+                    merge_target(&repo, target, &name, false)
+                }
+                Operation::AbortMerge | Operation::AbortRevert | Operation::AbortCherryPick => {
+                    abort_operation(&repo)?;
+                    Ok("Operation aborted".into())
+                }
+                Operation::Revert(id) => {
+                    ensure!(
+                        file_changes(&repo)?.is_empty(),
+                        "Revert 前请先提交、Stash 或丢弃现有修改"
+                    );
+                    let commit = repo.find_commit(oid(&id)?)?;
+                    repo.revert(&commit, None)?;
+                    if repo.index()?.has_conflicts() {
+                        bail!("Revert has conflicts; resolve or abort");
+                    }
+                    let message = format!(
+                        "Revert \"{}\"",
+                        commit.summary().ok().flatten().unwrap_or_default()
+                    );
+                    commit_index(&repo, &message, None)
+                }
+                Operation::CherryPick(id) => {
+                    ensure!(
+                        file_changes(&repo)?.is_empty(),
+                        "Cherry-pick 前请先提交、Stash 或丢弃现有修改"
+                    );
+                    let commit = repo.find_commit(oid(&id)?)?;
+                    repo.cherrypick(&commit, None)?;
+                    if repo.index()?.has_conflicts() {
+                        bail!("Cherry-pick has conflicts; resolve or abort");
+                    }
+                    commit_index(&repo, commit.message().ok().unwrap_or("Cherry-pick"), None)
+                }
+                Operation::ContinueCherryPick | Operation::ContinueRevert => {
+                    let state = repo.state();
+                    ensure!(
+                        matches!(state, RepositoryState::CherryPick | RepositoryState::Revert),
+                        "没有待继续的操作"
+                    );
+                    let message = fs::read_to_string(repo.path().join("MERGE_MSG"))
+                        .unwrap_or_else(|_| "Continue operation".into());
+                    commit_index(&repo, &message, None)
+                }
+                Operation::SetIdentity(name, email) => {
+                    ensure!(
+                        !name.trim().is_empty() && !email.trim().is_empty(),
+                        "请输入姓名和邮箱"
+                    );
+                    let mut config = repo.config()?;
+                    config.set_str("user.name", &name)?;
+                    config.set_str("user.email", &email)?;
+                    Ok("Commit identity saved".into())
+                }
+                Operation::Fetch => {
+                    fetch_all(&repo, control.clone())?;
+                    control.cancellation.finish()?;
+                    control.phase("Fetch: updating repository view…");
+                    Ok("Remotes fetched".into())
+                }
+                Operation::Pull => {
+                    let head = repo.head()?;
+                    let local_name = head.shorthand().context("当前不在分支上")?.to_string();
+                    let local = repo.find_branch(&local_name, BranchType::Local)?;
+                    let upstream = local.upstream().context("当前分支没有上游")?;
+                    let upstream_name = upstream.name()?.context("上游名称无效")?.to_string();
+                    let remote_name = upstream_name
+                        .split('/')
+                        .next()
+                        .context("上游远程名称无效")?;
+                    fetch_one(&repo, remote_name, control.clone())?;
+                    let updated = repo.find_branch(&upstream_name, BranchType::Remote)?;
+                    let target = updated.get().target().context("上游没有提交")?;
+                    control.cancellation.finish()?;
+                    control.phase("Pull: applying fast-forward…");
+                    merge_target(&repo, target, &upstream_name, true)
+                }
+                Operation::Push => {
+                    let head = repo.head()?;
+                    ensure!(head.is_branch(), "请先切换到本地分支再推送");
+                    let source = head.name()?.to_string();
+                    let name = head.shorthand().context("当前不在分支上")?.to_string();
+                    // Read configuration directly: a tracking ref may be absent,
+                    // and neither the remote nor its branch can be inferred by splitting '/'.
+                    let (remote_name, target, set_upstream) = match (
+                        repo.branch_upstream_remote(&source),
+                        repo.branch_upstream_merge(&source),
+                    ) {
+                        (Ok(remote), Ok(target)) => (
+                            remote.as_str().context("远程名称编码无效")?.to_string(),
+                            target.as_str().context("上游分支编码无效")?.to_string(),
+                            false,
+                        ),
+                        (Err(remote), Err(target))
+                            if remote.code() == ErrorCode::NotFound
+                                && target.code() == ErrorCode::NotFound =>
+                        {
+                            ("origin".into(), source.clone(), true)
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            return Err(error).context(
+                                "上游配置不完整或无法读取，请检查分支的 remote 和 merge 配置",
+                            );
+                        }
+                    };
+                    ensure!(
+                        target.starts_with("refs/heads/")
+                            && git2::Reference::is_valid_name(&target),
+                        "上游目标不是有效的分支引用"
+                    );
+                    let mut remote = repo.find_remote(&remote_name)?;
+                    let mut callbacks = network_callbacks(control.clone());
+                    let push_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+                    let error_slot = push_error.clone();
+                    callbacks.push_update_reference(move |_, status| {
+                        if let Some(status) = status {
+                            *error_slot.lock().unwrap() = Some(status.to_string());
+                        }
+                        Ok(())
+                    });
+                    let mut options = PushOptions::new();
+                    options.remote_callbacks(callbacks);
+                    remote.push(&[format!("{source}:{target}")], Some(&mut options))?;
+                    // Up-to-date pushes may skip negotiation entirely.
+                    control.cancellation.finish()?;
+                    if let Some(error) = push_error.lock().unwrap().take() {
+                        bail!("Push rejected: {error}");
+                    }
+                    if set_upstream {
+                        let mut local = repo.find_branch(&name, BranchType::Local)?;
+                        local.set_upstream(Some(&format!("{remote_name}/{name}")))?;
+                    }
+                    Ok("Push completed".into())
+                }
+                Operation::Stash(message) => {
+                    let signature = author(&repo)?;
+                    let name = if message.trim().is_empty() {
+                        "GitBuddy stash"
+                    } else {
+                        &message
+                    };
+                    repo.stash_save(&signature, name, Some(StashFlags::INCLUDE_UNTRACKED))?;
+                    Ok("Changes stashed".into())
+                }
+                Operation::ApplyStash(id) => {
+                    repo.stash_apply(stash_index(&id)?, None)?;
+                    Ok("Stash applied".into())
+                }
+                Operation::DropStash(id) => {
+                    repo.stash_drop(stash_index(&id)?)?;
+                    Ok("Stash deleted".into())
+                }
+                Operation::Tag(name) => {
+                    validate_branch(&name)?;
+                    let head = repo.head()?.peel(git2::ObjectType::Commit)?;
+                    repo.tag_lightweight(&name, &head, false)?;
+                    Ok(format!("Created tag {name}"))
+                }
+                Operation::DeleteTag(name) => {
+                    validate_branch(&name)?;
+                    repo.tag_delete(&name)?;
+                    Ok(format!("Deleted tag {name}"))
+                }
+                Operation::AddRemote(name, url) => {
+                    ensure!(
+                        git2::Remote::is_valid_name(&name) && !url.is_empty(),
+                        "请输入有效的远程名称和 URL"
+                    );
+                    repo.remote(&name, &url)?;
+                    Ok(format!("Added remote {name}"))
+                }
             }
-            Operation::Stash(message) => {
-                let signature = author(&repo)?;
-                let name = if message.trim().is_empty() {
-                    "GitBuddy stash"
-                } else {
-                    &message
-                };
-                repo.stash_save(&signature, name, Some(StashFlags::INCLUDE_UNTRACKED))?;
-                Ok("Changes stashed".into())
-            }
-            Operation::ApplyStash(id) => {
-                repo.stash_apply(stash_index(&id)?, None)?;
-                Ok("Stash applied".into())
-            }
-            Operation::DropStash(id) => {
-                repo.stash_drop(stash_index(&id)?)?;
-                Ok("Stash deleted".into())
-            }
-            Operation::Tag(name) => {
-                validate_branch(&name)?;
-                let head = repo.head()?.peel(git2::ObjectType::Commit)?;
-                repo.tag_lightweight(&name, &head, false)?;
-                Ok(format!("Created tag {name}"))
-            }
-            Operation::DeleteTag(name) => {
-                validate_branch(&name)?;
-                repo.tag_delete(&name)?;
-                Ok(format!("Deleted tag {name}"))
-            }
-            Operation::AddRemote(name, url) => {
-                ensure!(
-                    git2::Remote::is_valid_name(&name) && !url.is_empty(),
-                    "请输入有效的远程名称和 URL"
-                );
-                repo.remote(&name, &url)?;
-                Ok(format!("Added remote {name}"))
-            }
-        }
+        })();
+        control.normalize(result)
     }
 }
 
@@ -1051,19 +1155,22 @@ fn merge_target(repo: &RawRepo, target: Oid, name: &str, ff_only: bool) -> Resul
     commit_index(repo, &format!("Merge branch '{name}'"), Some(target))
 }
 
-fn fetch_one(repo: &RawRepo, name: &str, progress: Option<ProgressSink>) -> Result<()> {
+fn fetch_one(repo: &RawRepo, name: &str, control: NetworkControl) -> Result<()> {
+    control.check()?;
+    control.phase(&format!("Fetch: connecting to {name}…"));
+    control.check()?;
     let mut remote = repo.find_remote(name)?;
     let mut options = FetchOptions::new();
     options
-        .remote_callbacks(network_callbacks_with_progress(progress))
+        .remote_callbacks(network_callbacks(control.clone()))
         .prune(git2::FetchPrune::On);
     remote.fetch(&[] as &[&str], Some(&mut options), None)?;
     Ok(())
 }
 
-fn fetch_all(repo: &RawRepo, progress: Option<ProgressSink>) -> Result<()> {
+fn fetch_all(repo: &RawRepo, control: NetworkControl) -> Result<()> {
     for name in repo.remotes()?.iter().flatten().flatten() {
-        fetch_one(repo, name, progress.clone())?;
+        fetch_one(repo, name, control.clone())?;
     }
     Ok(())
 }

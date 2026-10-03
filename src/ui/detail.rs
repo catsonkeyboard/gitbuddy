@@ -101,7 +101,7 @@ impl GitBuddy {
                             .child(
                                 self.button("amend-latest", "Amend…")
                                     .ghost()
-                                    .disabled(self.busy || self.snapshot.head_id.is_none())
+                                    .disabled(self.busy() || self.snapshot.head_id.is_none())
                                     .on_click(cx.listener(|this, _, w, cx| {
                                         this.begin_history(HistoryKind::Amend, w, cx)
                                     })),
@@ -119,7 +119,7 @@ impl GitBuddy {
                                 )
                                 .primary()
                                 .disabled(
-                                    self.busy
+                                    self.busy()
                                         || staged == 0
                                         || self.snapshot.files.iter().any(|f| f.conflict()),
                                 )

@@ -23,7 +23,7 @@ pub(super) enum InspectState {
 
 impl GitBuddy {
     pub(super) fn begin_inspection(&mut self, request: InspectRequest, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy() {
             return;
         }
         let Some(repo) = self.active.repo.clone() else {
@@ -109,7 +109,7 @@ impl GitBuddy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy || self.repo.is_none() {
+        if self.busy() || self.repo.is_none() {
             return;
         }
         let base = base
@@ -151,7 +151,7 @@ impl GitBuddy {
     }
 
     pub(super) fn open_file_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.repo.is_none() {
+        if self.busy() || self.repo.is_none() {
             return;
         }
         let spec = match &self.selection {
@@ -630,7 +630,7 @@ impl GitBuddy {
     ) -> AnyElement {
         let history = InspectRequest::History(path.clone(), revision.clone(), 100);
         let blame = blame.map(|(path, revision)| InspectRequest::Blame(path, revision));
-        let blame_disabled = blame.is_none();
+        let blame_disabled = self.busy() || blame.is_none();
         h_flex()
             .id(id)
             .gap_1()

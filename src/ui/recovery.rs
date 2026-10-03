@@ -7,7 +7,7 @@ impl GitBuddy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy || self.active.repo.is_none() {
+        if self.busy() || self.active.repo.is_none() {
             return;
         }
         self.reflog_limit = 100;
@@ -131,7 +131,7 @@ impl GitBuddy {
                     .child(h_flex().justify_end().gap_2()
                         .child(self.button("history-cancel", "Cancel").on_click(cx.listener(|this,_,w,cx| {this.modal=None;this.focus.focus(w,cx);cx.notify();})))
                         .child(self.button("history-apply", if kind == HistoryKind::Amend { "Amend commit" } else { "Undo commit" }).primary()
-                            .disabled(self.busy || (kind == HistoryKind::Amend && self.amend_message.read(cx).value().trim().is_empty())
+                            .disabled(self.busy() || (kind == HistoryKind::Amend && self.amend_message.read(cx).value().trim().is_empty())
                                 || (kind == HistoryKind::Undo && edit.parents.is_empty() && edit.head.reference == "HEAD"))
                             .on_click(cx.listener(move |this,_,_,cx| {
                                 let operation = if kind == HistoryKind::Amend {

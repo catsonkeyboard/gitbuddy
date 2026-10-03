@@ -7,6 +7,7 @@ mod modals;
 mod patches;
 mod recovery;
 mod sidebar;
+mod tasks;
 mod toolbar;
 use gitbuddy::{
     git::{
@@ -27,7 +28,7 @@ use gpui_kit::{
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -58,7 +59,7 @@ const MUTED: u32 = 0x8c96a6;
 const TEXT: u32 = 0xdce1e8;
 const ACCENT: u32 = 0x86b7f3;
 const HISTORY_PAGE_SIZE: usize = 300;
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Selection {
     #[default]
     Work,
@@ -158,7 +159,7 @@ enum HistoryKind {
     Undo,
     Reflog,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 enum HistoryData {
     #[default]
     Loading,
@@ -224,6 +225,12 @@ impl Loaded {
 /// tabs swaps this struct wholesale instead of copying fifteen fields.
 #[derive(Clone)]
 pub struct RepoTab {
+    id: tasks::TabId,
+    preparing: Option<PathBuf>,
+    retry_preparation: Option<tasks::Preparation>,
+    refresh_views: bool,
+    task_finished: bool,
+    history_retry: Option<(Modal, HistoryData, String)>,
     repo: Option<Repository>,
     snapshot: Snapshot,
     selection: Selection,
@@ -246,6 +253,12 @@ pub struct RepoTab {
 impl Default for RepoTab {
     fn default() -> Self {
         Self {
+            id: tasks::TabId::new(),
+            preparing: None,
+            retry_preparation: None,
+            refresh_views: false,
+            task_finished: false,
+            history_retry: None,
             repo: None,
             snapshot: Snapshot::default(),
             selection: Selection::default(),
@@ -283,6 +296,7 @@ pub struct GitBuddy {
     form_b: Entity<InputState>,
     clear_message: bool,
     modal: Option<Modal>,
+    modal_error: Option<String>,
     history_data: HistoryData,
     history_generation: u64,
     reflog_limit: usize,
@@ -294,7 +308,7 @@ pub struct GitBuddy {
     conflict_generation: u64,
     conflict_editor: Entity<EditorState>,
     restore_conflict: Option<String>,
-    busy: bool,
+    tasks: tasks::RepositoryTasks,
     settings: Settings,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -384,6 +398,7 @@ impl GitBuddy {
             form_b,
             clear_message: false,
             modal: None,
+            modal_error: None,
             history_data: HistoryData::default(),
             history_generation: 0,
             reflog_limit: 100,
@@ -395,7 +410,7 @@ impl GitBuddy {
             conflict_generation: 0,
             conflict_editor,
             restore_conflict: None,
-            busy: false,
+            tasks: tasks::RepositoryTasks::default(),
             settings,
             focus,
             _subscriptions: subscriptions,
@@ -410,7 +425,7 @@ impl GitBuddy {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if !this.busy
+                        if !this.busy()
                             && this.modal.is_none()
                             && this.active.repo.is_some()
                             && !this.active.error
@@ -431,15 +446,11 @@ impl GitBuddy {
         let Some(index) = self.active_index else {
             return;
         };
-        self.active.message = if self.clear_message {
-            String::new()
-        } else {
-            self.message.read(cx).value().to_string()
-        };
+        self.active.message = self.current_message(cx);
         self.tabs[index] = Some(std::mem::take(&mut self.active));
     }
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.active_index == Some(index) || self.busy {
+        if self.active_index == Some(index) || index >= self.tabs.len() {
             return;
         }
         self.save_active_tab(cx);
@@ -447,6 +458,7 @@ impl GitBuddy {
             return;
         };
         self.active = tab;
+        self.active.task_finished = false;
         self.active_index = Some(index);
         self.active
             .patches
@@ -455,36 +467,31 @@ impl GitBuddy {
         self.restore_message = Some(self.active.message.clone());
         self.clear_message = false;
         self.modal = None;
+        self.modal_error = None;
         self.patch_generation += 1;
         self.selection_generation += 1;
         self.conflict_generation += 1;
-        if matches!(self.active.selection, Selection::Conflicts) {
-            self.reload_conflicts(None, cx);
-            self.restore_conflict_editor();
-        }
-        if matches!(self.active.selection, Selection::Inspect)
-            && let inspect::InspectState::Loading(request) = &self.active.inspection
-        {
-            self.begin_inspection(request.clone(), cx);
-        }
-        let sources: Vec<_> = self.work_and_commit_sources();
-        for source in sources {
-            if self.active.expanded.contains(&source.key())
-                && !self.active.patches.contains_key(&source.key())
-            {
-                self.load_patch(source, cx);
-            }
-        }
-        if self.active.commit_detail.is_none()
-            && let Selection::Commit(id) = &self.active.selection
-        {
-            let id = id.clone();
-            self.request_commit_detail(id, cx);
+        self.active.refresh_views = true;
+        self.refresh_task_views(cx);
+        if let Some((modal, history, message)) = self.active.history_retry.take() {
+            self.modal = Some(modal);
+            self.history_data = history;
+            self.restore_amend_message = Some(message);
         }
         cx.notify();
     }
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.busy || index >= self.tabs.len() {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let id = if self.active_index == Some(index) {
+            self.active.id
+        } else if let Some(tab) = self.tabs[index].as_ref() {
+            tab.id
+        } else {
+            return;
+        };
+        if self.tasks.get(id).is_some() {
             return;
         }
         let was_active = self.active_index == Some(index);
@@ -508,164 +515,6 @@ impl GitBuddy {
             self.active_index = Some(active - 1);
         }
         cx.notify();
-    }
-    fn apply_opened_tab(&mut self, loaded: Loaded, cx: &mut Context<Self>) {
-        let root = loaded.repo.root.clone();
-        if let Err(err) = self.settings.remember(root.clone()) {
-            eprintln!("Cannot save recent repositories: {err}");
-        }
-        if self
-            .active
-            .repo
-            .as_ref()
-            .is_some_and(|repo| repo.root == root)
-        {
-            self.active.snapshot = loaded.snapshot;
-            self.active.notice = loaded.notice;
-            self.active.error = loaded.error;
-            cx.notify();
-            return;
-        }
-        if let Some(index) = self.tabs.iter().position(|tab| {
-            tab.as_ref()
-                .is_some_and(|t| t.repo.as_ref().is_some_and(|repo| repo.root == root))
-        }) {
-            if let Some(tab) = self.tabs[index].as_mut() {
-                tab.snapshot = loaded.snapshot;
-                tab.notice = loaded.notice;
-                tab.error = loaded.error;
-            }
-            self.activate_tab(index, cx);
-            return;
-        }
-        let index = self.tabs.len();
-        self.tabs.push(Some(RepoTab {
-            repo: Some(loaded.repo),
-            snapshot: loaded.snapshot,
-            notice: loaded.notice,
-            error: loaded.error,
-            ..RepoTab::default()
-        }));
-        self.activate_tab(index, cx);
-    }
-    fn dispatch(
-        &mut self,
-        label: &str,
-        work: impl FnOnce(Option<git::ProgressSink>) -> anyhow::Result<Loaded> + Send + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        if self.busy {
-            return;
-        }
-        self.busy = true;
-        self.active.error = false;
-        if !label.is_empty() {
-            self.active.notice = label.into();
-        }
-        cx.notify();
-        let requested_selection = self.selection_generation;
-        // Progress flows from libgit2 callbacks (worker threads) into the
-        // status bar. The channel closes when the operation finishes and
-        // drops the sender, which also ends the consumer loop below.
-        let (progress_tx, progress_rx) = async_channel::bounded::<String>(64);
-        let sink: git::ProgressSink =
-            std::sync::Arc::new(std::sync::Mutex::new(move |text: &str| {
-                let _ = progress_tx.try_send(text.to_string());
-            }));
-        let task = cx
-            .background_executor()
-            .spawn(async move { work(Some(sink)) });
-        cx.spawn(async move |this, cx| {
-            while let Ok(text) = progress_rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.busy {
-                        this.active.notice = text;
-                        cx.notify();
-                    }
-                });
-            }
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                this.busy = false;
-                match result {
-                    Ok(mut loaded) => {
-                        if loaded.open_as_tab {
-                            this.apply_opened_tab(loaded, cx);
-                            return;
-                        }
-                        if requested_selection != this.selection_generation {
-                            loaded.selection = this.active.selection.clone();
-                            loaded.commit_detail = this.active.commit_detail.clone();
-                        }
-                        if let Selection::Commit(id) = &loaded.selection
-                            && loaded.commit_detail.is_none()
-                        {
-                            loaded.commit_detail = this.active.commit_cache.get(id).cloned();
-                        }
-                        let changed =
-                            this.active.repo.as_ref().map(|r| &r.root) != Some(&loaded.repo.root);
-                        let old_id = this.active.commit_detail.as_ref().map(|d| &d.id);
-                        let new_id = loaded.commit_detail.as_ref().map(|d| &d.id);
-                        if changed
-                            || (old_id != new_id && !matches!(loaded.selection, Selection::Inspect))
-                        {
-                            this.active.expanded.clear();
-                            this.active.patches.clear();
-                            this.patch_generation += 1;
-                            this.active.show_commit_body = false;
-                        }
-                        this.active.commit_detail = loaded.commit_detail;
-                        if changed
-                            && let Err(err) = this.settings.remember(loaded.repo.root.clone())
-                        {
-                            eprintln!("Cannot save recent repositories: {err}");
-                        }
-                        this.active.repo = Some(loaded.repo);
-                        this.active.snapshot = loaded.snapshot;
-                        this.active.selection = loaded.selection;
-                        this.active.diff = loaded.diff;
-                        if !loaded.notice.is_empty() {
-                            this.active.notice = loaded.notice;
-                        }
-                        this.active.error = loaded.error;
-                        if matches!(this.active.selection, Selection::Conflicts) {
-                            this.reload_conflicts(None, cx);
-                        }
-                        if let Some(modal) = loaded.retry_modal {
-                            this.modal = Some(modal);
-                        }
-                        this.clear_message = loaded.clear_message || changed;
-                        // Working tree content can change outside the app. Reload only open patches.
-                        if this.active.commit_detail.is_none()
-                            && !matches!(
-                                this.active.selection,
-                                Selection::Inspect | Selection::Conflicts
-                            )
-                        {
-                            this.patch_generation += 1;
-                            let sources: Vec<_> = this
-                                .work_and_commit_sources()
-                                .into_iter()
-                                .filter(|source| this.active.expanded.contains(&source.key()))
-                                .collect();
-                            // Collapsed patches must not retain stale content or line selections.
-                            let visible: HashSet<_> =
-                                sources.iter().map(PatchSource::key).collect();
-                            this.active.patches.retain(|key, _| visible.contains(key));
-                            for source in sources {
-                                this.load_patch(source, cx);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        this.active.notice = format!("{err:#}");
-                        this.active.error = true;
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
     /// Patch sources for every currently visible work file (staged and
     /// unstaged variants), or for the selected commit's files.
@@ -707,28 +556,6 @@ impl GitBuddy {
                 .collect(),
         }
     }
-    fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let label = if self.active.repo.is_some() {
-            ""
-        } else {
-            "Opening repository…"
-        };
-        self.dispatch(
-            label,
-            move |_progress| {
-                Loaded::read(
-                    Repository::open(path)?,
-                    Selection::Work,
-                    HISTORY_PAGE_SIZE,
-                    "Repository opened".into(),
-                    false,
-                    false,
-                    true,
-                )
-            },
-            cx,
-        );
-    }
     fn refresh_with_notice(&mut self, notice: String, cx: &mut Context<Self>) {
         let Some(repo) = self.active.repo.clone() else {
             return;
@@ -737,6 +564,7 @@ impl GitBuddy {
         let limit = self.active.limit;
         self.dispatch(
             "",
+            false,
             move |_progress| Loaded::read(repo, selection, limit, notice, false, false, false),
             cx,
         );
@@ -748,13 +576,18 @@ impl GitBuddy {
             return;
         };
         let expected = self.active.snapshot.fingerprint;
+        let tab_id = self.active.id;
         let task = cx
             .background_executor()
             .spawn(async move { repo.fingerprint().map(|fp| fp != expected).unwrap_or(true) });
         cx.spawn(async move |this, cx| {
             if task.await {
                 let _ = this.update(cx, |this, cx| {
-                    if !this.busy && this.modal.is_none() && this.active.repo.is_some() {
+                    if this.active.id == tab_id
+                        && !this.busy()
+                        && this.modal.is_none()
+                        && this.active.repo.is_some()
+                    {
                         this.refresh_with_notice(String::new(), cx);
                     }
                 });
@@ -763,7 +596,7 @@ impl GitBuddy {
         .detach();
     }
     fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy() {
             return;
         }
         if let Selection::File(file, staged) = selection {
@@ -866,6 +699,9 @@ impl GitBuddy {
         .detach();
     }
     fn perform(&mut self, operation: Operation, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         let Some(repo) = self.active.repo.clone() else {
             return;
         };
@@ -887,9 +723,10 @@ impl GitBuddy {
         let limit = self.active.limit;
         self.modal = None;
         self.dispatch(
-            "Running Git…",
-            move |progress| {
-                let (notice, error) = match repo.execute_with_progress(operation, progress) {
+            operation.label(),
+            operation.is_network(),
+            move |control| {
+                let (notice, error) = match repo.execute_with_control(operation, control) {
                     Ok(out) => (
                         if out.is_empty() {
                             "Operation completed".into()
@@ -898,7 +735,7 @@ impl GitBuddy {
                         },
                         false,
                     ),
-                    Err(err) => (format!("{err:#}"), true),
+                    Err(err) => (format!("{err:#}"), !git::is_cancelled(&err)),
                 };
                 let mut loaded = Loaded::read(
                     repo,
@@ -918,17 +755,18 @@ impl GitBuddy {
         );
     }
     fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy() && !matches!(modal, Modal::Open | Modal::Init | Modal::Clone) {
             return;
         }
         self.form_a.update(cx, |s, cx| s.set_value("", window, cx));
         self.form_b.update(cx, |s, cx| s.set_value("", window, cx));
         self.modal = Some(modal);
+        self.modal_error = None;
         self.form_a.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
     fn commit(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.modal.is_some() {
+        if self.busy() || self.modal.is_some() {
             return;
         }
         self.perform(
@@ -942,7 +780,7 @@ impl GitBuddy {
             .small()
             .h(px(24.))
             .text_size(px(11.))
-            .disabled(self.busy)
+            .disabled(self.busy())
     }
     fn sidebar_button(&self, id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
         let label = label.into();
@@ -952,7 +790,7 @@ impl GitBuddy {
             .h(px(24.))
             .w_full()
             .text_size(px(11.))
-            .disabled(self.busy)
+            .disabled(self.busy())
             .child(
                 h_flex()
                     .w_full()
@@ -1073,6 +911,8 @@ impl Render for GitBuddy {
                     .child(self.history(cx))
                     .child(self.detail(cx))
                     .into_any_element()
+            } else if self.active.preparing.is_some() {
+                self.preparation_view(cx)
             } else {
                 self.welcome(cx).into_any_element()
             })
@@ -1090,7 +930,7 @@ impl Render for GitBuddy {
                     .child(
                         div()
                             .text_color(rgb(if self.active.error { 0xf0a4aa } else { ACCENT }))
-                            .child(if self.busy {
+                            .child(if self.busy() {
                                 "◌"
                             } else if self.active.error {
                                 "!"
@@ -1117,6 +957,28 @@ impl Render for GitBuddy {
                             }),
                         ))
                     })
+                    .when_some(
+                        self.tasks
+                            .get(self.active.id)
+                            .and_then(|t| t.cancellation.as_ref()),
+                        |row, token| {
+                            row.child(
+                                self.button(
+                                    "cancel-network",
+                                    if token.is_requested() {
+                                        "Cancelling…"
+                                    } else if token.is_finishing() {
+                                        "Finishing…"
+                                    } else {
+                                        "Cancel"
+                                    },
+                                )
+                                .ghost()
+                                .disabled(!token.can_cancel())
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_task(cx))),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .text_color(rgb(MUTED))

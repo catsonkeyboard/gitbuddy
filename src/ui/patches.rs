@@ -139,7 +139,7 @@ impl GitBuddy {
                                             .on_click(cx.listener(
                                                 move |this, event: &ClickEvent, _, cx| {
                                                     cx.stop_propagation();
-                                                    if this.busy {
+                                                    if this.busy() {
                                                         return;
                                                     }
                                                     if let Some(PatchState::Ready(
@@ -194,7 +194,7 @@ impl GitBuddy {
                                 .child(
                                     self.button("clear-line-selection", "Clear")
                                         .ghost()
-                                        .disabled(self.busy || selected == 0)
+                                        .disabled(self.busy() || selected == 0)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Some(PatchState::Ready(_, selection)) =
                                                 this.active.patches.get_mut(&clear_key)
@@ -213,7 +213,7 @@ impl GitBuddy {
                                             "Stage selected"
                                         },
                                     )
-                                    .disabled(self.busy || selected == 0)
+                                    .disabled(self.busy() || selected == 0)
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             if let Some(PatchState::Ready(patch, selection)) =
@@ -451,7 +451,7 @@ impl GitBuddy {
             .child(h_flex().h(px(32.)).px_3().gap_2().bg(rgb(BG)).border_b_1().border_color(rgb(BORDER))
                 .child(div().text_xs().text_color(rgb(MUTED)).child("▾"))
                 .child(div().flex_1().text_xs().font_weight(FontWeight::SEMIBOLD).child(format!("{}  {}", if staged {"Staged files"} else {"Working directory"},files.len())))
-                .child(self.button(if staged {"unstage-all"} else {"stage-all"}, if staged {"Unstage all"} else {"Stage all"}).ghost().disabled(self.busy || files.is_empty() || self.snapshot.files.iter().any(|f|f.conflict()))
+                .child(self.button(if staged {"unstage-all"} else {"stage-all"}, if staged {"Unstage all"} else {"Stage all"}).ghost().disabled(self.busy() || files.is_empty() || self.snapshot.files.iter().any(|f|f.conflict()))
                     .on_click(cx.listener(move |this, _, _, cx|this.perform(if staged {Operation::UnstageAll} else {Operation::StageAll},cx)))))
             .children(files.into_iter().enumerate().map(|(index, file)| {
                 let source = PatchSource::Work(file.clone(),staged);

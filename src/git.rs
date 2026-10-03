@@ -190,6 +190,24 @@ pub use conflicts::{
 /// `Arc<Mutex<...>>` because libgit2 callbacks fire from worker threads.
 pub type ProgressSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(&str) + Send>>;
 
+#[path = "git/network.rs"]
+mod network;
+pub use network::{CancellationToken, Cancelled, NetworkControl, is_cancelled};
+
+impl Operation {
+    pub fn is_network(&self) -> bool {
+        matches!(self, Self::Fetch | Self::Pull | Self::Push)
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Fetch => "Fetch",
+            Self::Pull => "Pull",
+            Self::Push => "Push",
+            _ => "Git operation",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub old: String,
