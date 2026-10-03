@@ -23,7 +23,7 @@ use gpui_kit::{
     *,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -78,8 +78,41 @@ impl PatchSource {
 enum PatchState {
     #[default]
     Loading,
-    Ready(Arc<Vec<DiffLine>>),
+    Ready(Arc<git::FilePatch>, PatchLineSelection),
     Error(String),
+}
+#[derive(Clone, Debug, Default)]
+struct PatchLineSelection {
+    rows: BTreeSet<usize>,
+    anchor: Option<usize>,
+}
+impl PatchLineSelection {
+    fn select(&mut self, lines: &[DiffLine], row: usize, extend: bool, additive: bool) {
+        if !lines.get(row).is_some_and(|l| matches!(l.kind, '+' | '-')) {
+            return;
+        }
+        if extend {
+            let anchor = self.anchor.unwrap_or(row);
+            if !additive {
+                self.rows.clear();
+            }
+            self.rows.extend(
+                (anchor.min(row)..=anchor.max(row))
+                    .filter(|&i| lines.get(i).is_some_and(|l| matches!(l.kind, '+' | '-'))),
+            );
+            self.anchor = Some(anchor);
+        } else {
+            if additive {
+                if !self.rows.remove(&row) {
+                    self.rows.insert(row);
+                }
+            } else {
+                self.rows.clear();
+                self.rows.insert(row);
+            }
+            self.anchor = Some(row);
+        }
+    }
 }
 #[derive(Clone)]
 enum Modal {
@@ -494,6 +527,10 @@ impl GitBuddy {
                                 .into_iter()
                                 .filter(|source| this.active.expanded.contains(&source.key()))
                                 .collect();
+                            // Collapsed patches must not retain stale content or line selections.
+                            let visible: HashSet<_> =
+                                sources.iter().map(PatchSource::key).collect();
+                            this.active.patches.retain(|key, _| visible.contains(key));
                             for source in sources {
                                 this.load_patch(source, cx);
                             }
@@ -933,8 +970,28 @@ fn expand_path(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Loaded, RepoTab, Selection};
+    use super::{Loaded, PatchLineSelection, RepoTab, Selection};
     use gitbuddy::git::{Operation, Repository};
+
+    #[test]
+    fn line_selection_supports_ranges_toggles_and_ignores_context() {
+        let lines = gitbuddy::git::diff_lines("@@ -1,4 +1,4 @@\n-a\n+b\n context\n-c\n+d\n end\n");
+        let mut selection = PatchLineSelection::default();
+        selection.select(&lines, 1, false, false);
+        selection.select(&lines, 5, true, false);
+        assert_eq!(
+            selection.rows.iter().copied().collect::<Vec<_>>(),
+            [1, 2, 4, 5]
+        );
+        selection.select(&lines, 2, true, false);
+        assert_eq!(selection.rows.iter().copied().collect::<Vec<_>>(), [1, 2]);
+        selection.select(&lines, 4, false, true);
+        selection.select(&lines, 1, false, true);
+        assert_eq!(selection.rows.iter().copied().collect::<Vec<_>>(), [2, 4]);
+        selection.select(&lines, 3, false, false);
+        selection.select(&lines, usize::MAX, false, false);
+        assert_eq!(selection.rows.iter().copied().collect::<Vec<_>>(), [2, 4]);
+    }
 
     #[test]
     fn new_tab_keeps_history_when_refreshed_after_an_operation() {

@@ -23,12 +23,13 @@ impl GitBuddy {
             .entry(key.clone())
             .or_insert(PatchState::Loading);
         let task = cx.background_executor().spawn(async move {
-            let raw = match source {
-                PatchSource::Work(file, staged) => repo.diff(&file, staged),
-                PatchSource::Commit(id, file) => repo.commit_file_diff(&id, &file),
+            let patch = match source {
+                PatchSource::Work(file, staged) => repo.worktree_patch(&file, staged),
+                PatchSource::Commit(id, file) => repo
+                    .commit_file_diff(&id, &file)
+                    .map(|raw| git::FilePatch::read_only(&raw)),
             }?;
-            let lines = git::diff_preview(&raw);
-            anyhow::Ok(Arc::new(lines))
+            anyhow::Ok(Arc::new(patch))
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -37,10 +38,18 @@ impl GitBuddy {
                 if this.patch_generation != generation {
                     return;
                 }
+                let selection = match (&result, this.active.patches.get(&key)) {
+                    (Ok(next), Some(PatchState::Ready(previous, selection)))
+                        if next.partial == previous.partial && next.lines == previous.lines =>
+                    {
+                        selection.clone()
+                    }
+                    _ => PatchLineSelection::default(),
+                };
                 this.active.patches.insert(
                     key,
                     match result {
-                        Ok(lines) => PatchState::Ready(lines),
+                        Ok(patch) => PatchState::Ready(patch, selection),
                         Err(error) => PatchState::Error(error.to_string()),
                     },
                 );
@@ -50,24 +59,194 @@ impl GitBuddy {
         .detach();
     }
 
-    pub(super) fn patch_body(&self, key: &PatchKey, id: impl Into<ElementId>) -> AnyElement {
+    pub(super) fn patch_body(
+        &self,
+        key: &PatchKey,
+        id: impl Into<ElementId>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = id.into();
         match self.active.patches.get(key) {
-            Some(PatchState::Ready(lines)) if !lines.is_empty() => {
-                let height = (lines.len() as f32 * 20.).min(420.);
-                let lines = lines.clone();
+            Some(PatchState::Ready(patch, selection)) if !patch.lines.is_empty() => {
+                let height = (patch.lines.len() as f32 * 20.).min(420.);
+                let key = key.clone();
+                let action_key = key.clone();
+                let clear_key = key.clone();
+                let staged = matches!(key, PatchKey::Work(_, true));
+                let selected = selection.rows.len();
                 // Independent horizontal/vertical scrolling keeps other file headers reachable.
-                uniform_list(id, lines.len(), move |range, _, _| {
-                    range.map(|i| patch_line(&lines[i])).collect()
-                })
+                let list = uniform_list(
+                    "patch-lines",
+                    patch.lines.len(),
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        let Some(PatchState::Ready(patch, selection)) =
+                            this.active.patches.get(&key)
+                        else {
+                            return Vec::new();
+                        };
+                        range
+                            .filter(|&i| i < patch.lines.len())
+                            .map(|i| {
+                                let line = &patch.lines[i];
+                                if let Some(partial) = &patch.partial {
+                                    if line.kind == '@' {
+                                        let partial = partial.clone();
+                                        return h_flex()
+                                            .h(px(20.))
+                                            .bg(rgb(0x2d3b4d))
+                                            .gap_2()
+                                            .child(
+                                                this.button(
+                                                    ("partial-hunk", i),
+                                                    if staged {
+                                                        "Unstage hunk"
+                                                    } else {
+                                                        "Stage hunk"
+                                                    },
+                                                )
+                                                .h(px(18.))
+                                                .ghost()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.perform(
+                                                        Operation::ApplyPartial {
+                                                            patch: partial.clone(),
+                                                            selection: git::PatchSelection::Hunk(i),
+                                                        },
+                                                        cx,
+                                                    );
+                                                })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family("Menlo")
+                                                    .text_size(px(11.))
+                                                    .text_color(rgb(0x9fbfe9))
+                                                    .whitespace_nowrap()
+                                                    .child(line.text.clone()),
+                                            )
+                                            .into_any_element();
+                                    }
+                                    if matches!(line.kind, '+' | '-') {
+                                        let key = key.clone();
+                                        let expected = patch.clone();
+                                        return patch_line(line, selection.rows.contains(&i))
+                                            .id(("partial-line", i))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(
+                                                move |this, event: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    if this.busy {
+                                                        return;
+                                                    }
+                                                    if let Some(PatchState::Ready(
+                                                        current,
+                                                        selection,
+                                                    )) = this.active.patches.get_mut(&key)
+                                                        && Arc::ptr_eq(current, &expected)
+                                                    {
+                                                        let modifiers = event.modifiers();
+                                                        selection.select(
+                                                            &current.lines,
+                                                            i,
+                                                            modifiers.shift,
+                                                            modifiers.platform || modifiers.control,
+                                                        );
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                            .into_any_element();
+                                    }
+                                }
+                                patch_line(line, false).into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
                 .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
                 .h(px(height))
-                .w_full()
-                .into_any_element()
+                .w_full();
+                v_flex()
+                    .id(id)
+                    .when(patch.partial.is_some(), |col| {
+                        col.child(
+                            h_flex()
+                                .h(px(28.))
+                                .px_3()
+                                .gap_2()
+                                .bg(rgb(PANEL))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(MUTED))
+                                        .child(if selected == 0 {
+                                            "Click ± lines · Shift range · ⌘/Ctrl multi-select"
+                                                .into()
+                                        } else {
+                                            format!("{selected} changed lines selected")
+                                        }),
+                                )
+                                .child(
+                                    self.button("clear-line-selection", "Clear")
+                                        .ghost()
+                                        .disabled(self.busy || selected == 0)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(PatchState::Ready(_, selection)) =
+                                                this.active.patches.get_mut(&clear_key)
+                                            {
+                                                *selection = PatchLineSelection::default();
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    self.button(
+                                        "apply-line-selection",
+                                        if staged {
+                                            "Unstage selected"
+                                        } else {
+                                            "Stage selected"
+                                        },
+                                    )
+                                    .disabled(self.busy || selected == 0)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if let Some(PatchState::Ready(patch, selection)) =
+                                                this.active.patches.get(&action_key)
+                                                && let Some(partial) = &patch.partial
+                                            {
+                                                let operation = Operation::ApplyPartial {
+                                                    patch: partial.clone(),
+                                                    selection: git::PatchSelection::Lines(
+                                                        selection.rows.iter().copied().collect(),
+                                                    ),
+                                                };
+                                                this.perform(operation, cx);
+                                            }
+                                        },
+                                    )),
+                                ),
+                        )
+                    })
+                    .when_some(patch.unavailable.clone(), |col, reason| {
+                        col.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(reason),
+                        )
+                    })
+                    .child(list)
+                    .into_any_element()
             }
             state => {
                 let (label, color) = match state {
                     Some(PatchState::Error(error)) => (error.clone(), 0xe9a3a9),
-                    Some(PatchState::Ready(_)) => (
+                    Some(PatchState::Ready(_, _)) => (
                         "No text changes · empty file or metadata-only change".into(),
                         MUTED,
                     ),
@@ -232,7 +411,7 @@ impl GitBuddy {
                                     .child(patch_stat(self.active.patches.get(&key))),
                             )
                             .when(expanded, |col| {
-                                col.child(self.patch_body(&key, ("commit-patch", index)))
+                                col.child(self.patch_body(&key, ("commit-patch", index), cx))
                             })
                     }))
                     .when(detail.files.is_empty(), |col| {
@@ -283,7 +462,7 @@ impl GitBuddy {
                                 cx.stop_propagation();let mut paths=vec![action.path.clone()];if let Some(old)=&action.original {paths.push(old.clone());}
                                 this.perform(if staged {Operation::Unstage(paths)} else {Operation::Stage(paths)},cx);
                             }))))
-                    .when(expanded, |col|col.child(self.patch_body(&key,(if staged {"staged-patch"} else {"work-patch"},index))))
+                    .when(expanded, |col|col.child(self.patch_body(&key,(if staged {"staged-patch"} else {"work-patch"},index),cx)))
             }))
     }
 }
@@ -305,18 +484,18 @@ fn status_badge(status: char) -> impl IntoElement {
         .child(status.to_string())
 }
 fn patch_stat(state: Option<&PatchState>) -> impl IntoElement {
-    let text = if let Some(PatchState::Ready(lines)) = state {
+    let text = if let Some(PatchState::Ready(patch, _)) = state {
         format!(
             "+{}  −{}",
-            lines.iter().filter(|l| l.kind == '+').count(),
-            lines.iter().filter(|l| l.kind == '-').count()
+            patch.lines.iter().filter(|l| l.kind == '+').count(),
+            patch.lines.iter().filter(|l| l.kind == '-').count()
         )
     } else {
         String::new()
     };
     div().text_size(px(10.)).text_color(rgb(MUTED)).child(text)
 }
-fn patch_line(line: &DiffLine) -> impl IntoElement + use<> {
+fn patch_line(line: &DiffLine, selected: bool) -> Div {
     let (background, foreground) = match line.kind {
         '+' => (0x293e38, 0xb8e5c6),
         '-' => (0x443137, 0xedb5b7),
@@ -327,7 +506,14 @@ fn patch_line(line: &DiffLine) -> impl IntoElement + use<> {
         .h(px(20.))
         .font_family("Menlo")
         .text_size(px(11.))
-        .bg(rgb(background))
+        .bg(rgb(if selected { 0x375776 } else { background }))
+        .child(
+            div()
+                .w(px(18.))
+                .flex_shrink_0()
+                .text_color(rgb(ACCENT))
+                .child(if selected { "▎" } else { "" }),
+        )
         .child(
             div()
                 .w(px(38.))

@@ -8,7 +8,7 @@ use std::{
 pub struct Repository {
     pub root: PathBuf,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChange {
     pub path: PathBuf,
     pub original: Option<PathBuf>,
@@ -79,6 +79,10 @@ pub struct Snapshot {
 pub enum Operation {
     Stage(Vec<PathBuf>),
     Unstage(Vec<PathBuf>),
+    ApplyPartial {
+        patch: std::sync::Arc<PartialPatch>,
+        selection: PatchSelection,
+    },
     StageAll,
     UnstageAll,
     Discard(PathBuf),
@@ -144,12 +148,15 @@ pub fn parse_status(bytes: &[u8]) -> Vec<FileChange> {
 
 #[path = "git/libgit.rs"]
 mod libgit;
+#[path = "git/partial.rs"]
+mod partial;
+pub use partial::{FilePatch, PartialPatch, PatchSelection};
 
 /// Shared progress sink shown in the status bar during network operations.
 /// `Arc<Mutex<...>>` because libgit2 callbacks fire from worker threads.
 pub type ProgressSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(&str) + Send>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub old: String,
     pub new: String,

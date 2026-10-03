@@ -13,7 +13,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-fn raw(repo: &Repository) -> Result<RawRepo> {
+pub(super) fn raw(repo: &Repository) -> Result<RawRepo> {
     RawRepo::open(&repo.root).context("无法打开 Git 仓库")
 }
 
@@ -109,7 +109,7 @@ fn patch_text(diff: &Diff<'_>, paths: Option<&[PathBuf]>) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-fn head_tree(repo: &RawRepo) -> Result<Option<git2::Tree<'_>>> {
+pub(super) fn head_tree(repo: &RawRepo) -> Result<Option<git2::Tree<'_>>> {
     match repo.head() {
         Ok(head) => Ok(Some(head.peel_to_commit()?.tree()?)),
         Err(error)
@@ -121,7 +121,7 @@ fn head_tree(repo: &RawRepo) -> Result<Option<git2::Tree<'_>>> {
     }
 }
 
-fn diff_for(repo: &RawRepo, staged: bool) -> Result<Diff<'_>> {
+pub(super) fn diff_for(repo: &RawRepo, staged: bool) -> Result<Diff<'_>> {
     let mut opts = DiffOptions::new();
     opts.include_typechange(true)
         .include_untracked(true)
@@ -628,6 +628,7 @@ impl Repository {
     ) -> Result<String> {
         let mut repo = raw(self)?;
         match operation {
+            Operation::ApplyPartial { patch, selection } => self.apply_partial(&patch, &selection),
             Operation::Stage(paths) => {
                 ensure!(!paths.is_empty(), "没有选择文件");
                 let mut index = repo.index()?;
