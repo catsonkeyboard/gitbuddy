@@ -63,6 +63,7 @@ pub struct Snapshot {
     /// State fingerprint including HEAD, refs, statuses, index blob IDs and
     /// changed-file metadata, used to avoid unnecessary snapshot rebuilds.
     pub fingerprint: u64,
+    pub head_id: Option<String>,
     pub branch: String,
     pub upstream: String,
     pub ahead: usize,
@@ -87,6 +88,19 @@ pub enum Operation {
     UnstageAll,
     Discard(PathBuf),
     Commit(String),
+    Amend {
+        context: std::sync::Arc<CommitEdit>,
+        message: String,
+    },
+    UndoLast(HeadState),
+    RestoreReflog {
+        expected: HeadState,
+        target: ReflogTarget,
+    },
+    RecoverBranch {
+        target: ReflogTarget,
+        name: String,
+    },
     CreateBranch(String),
     Checkout(String),
     DeleteBranch(String),
@@ -151,6 +165,9 @@ mod libgit;
 #[path = "git/partial.rs"]
 mod partial;
 pub use partial::{FilePatch, PartialPatch, PatchSelection};
+#[path = "git/recovery.rs"]
+mod recovery;
+pub use recovery::{CommitEdit, HeadState, ReflogEntry, ReflogPage, ReflogTarget};
 
 /// Shared progress sink shown in the status bar during network operations.
 /// `Arc<Mutex<...>>` because libgit2 callbacks fire from worker threads.

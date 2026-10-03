@@ -17,7 +17,7 @@ pub(super) fn raw(repo: &Repository) -> Result<RawRepo> {
     RawRepo::open(&repo.root).context("无法打开 Git 仓库")
 }
 
-fn oid(id: &str) -> Result<Oid> {
+pub(super) fn oid(id: &str) -> Result<Oid> {
     ensure!(
         matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()),
         "无效的提交 ID"
@@ -25,7 +25,7 @@ fn oid(id: &str) -> Result<Oid> {
     Ok(Oid::from_str(id)?)
 }
 
-fn author(repo: &RawRepo) -> Result<git2::Signature<'static>> {
+pub(super) fn author(repo: &RawRepo) -> Result<git2::Signature<'static>> {
     let config = repo.config()?;
     let name = config
         .get_string("user.name")
@@ -401,12 +401,23 @@ impl Repository {
         let mut repo = raw(self)?;
         let files = file_changes(&repo)?;
         let head = repo.head().ok();
+        let head_id = head
+            .as_ref()
+            .and_then(|h| h.target())
+            .map(|id| id.to_string());
         let fingerprint = fingerprint_of(&repo, head.as_ref(), &files)?;
         let branch = head
             .as_ref()
             .and_then(|h| h.shorthand().ok())
-            .unwrap_or("detached HEAD")
-            .to_string();
+            .map(str::to_string)
+            .or_else(|| {
+                repo.find_reference("HEAD")
+                    .ok()?
+                    .symbolic_target()
+                    .ok()?
+                    .map(|name| name.trim_start_matches("refs/heads/").to_string())
+            })
+            .unwrap_or_else(|| "detached HEAD".into());
         let mut upstream = String::new();
         let mut ahead = 0;
         let mut behind = 0;
@@ -483,6 +494,7 @@ impl Repository {
         let merging = repo.state() == RepositoryState::Merge;
         Ok(Snapshot {
             fingerprint,
+            head_id,
             branch,
             upstream,
             ahead,
@@ -628,6 +640,12 @@ impl Repository {
     ) -> Result<String> {
         let mut repo = raw(self)?;
         match operation {
+            Operation::Amend { context, message } => self.amend(&context, &message),
+            Operation::UndoLast(expected) => self.undo_last(&expected),
+            Operation::RestoreReflog { expected, target } => {
+                self.restore_reflog(&expected, &target)
+            }
+            Operation::RecoverBranch { target, name } => self.recover_branch(&target, &name),
             Operation::ApplyPartial { patch, selection } => self.apply_partial(&patch, &selection),
             Operation::Stage(paths) => {
                 ensure!(!paths.is_empty(), "没有选择文件");

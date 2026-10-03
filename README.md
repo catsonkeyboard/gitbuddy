@@ -31,8 +31,9 @@ open dist/GitBuddy.app
 | 仓库 | 打开、初始化、克隆、多仓库标签、最近仓库、每 10 秒刷新、手动刷新 |
 | 工作区 | 已暂存 / 未暂存状态、按文件 / hunk / 选中行暂存与取消暂存、全部暂存 / 取消暂存、重命名、删除、冲突识别 |
 | 差异 | 工作区、暂存区、历史提交按文件折叠；点击文件才加载该文件的统一 diff；红绿增删行、双侧行号、虚拟滚动；二进制和大文件提示 |
-| 提交 | 多行提交说明、提交已暂存文件、复制提交 ID、revert、cherry-pick 及继续 / 中止 |
+| 提交 | 多行提交说明、提交已暂存文件、Amend、撤销最近一次提交、复制提交 ID、revert、cherry-pick 及继续 / 中止 |
 | 历史 | 所有分支的提交、作者、相对时间、哈希、引用标记；按父提交绘制分支与合并线；在已加载历史中搜索；分页加载 |
+| 恢复 | HEAD Reflog 分页查看、选择操作前 / 后的提交、创建恢复分支、恢复当前分支位置 |
 | 分支 | 创建并切换、本地切换、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
 | 远程 | 添加 remote、fetch/prune、pull --ff-only、按配置的上游分支 push（支持不同名分支）、首次推送到 origin 并设置 upstream、领先 / 落后计数 |
 | Stash | 保存（包含未跟踪文件）、应用并保留、确认后删除 |
@@ -48,6 +49,16 @@ open dist/GitBuddy.app
 新增行与删除行独立选择：若要暂存一次完整替换，请同时选中对应的红、绿行。部分操作只更新暂存区，不改写工作区，保留其他文件与未选中行；操作完成后刷新 diff。外部编辑、HEAD 或暂存区变化导致 diff 过期时会拒绝执行，需重新选择。普通的新建、删除文件也支持部分操作；文件权限变化、重命名、二进制、符号链接、子模块、冲突及截断预览应使用整文件操作。
 
 ## 操作约定
+
+### Amend、撤销提交与 Reflog 恢复
+
+- **Amend**：从工作区的 **Amend…** 或 **Repository → Amend latest commit…** 打开。预填原提交说明，使用已暂存内容替换 HEAD，保留原作者和父提交，更新提交者；没有新暂存改动时可只修改说明。编辑框独立于普通提交草稿。
+- **撤销最近一次提交**：选择 **Repository → Undo latest commit…**。HEAD 回到第一个父提交，暂存区与工作区保持原样；合并提交也按第一个父提交回退。撤销首次提交后，当前分支回到尚未提交的状态，文件仍在暂存区；分离 HEAD 下的首次提交需先创建分支。
+- **Reflog 恢复**：选择 **Repository → Reflog / Recover…**，点击记录中的 **Before / After** 选择操作前后的确切提交。**Create recovery branch…** 新建分支但不切换；**Restore current branch…** 只恢复当前分支（或分离 HEAD）的位置，保留暂存区与工作区，因此相对目标提交的差异可能变成已暂存修改。
+
+改写前会再次校验 HEAD；Amend 还校验暂存快照，打开对话框后发生变化则拒绝执行。未完成的合并、rebase、cherry-pick、revert 或索引冲突会阻止改写历史，但仍可从 Reflog 创建独立恢复分支。历史改写会保留 HEAD Reflog 记录，不自动推送；已被 Git 清理的提交对象无法恢复。
+
+### 通用约定
 
 - 仓库操作由 Rust `git2` 在后台调用 `libgit2` 完成，应用运行时不会启动 Bash 或系统 `git`。单文件操作按字面路径匹配，支持空格、换行、通配字符及 Unix 非 UTF-8 文件名。
 - 丢弃操作只恢复工作区到暂存区版本，不清除已暂存内容；不提供批量删除未跟踪文件的快捷操作。
@@ -78,13 +89,16 @@ cargo test --locked
 - `src/git.rs`：仓库数据类型、diff 行号处理与共享预览上限（`diff_preview`）、进度通道类型。
 - `src/git/libgit.rs`：基于 `git2` / `libgit2` 的仓库快照（含变化指纹）、差异、Git 操作与网络进度回调。
 - `src/git/partial.rs`：结构化 hunk / 行选择、过期校验与暂存区内容重建，保留原始字节及换行。
+- `src/git/recovery.rs`：Amend、保留暂存区的提交撤销、HEAD Reflog 与恢复；使用引用锁和快照校验防止操作落到已切换的分支。
 - `src/ui.rs`：状态机核心——多仓库标签（`tabs` + `active` 两段式）、后台任务分发（`dispatch`）、异步代际控制。
 - `src/ui/graph.rs`：提交分支及合并线布局。
 - `src/ui/patches.rs`：按文件懒加载的 diff 面板。
 - `src/ui/history.rs`、`src/ui/sidebar.rs`、`src/ui/toolbar.rs`、`src/ui/detail.rs`、`src/ui/modals.rs`：对应界面区域。
+- `src/ui/recovery.rs`：异步加载历史操作对话框、独立 Amend 编辑器与 Reflog 恢复列表。
 - `src/settings.rs`：最近仓库记录（损坏时备份为 `.json.broken` 并重建）。
 - `tests/git_workflows.rs`：真实 Git 仓库的集成测试。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。
+- `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。
 - `examples/demo_repo.rs`：可重复生成的隔离演示仓库。
 
 ## 性能设计

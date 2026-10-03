@@ -3,6 +3,7 @@ mod graph;
 mod history;
 mod modals;
 mod patches;
+mod recovery;
 mod sidebar;
 mod toolbar;
 use gitbuddy::{
@@ -37,6 +38,9 @@ gpui_kit::actions!(
         EditIdentity,
         Refresh,
         CommitChanges,
+        AmendCommit,
+        UndoCommit,
+        OpenReflog,
         Quit,
         CloseModal
     ]
@@ -129,6 +133,22 @@ enum Modal {
     CommitActions(String),
     TagActions(String),
     Confirm(String, Operation),
+    History(HistoryKind),
+    RecoveryBranch(git::ReflogTarget),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryKind {
+    Amend,
+    Undo,
+    Reflog,
+}
+#[derive(Default)]
+enum HistoryData {
+    #[default]
+    Loading,
+    Edit(Arc<git::CommitEdit>),
+    Reflog(Arc<git::ReflogPage>),
+    Error(String),
 }
 struct Loaded {
     repo: Repository,
@@ -140,6 +160,7 @@ struct Loaded {
     error: bool,
     clear_message: bool,
     open_as_tab: bool,
+    retry_modal: Option<Modal>,
 }
 impl Loaded {
     fn read(
@@ -180,6 +201,7 @@ impl Loaded {
             error,
             clear_message,
             open_as_tab,
+            retry_modal: None,
         })
     }
 }
@@ -240,6 +262,12 @@ pub struct GitBuddy {
     form_b: Entity<InputState>,
     clear_message: bool,
     modal: Option<Modal>,
+    history_data: HistoryData,
+    history_generation: u64,
+    reflog_limit: usize,
+    reflog_selected: Option<git::ReflogTarget>,
+    amend_message: Entity<TextareaState>,
+    restore_amend_message: Option<String>,
     busy: bool,
     settings: Settings,
     focus: FocusHandle,
@@ -267,15 +295,21 @@ impl GitBuddy {
         });
         let form_a = cx.new(|cx| InputState::new(window, cx));
         let form_b = cx.new(|cx| InputState::new(window, cx));
-        let subscriptions =
-            vec![
-                cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.active.query = this.search.read(cx).value().to_string().to_lowercase();
-                        cx.notify();
-                    }
-                }),
-            ];
+        let amend_message =
+            cx.new(|cx| TextareaState::new(window, cx).placeholder("Commit message"));
+        let subscriptions = vec![
+            cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.active.query = this.search.read(cx).value().to_string().to_lowercase();
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&amend_message, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        ];
         let settings = Settings::load();
         let initial = path.or_else(|| settings.recent.first().cloned());
         let focus = cx.focus_handle();
@@ -297,6 +331,12 @@ impl GitBuddy {
             form_b,
             clear_message: false,
             modal: None,
+            history_data: HistoryData::default(),
+            history_generation: 0,
+            reflog_limit: 100,
+            reflog_selected: None,
+            amend_message,
+            restore_amend_message: None,
             busy: false,
             settings,
             focus,
@@ -518,6 +558,9 @@ impl GitBuddy {
                             this.active.notice = loaded.notice;
                         }
                         this.active.error = loaded.error;
+                        if let Some(modal) = loaded.retry_modal {
+                            this.modal = Some(modal);
+                        }
                         this.clear_message = loaded.clear_message || changed;
                         // Working tree content can change outside the app. Reload only open patches.
                         if this.active.commit_detail.is_none() {
@@ -729,7 +772,16 @@ impl GitBuddy {
             return;
         };
         let clear_message = matches!(operation, Operation::Commit(_));
-        let selection = if clear_message {
+        let history_edit = matches!(
+            operation,
+            Operation::Amend { .. } | Operation::UndoLast(_) | Operation::RestoreReflog { .. }
+        );
+        let retry_modal = if matches!(operation, Operation::Amend { .. }) {
+            self.modal.clone()
+        } else {
+            None
+        };
+        let selection = if clear_message || history_edit {
             Selection::Work
         } else {
             self.active.selection.clone()
@@ -750,7 +802,7 @@ impl GitBuddy {
                     ),
                     Err(err) => (format!("{err:#}"), true),
                 };
-                Loaded::read(
+                let mut loaded = Loaded::read(
                     repo,
                     selection,
                     limit,
@@ -758,7 +810,11 @@ impl GitBuddy {
                     error,
                     clear_message && !error,
                     false,
-                )
+                )?;
+                if error {
+                    loaded.retry_modal = retry_modal;
+                }
+                Ok(loaded)
             },
             cx,
         );
@@ -845,6 +901,14 @@ impl Render for GitBuddy {
             self.message
                 .update(cx, |state, cx| state.set_value(value, window, cx));
         }
+        if let Some(value) = self.restore_amend_message.take() {
+            self.amend_message
+                .update(cx, |state, cx| state.set_value(value, window, cx));
+            self.amend_message
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+        }
         if self.clear_message {
             self.clear_message = false;
             self.message
@@ -865,6 +929,15 @@ impl Render for GitBuddy {
                 this.refresh_with_notice("Refreshed".into(), cx)
             }))
             .on_action(cx.listener(|this, _: &CommitChanges, _, cx| this.commit(cx)))
+            .on_action(cx.listener(|this, _: &AmendCommit, w, cx| {
+                this.begin_history(HistoryKind::Amend, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UndoCommit, w, cx| {
+                this.begin_history(HistoryKind::Undo, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenReflog, w, cx| {
+                this.begin_history(HistoryKind::Reflog, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &CloneRepository, window, cx| {
                 this.show_modal(Modal::Clone, window, cx)
             }))

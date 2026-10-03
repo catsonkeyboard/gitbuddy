@@ -57,11 +57,17 @@ impl GitBuddy {
             Modal::Stash => self.perform(Operation::Stash(a), cx),
             Modal::Identity => self.perform(Operation::SetIdentity(a, b), cx),
             Modal::Confirm(_, operation) => self.perform(operation, cx),
+            Modal::RecoveryBranch(target) => {
+                self.perform(Operation::RecoverBranch { target, name: a }, cx)
+            }
             _ => {}
         }
     }
 
-    pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if let Modal::History(kind) = modal {
+            return self.history_modal(kind, cx);
+        }
         let (title, label_a, label_b, submit) = match &modal {
             Modal::Open => ("Open repository", "Local repository path", None, "Open"),
             Modal::Init => (
@@ -106,6 +112,13 @@ impl GitBuddy {
             Modal::StashActions(..) => ("Stash actions", "", None, ""),
             Modal::CommitActions(..) => ("Commit actions", "", None, ""),
             Modal::TagActions(..) => ("Tag actions", "", None, ""),
+            Modal::RecoveryBranch(..) => (
+                "Create recovery branch",
+                "New branch name (current branch stays unchanged)",
+                None,
+                "Create branch",
+            ),
+            Modal::History(_) => unreachable!(),
         };
         let mut card = v_flex()
             .w(px(540.))
@@ -216,6 +229,20 @@ impl GitBuddy {
                         );
             }
             Modal::CommitActions(id) => {
+                if self.snapshot.head_id.as_ref() == Some(&id) {
+                    card = card
+                        .child(
+                            self.button("amend-head", "Amend this HEAD commit…")
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.begin_history(HistoryKind::Amend, w, cx)
+                                })),
+                        )
+                        .child(self.button("undo-head", "Undo this HEAD commit…").on_click(
+                            cx.listener(|this, _, w, cx| {
+                                this.begin_history(HistoryKind::Undo, w, cx)
+                            }),
+                        ));
+                }
                 let revert = id.clone();
                 let cherry = id.clone();
                 let copy = id.clone();
@@ -340,5 +367,6 @@ impl GitBuddy {
             .bg(rgba(0x00000099))
             .occlude()
             .child(card)
+            .into_any_element()
     }
 }

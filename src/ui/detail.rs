@@ -58,6 +58,8 @@ impl GitBuddy {
                 .child(h_flex().justify_between().child(section("COMMIT CHANGES")).child(div().text_xs().text_color(rgb(MUTED)).child("⌘ Enter to commit")))
                 .child(Textarea::new(&self.message).h(px(64.)).appearance(false))
                 .child(h_flex().gap_2().justify_end()
+                    .child(self.button("amend-latest", "Amend…").ghost().disabled(self.busy || self.snapshot.head_id.is_none())
+                        .on_click(cx.listener(|this,_,w,cx|this.begin_history(HistoryKind::Amend,w,cx))))
                     .child(self.button("stash-work","Stash…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Stash,w,cx))))
                     .child(self.button("commit",format!("Commit {staged} file{}",if staged==1{""}else{"s"})).primary().disabled(self.busy||staged==0||self.snapshot.files.iter().any(|f|f.conflict())).on_click(cx.listener(|this,_,_,cx|this.commit(cx))))))
             .when(self.snapshot.files.iter().any(|f|f.conflict())||self.snapshot.merging,|col|col.child(v_flex().p_3().gap_2().bg(rgb(0x51432d)).child("Merge / conflict in progress. Resolve files in your editor, stage them, then commit.")

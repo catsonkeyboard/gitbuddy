@@ -10,6 +10,7 @@ impl GitBuddy {
             .unwrap_or_else(|| "GitBuddy".into());
         let focus = self.focus.clone();
         let has_repo = self.repo.is_some();
+        let has_head = self.snapshot.head_id.is_some();
         h_flex()
             .h(px(44.))
             .px_3()
@@ -56,6 +57,25 @@ impl GitBuddy {
                                 "Initialize repository…",
                                 IconName::Plus,
                                 Box::new(InitRepository),
+                            )
+                            .separator()
+                            .menu_with_icon_and_disabled(
+                                "Amend latest commit…",
+                                IconName::FileText,
+                                Box::new(AmendCommit),
+                                !has_head,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Undo latest commit…",
+                                IconName::ArrowLeft,
+                                Box::new(UndoCommit),
+                                !has_head,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Reflog / Recover…",
+                                IconName::RotateCw,
+                                Box::new(OpenReflog),
+                                !has_repo,
                             )
                             .separator()
                             .menu_with_icon_and_disabled(
