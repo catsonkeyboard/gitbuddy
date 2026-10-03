@@ -19,6 +19,10 @@ cargo run --locked -- /absolute/path/to/repository
 cargo run --locked --example demo_repo
 cargo run --locked -- ./target/demo-repo
 
+# 创建四种冲突的独立演示仓库（全部使用 libgit2）
+cargo run --locked --example demo_conflicts
+cargo run --locked -- ./target/demo-conflicts
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -30,6 +34,7 @@ open dist/GitBuddy.app
 | --- | --- |
 | 仓库 | 打开、初始化、克隆、多仓库标签、最近仓库、每 10 秒刷新、手动刷新 |
 | 工作区 | 已暂存 / 未暂存状态、按文件 / hunk / 选中行暂存与取消暂存、全部暂存 / 取消暂存、重命名、删除、冲突识别 |
+| 冲突处理 | 按文件查看 Ours / Base / Theirs、编辑合并结果、选择完整版本或删除、保存并标记解决、继续 / 中止 merge、cherry-pick、revert |
 | 差异 | 工作区、暂存区、历史提交按文件折叠；点击文件才加载该文件的统一 diff；红绿增删行、双侧行号、虚拟滚动；二进制和大文件提示 |
 | 提交 | 多行提交说明、提交已暂存文件、Amend、撤销最近一次提交、复制提交 ID、revert、cherry-pick 及继续 / 中止 |
 | 历史 | 所有分支的提交、作者、相对时间、哈希、引用标记；按父提交绘制分支与合并线；在已加载历史中搜索；分页加载 |
@@ -51,6 +56,18 @@ open dist/GitBuddy.app
 新增行与删除行独立选择：若要暂存一次完整替换，请同时选中对应的红、绿行。部分操作只更新暂存区，不改写工作区，保留其他文件与未选中行；操作完成后刷新 diff。外部编辑、HEAD 或暂存区变化导致 diff 过期时会拒绝执行，需重新选择。普通的新建、删除文件也支持部分操作；文件权限变化、重命名、二进制、符号链接、子模块、冲突及截断预览应使用整文件操作。
 
 ## 操作约定
+
+### 冲突处理
+
+从工作区的 **Resolve conflicts…**、冲突文件行的 **Resolve…** 或 **Repository → Resolve conflicts…** 打开。左侧列出未解决文件，右侧并排显示索引中的 **Ours / Base / Theirs**，下方编辑最终结果。点击 **Use ours / Use theirs** 采用完整版本，**Use working file** 保留当前加载的工作文件；某一侧不存在时可选择删除。Ours / Theirs 指 Git 索引的当前侧 / 传入侧，在 rebase 等操作中不能简单等同于本地 / 远程分支。
+
+**Save & mark resolved** 同时写入工作文件和暂存区，并移除该文件的索引冲突；删除需要确认，其他文件的已暂存内容保留。残留的冲突标记会阻止手工结果和工作文件保存，冲突未全部解决时禁用批量暂存 / 取消暂存。文本草稿随文件和仓库标签保留，但不保存到磁盘，关闭应用会丢失未保存草稿。
+
+外部修改工作文件、冲突索引、HEAD 或操作状态后，过期的保存请求会拒绝执行。**Refresh list** 刷新文件列表，**Reload file** 重新读取三方内容和工作文件；重新加载保留手工文本草稿供复核，完整版本选择则需要重新选择。也可以使用外部编辑器修改文件，再重新加载并选 **Use working file**。
+
+全部解决后可先 **Review working tree** 查看暂存内容，再 **Continue Merge / Cherry-pick / Revert…**。继续操作使用全部已暂存内容和操作原有提交说明，merge 保留两个父提交，cherry-pick 保留原作者；确认后再次校验暂存区和 HEAD。**Abort…** 会恢复 tracked 文件到 HEAD，丢弃操作期间保存的解决结果及其他 tracked 编辑。
+
+内置结果编辑仅支持不超过 2 MB 的 UTF-8 常规文本，三方预览最多显示 20,000 行。二进制、非 UTF-8 和大文件可选择完整版本或使用外部编辑后的工作文件，按原始字节保存。重命名、符号链接和子模块冲突需使用外部工具；rebase 等其他操作可查看 / 解决支持的索引冲突，继续 / 中止需使用外部工具。暂不提供按冲突块自动合并或同步三方滚动。
 
 ### 文件历史、Blame 与版本比较
 
@@ -75,7 +92,7 @@ open dist/GitBuddy.app
 - 删除 stash、丢弃修改、合并、revert 等操作需要在应用内确认。删除分支前检查分支是否已合入当前 HEAD，推送不使用 force。
 - 远程操作通过 `libgit2` 使用 SSH agent / Git credential helper。GUI 不提供终端密码输入，首次 SSH 信任及凭据准备应先完成；错误可在状态栏复制。
 - 合并、cherry-pick 和 revert 要求操作前工作区及暂存区无改动，避免中止操作时覆盖已有修改。
-- 合并冲突显示在工作区；在编辑器解决后暂存并提交。Cherry-pick/revert 的继续和中止入口位于提交的 Actions 菜单。
+- 合并冲突显示在工作区，可进入内置冲突处理界面；Cherry-pick/revert 的继续和中止也保留在提交的 Actions 菜单。
 - 最近仓库记录保存在 `~/.config/gitbuddy/settings.json`。
 
 ## 验证
@@ -90,7 +107,7 @@ cargo test --locked
 
 ## 当前边界
 
-这是可运行的首版客户端，尚未实现交互式 rebase、三方冲突编辑器、Git LFS / 子模块专用管理。提交图依据已加载提交的父子关系绘制；搜索过滤或分页边界外的提交不会显示连线。`libgit2` 创建提交时不会执行用户的 Git hooks 或自动进行 GPG 签名。
+这是可运行的首版客户端，尚未实现交互式 rebase、Git LFS / 子模块专用管理。提交图依据已加载提交的父子关系绘制；搜索过滤或分页边界外的提交不会显示连线。`libgit2` 创建提交时不会执行用户的 Git hooks 或自动进行 GPG 签名。
 
 差异预览最多 20,000 行，未跟踪文件超过 2 MB 不加载正文。远程操作（fetch / pull / push / clone）在状态栏显示传输进度（每 100ms 节流），但尚不支持取消；真实外部服务器认证尚未验收。当前在 macOS 验证，Windows/Linux 尚未验收。生成的 .app 用于本地运行，未做发行签名或公证。
 
@@ -101,18 +118,22 @@ cargo test --locked
 - `src/git/partial.rs`：结构化 hunk / 行选择、过期校验与暂存区内容重建，保留原始字节及换行。
 - `src/git/recovery.rs`：Amend、保留暂存区的提交撤销、HEAD Reflog 与恢复；使用引用锁和快照校验防止操作落到已切换的分支。
 - `src/git/inspect.rs`：固定版本的文件浏览、跨父提交跟随重命名的历史、Blame、两棵树比较与精确文件 patch。
+- `src/git/conflicts.rs`：索引三方内容、结果保存、引用 / 索引锁和过期校验、继续冲突操作。
 - `src/ui.rs`：状态机核心——多仓库标签（`tabs` + `active` 两段式）、后台任务分发（`dispatch`）、异步代际控制。
 - `src/ui/graph.rs`：提交分支及合并线布局。
 - `src/ui/patches.rs`：按文件懒加载的 diff 面板。
 - `src/ui/history.rs`、`src/ui/sidebar.rs`、`src/ui/toolbar.rs`、`src/ui/detail.rs`、`src/ui/modals.rs`：对应界面区域。
 - `src/ui/recovery.rs`：异步加载历史操作对话框、独立 Amend 编辑器与 Reflog 恢复列表。
 - `src/ui/inspect.rs`：文件选择器、文件历史、Blame 虚拟列表和版本比较页面，后台加载及过期结果隔离。
+- `src/ui/conflicts.rs`：三方预览、独立文件草稿、结果编辑、删除确认与继续 / 中止入口。
 - `src/settings.rs`：最近仓库记录（损坏时备份为 `.json.broken` 并重建）。
 - `tests/git_workflows.rs`：真实 Git 仓库的集成测试。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。
 - `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。
 - `tests/repository_inspection.rs`：文件历史 / Blame / 比较的隔离仓库测试，包含合并、重命名后旧名复用、删除后重建、特殊路径和版本固定。
+- `tests/conflict_resolution.rs`：三方版本、删除 / 二进制 / 可执行文件、过期请求、索引锁、多文件独立解决和继续操作的 libgit2 隔离仓库测试。
 - `examples/demo_repo.rs`：可重复生成的隔离演示仓库。
+- `examples/demo_conflicts.rs`：包含文本、二进制、修改 / 删除冲突的隔离演示仓库。
 
 ## 性能设计
 

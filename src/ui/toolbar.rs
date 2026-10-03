@@ -11,6 +11,8 @@ impl GitBuddy {
         let focus = self.focus.clone();
         let has_repo = self.repo.is_some();
         let has_head = self.snapshot.head_id.is_some();
+        let has_conflicts = self.snapshot.files.iter().any(|f| f.conflict())
+            || self.snapshot.conflict_operation != git::ConflictOperation::None;
         h_flex()
             .h(px(44.))
             .px_3()
@@ -59,6 +61,12 @@ impl GitBuddy {
                                 Box::new(InitRepository),
                             )
                             .separator()
+                            .menu_with_icon_and_disabled(
+                                "Resolve conflicts…",
+                                IconName::FileText,
+                                Box::new(OpenConflicts),
+                                !has_conflicts,
+                            )
                             .menu_with_icon_and_disabled(
                                 "File history / Blame…",
                                 IconName::FileText,

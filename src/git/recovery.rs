@@ -47,7 +47,7 @@ pub struct ReflogPage {
     pub total: usize,
 }
 
-fn head_state(repo: &RawRepo) -> Result<HeadState> {
+pub(super) fn head_state(repo: &RawRepo) -> Result<HeadState> {
     let head = repo.find_reference("HEAD")?;
     let reference = head.symbolic_target()?.unwrap_or("HEAD").to_owned();
     ensure!(

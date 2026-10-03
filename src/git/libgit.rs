@@ -493,6 +493,7 @@ impl Repository {
             .collect();
         let merging = repo.state() == RepositoryState::Merge;
         Ok(Snapshot {
+            conflict_operation: super::conflicts::operation(repo.state()),
             fingerprint,
             head_id,
             branch,
@@ -641,6 +642,11 @@ impl Repository {
             }
             Operation::RecoverBranch { target, name } => self.recover_branch(&target, &name),
             Operation::ApplyPartial { patch, selection } => self.apply_partial(&patch, &selection),
+            Operation::ResolveConflict {
+                context,
+                resolution,
+            } => self.resolve_conflict(&context, resolution),
+            Operation::ContinueConflict(session) => self.continue_conflict(&session),
             Operation::Stage(paths) => {
                 ensure!(!paths.is_empty(), "没有选择文件");
                 let mut index = repo.index()?;

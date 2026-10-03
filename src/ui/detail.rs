@@ -11,6 +11,7 @@ impl GitBuddy {
             ),
             Selection::Commit(id) => format!("Commit  {}", &id[..8]),
             Selection::Inspect => self.inspection_title(),
+            Selection::Conflicts => "Resolve conflicts".into(),
         };
         v_flex()
             .flex_1()
@@ -57,7 +58,9 @@ impl GitBuddy {
                         )
                     }),
             )
-            .child(if matches!(self.selection, Selection::Inspect) {
+            .child(if matches!(self.selection, Selection::Conflicts) {
+                self.conflicts_view(cx)
+            } else if matches!(self.selection, Selection::Inspect) {
                 self.inspection_view(cx)
             } else if matches!(self.selection, Selection::Work) {
                 self.summary(cx).into_any_element()
@@ -69,20 +72,113 @@ impl GitBuddy {
     }
     fn summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let staged = self.snapshot.files.iter().filter(|f| f.staged()).count();
-        v_flex().flex_1().min_h_0()
-            .child(v_flex().px_3().py_2().gap_1().border_b_1().border_color(rgb(BORDER))
-                .child(h_flex().justify_between().child(section("COMMIT CHANGES")).child(div().text_xs().text_color(rgb(MUTED)).child("⌘ Enter to commit")))
-                .child(Textarea::new(&self.message).h(px(64.)).appearance(false))
-                .child(h_flex().gap_2().justify_end()
-                    .child(self.button("amend-latest", "Amend…").ghost().disabled(self.busy || self.snapshot.head_id.is_none())
-                        .on_click(cx.listener(|this,_,w,cx|this.begin_history(HistoryKind::Amend,w,cx))))
-                    .child(self.button("stash-work","Stash…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Stash,w,cx))))
-                    .child(self.button("commit",format!("Commit {staged} file{}",if staged==1{""}else{"s"})).primary().disabled(self.busy||staged==0||self.snapshot.files.iter().any(|f|f.conflict())).on_click(cx.listener(|this,_,_,cx|this.commit(cx))))))
-            .when(self.snapshot.files.iter().any(|f|f.conflict())||self.snapshot.merging,|col|col.child(v_flex().p_3().gap_2().bg(rgb(0x51432d)).child("Merge / conflict in progress. Resolve files in your editor, stage them, then commit.")
-                .child(self.button("abort-merge","Abort merge…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm("Abort the current merge?".into(),Operation::AbortMerge),w,cx))))))
-            .child(v_flex().id("changes-scroll").flex_1().min_h_0().overflow_y_scroll()
-                .child(self.file_group(false,cx)).child(self.file_group(true,cx))
-                .when(self.snapshot.files.is_empty(),|col|col.child(v_flex().items_center().justify_center().py_6().gap_3().child(div().text_3xl().text_color(rgb(0x8ec6a5)).child("✓")).child(div().font_weight(FontWeight::MEDIUM).child("Working tree clean")).child(div().text_sm().text_color(rgb(MUTED)).child("Everything is committed. A good place to begin.")))))
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
+                v_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(section("COMMIT CHANGES"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("⌘ Enter to commit"),
+                            ),
+                    )
+                    .child(Textarea::new(&self.message).h(px(64.)).appearance(false))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                self.button("amend-latest", "Amend…")
+                                    .ghost()
+                                    .disabled(self.busy || self.snapshot.head_id.is_none())
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.begin_history(HistoryKind::Amend, w, cx)
+                                    })),
+                            )
+                            .child(self.button("stash-work", "Stash…").on_click(
+                                cx.listener(|this, _, w, cx| this.show_modal(Modal::Stash, w, cx)),
+                            ))
+                            .child(
+                                self.button(
+                                    "commit",
+                                    format!(
+                                        "Commit {staged} file{}",
+                                        if staged == 1 { "" } else { "s" }
+                                    ),
+                                )
+                                .primary()
+                                .disabled(
+                                    self.busy
+                                        || staged == 0
+                                        || self.snapshot.files.iter().any(|f| f.conflict()),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.commit(cx))),
+                            ),
+                    ),
+            )
+            .when(
+                self.snapshot.files.iter().any(|f| f.conflict())
+                    || self.snapshot.conflict_operation != git::ConflictOperation::None,
+                |col| {
+                    col.child(
+                        h_flex()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .bg(rgb(0x51432d))
+                            .child(div().flex_1().text_xs().child(
+                                "Review and resolve conflicts, then continue the operation.",
+                            ))
+                            .child(
+                                self.button("resolve-conflicts", "Resolve conflicts…")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_conflicts(None, cx)),
+                                    ),
+                            ),
+                    )
+                },
+            )
+            .child(
+                v_flex()
+                    .id("changes-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.file_group(false, cx))
+                    .child(self.file_group(true, cx))
+                    .when(self.snapshot.files.is_empty(), |col| {
+                        col.child(
+                            v_flex()
+                                .items_center()
+                                .justify_center()
+                                .py_6()
+                                .gap_3()
+                                .child(div().text_3xl().text_color(rgb(0x8ec6a5)).child("✓"))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Working tree clean"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(MUTED))
+                                        .child("Everything is committed. A good place to begin."),
+                                ),
+                        )
+                    }),
+            )
     }
 
     fn diff_view(&self, cx: &mut Context<Self>) -> impl IntoElement {

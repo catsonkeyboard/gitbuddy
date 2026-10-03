@@ -75,6 +75,7 @@ pub struct Snapshot {
     pub stashes: Vec<(String, String)>,
     pub remotes: Vec<String>,
     pub merging: bool,
+    pub conflict_operation: ConflictOperation,
 }
 #[derive(Clone, Debug)]
 pub enum Operation {
@@ -84,6 +85,11 @@ pub enum Operation {
         patch: std::sync::Arc<PartialPatch>,
         selection: PatchSelection,
     },
+    ResolveConflict {
+        context: std::sync::Arc<ConflictContext>,
+        resolution: ConflictResolution,
+    },
+    ContinueConflict(std::sync::Arc<ConflictSession>),
     StageAll,
     UnstageAll,
     Discard(PathBuf),
@@ -172,6 +178,12 @@ pub use recovery::{CommitEdit, HeadState, ReflogEntry, ReflogPage, ReflogTarget}
 mod inspect;
 pub use inspect::{
     BlameLine, BlameView, Comparison, FileHistory, FileHistoryEntry, Revision, TreeFiles,
+};
+#[path = "git/conflicts.rs"]
+mod conflicts;
+pub use conflicts::{
+    ConflictContext, ConflictFile, ConflictOperation, ConflictResolution, ConflictSession,
+    ConflictSide, has_conflict_markers,
 };
 
 /// Shared progress sink shown in the status bar during network operations.

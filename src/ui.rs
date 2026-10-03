@@ -1,3 +1,4 @@
+mod conflicts;
 mod detail;
 mod graph;
 mod history;
@@ -17,7 +18,7 @@ use gitbuddy::{
 use gpui_kit::{
     component::{
         button::{Button, ButtonVariants},
-        input::{Input, InputEvent, InputState, Textarea, TextareaState},
+        input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
         menu::DropdownMenu,
         *,
     },
@@ -44,6 +45,7 @@ gpui_kit::actions!(
         OpenReflog,
         OpenFileTools,
         CompareRevisions,
+        OpenConflicts,
         Quit,
         CloseModal
     ]
@@ -63,6 +65,7 @@ enum Selection {
     File(FileChange, bool),
     Commit(String),
     Inspect,
+    Conflicts,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum PatchKey {
@@ -232,6 +235,7 @@ pub struct RepoTab {
     show_commit_body: bool,
     inspection: inspect::InspectState,
     comparison_base: Option<String>,
+    conflicts: conflicts::ConflictViewState,
     query: String,
     message: String,
     limit: usize,
@@ -253,6 +257,7 @@ impl Default for RepoTab {
             show_commit_body: false,
             inspection: inspect::InspectState::default(),
             comparison_base: None,
+            conflicts: conflicts::ConflictViewState::default(),
             query: String::new(),
             message: String::new(),
             limit: HISTORY_PAGE_SIZE,
@@ -286,6 +291,9 @@ pub struct GitBuddy {
     restore_amend_message: Option<String>,
     tool_files: Option<Result<Arc<git::TreeFiles>, String>>,
     tool_generation: u64,
+    conflict_generation: u64,
+    conflict_editor: Entity<EditorState>,
+    restore_conflict: Option<String>,
     busy: bool,
     settings: Settings,
     focus: FocusHandle,
@@ -315,7 +323,29 @@ impl GitBuddy {
         let form_b = cx.new(|cx| InputState::new(window, cx));
         let amend_message =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Commit message"));
+        let conflict_editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
         let subscriptions = vec![
+            cx.subscribe_in(
+                &conflict_editor,
+                window,
+                |this, _, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change)
+                        && this.restore_conflict.is_none()
+                        && matches!(this.selection, Selection::Conflicts)
+                    {
+                        let text = this.conflict_editor.read(cx).value().to_string();
+                        if let Some(path) = this.active.conflicts.selected.clone()
+                            && let Some(draft) = this.active.conflicts.drafts.get_mut(&path)
+                            && draft.text != text
+                        {
+                            draft.text = text;
+                            draft.choice = conflicts::ResultChoice::Edited;
+                            draft.dirty = true;
+                        }
+                        cx.notify();
+                    }
+                },
+            ),
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.active.query = this.search.read(cx).value().to_string().to_lowercase();
@@ -362,6 +392,9 @@ impl GitBuddy {
             restore_amend_message: None,
             tool_files: None,
             tool_generation: 0,
+            conflict_generation: 0,
+            conflict_editor,
+            restore_conflict: None,
             busy: false,
             settings,
             focus,
@@ -424,6 +457,11 @@ impl GitBuddy {
         self.modal = None;
         self.patch_generation += 1;
         self.selection_generation += 1;
+        self.conflict_generation += 1;
+        if matches!(self.active.selection, Selection::Conflicts) {
+            self.reload_conflicts(None, cx);
+            self.restore_conflict_editor();
+        }
         if matches!(self.active.selection, Selection::Inspect)
             && let inspect::InspectState::Loading(request) = &self.active.inspection
         {
@@ -590,13 +628,19 @@ impl GitBuddy {
                             this.active.notice = loaded.notice;
                         }
                         this.active.error = loaded.error;
+                        if matches!(this.active.selection, Selection::Conflicts) {
+                            this.reload_conflicts(None, cx);
+                        }
                         if let Some(modal) = loaded.retry_modal {
                             this.modal = Some(modal);
                         }
                         this.clear_message = loaded.clear_message || changed;
                         // Working tree content can change outside the app. Reload only open patches.
                         if this.active.commit_detail.is_none()
-                            && !matches!(this.active.selection, Selection::Inspect)
+                            && !matches!(
+                                this.active.selection,
+                                Selection::Inspect | Selection::Conflicts
+                            )
                         {
                             this.patch_generation += 1;
                             let sources: Vec<_> = this
@@ -627,6 +671,7 @@ impl GitBuddy {
     /// unstaged variants), or for the selected commit's files.
     fn work_and_commit_sources(&self) -> Vec<PatchSource> {
         match &self.active.selection {
+            Selection::Conflicts => Vec::new(),
             Selection::Inspect => self.inspection_sources(),
             Selection::Commit(id) => {
                 self.active
@@ -786,6 +831,7 @@ impl GitBuddy {
                 }
                 cx.notify();
             }
+            Selection::Conflicts => self.open_conflicts(None, cx),
         }
     }
     fn request_commit_detail(&mut self, id: String, cx: &mut Context<Self>) {
@@ -961,6 +1007,10 @@ impl Render for GitBuddy {
                 .focus_handle(cx)
                 .focus(window, cx);
         }
+        if let Some(value) = self.restore_conflict.take() {
+            self.conflict_editor
+                .update(cx, |state, cx| state.set_value(value, window, cx));
+        }
         if self.clear_message {
             self.clear_message = false;
             self.message
@@ -991,6 +1041,7 @@ impl Render for GitBuddy {
                 this.begin_history(HistoryKind::Reflog, w, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenFileTools, w, cx| this.open_file_tools(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenConflicts, _, cx| this.open_conflicts(None, cx)))
             .on_action(
                 cx.listener(|this, _: &CompareRevisions, w, cx| {
                     this.open_compare(None, None, w, cx)

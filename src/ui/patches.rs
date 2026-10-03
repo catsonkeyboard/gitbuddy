@@ -451,7 +451,7 @@ impl GitBuddy {
             .child(h_flex().h(px(32.)).px_3().gap_2().bg(rgb(BG)).border_b_1().border_color(rgb(BORDER))
                 .child(div().text_xs().text_color(rgb(MUTED)).child("▾"))
                 .child(div().flex_1().text_xs().font_weight(FontWeight::SEMIBOLD).child(format!("{}  {}", if staged {"Staged files"} else {"Working directory"},files.len())))
-                .child(self.button(if staged {"unstage-all"} else {"stage-all"}, if staged {"Unstage all"} else {"Stage all"}).ghost().disabled(self.busy || files.is_empty())
+                .child(self.button(if staged {"unstage-all"} else {"stage-all"}, if staged {"Unstage all"} else {"Stage all"}).ghost().disabled(self.busy || files.is_empty() || self.snapshot.files.iter().any(|f|f.conflict()))
                     .on_click(cx.listener(move |this, _, _, cx|this.perform(if staged {Operation::UnstageAll} else {Operation::StageAll},cx)))))
             .children(files.into_iter().enumerate().map(|(index, file)| {
                 let source = PatchSource::Work(file.clone(),staged);
@@ -472,15 +472,16 @@ impl GitBuddy {
                             let blame = if file.index == 'A' || file.index == '?' { None } else { Some((path.clone(), revision.clone())) };
                             row.child(self.file_inspect_buttons(path, revision, blame, (if staged {"staged-file-tools"} else {"work-file-tools"},index),cx))
                         })
-                        .when(!staged && file.index != '?' && !file.conflict(), |row|row.child(self.button(("discard",index),"Discard…").ghost()
+                         .when(!staged && file.index != '?' && !file.conflict(), |row|row.child(self.button(("discard",index),"Discard…").ghost()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();this.show_modal(Modal::Confirm(format!("Discard unstaged changes to {}? This cannot be undone. Staged content is preserved.",discard.path.display()),Operation::Discard(discard.path.clone())),window,cx);
-                            }))))
-                        .child(self.button((if staged {"unstage"} else {"stage"},index),if staged {"Unstage"} else {"Stage"}).ghost()
+                             }))))
+                        .when(file.conflict(), |row| { let path = file.path.clone(); row.child(self.button(("resolve-file",index),"Resolve…").ghost().on_click(cx.listener(move|this,_,_,cx| {cx.stop_propagation();this.open_conflicts(Some(path.clone()),cx);}))) })
+                        .when(!file.conflict(), |row|row.child(self.button((if staged {"unstage"} else {"stage"},index),if staged {"Unstage"} else {"Stage"}).ghost()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();let mut paths=vec![action.path.clone()];if let Some(old)=&action.original {paths.push(old.clone());}
                                 this.perform(if staged {Operation::Unstage(paths)} else {Operation::Stage(paths)},cx);
-                            }))))
+                            })))))
                     .when(expanded, |col|col.child(self.patch_body(&key,(if staged {"staged-patch"} else {"work-patch"},index),cx)))
             }))
     }
