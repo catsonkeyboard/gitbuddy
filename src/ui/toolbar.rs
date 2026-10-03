@@ -60,6 +60,19 @@ impl GitBuddy {
                             )
                             .separator()
                             .menu_with_icon_and_disabled(
+                                "File history / Blame…",
+                                IconName::FileText,
+                                Box::new(OpenFileTools),
+                                !has_head,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Compare commits / branches…",
+                                IconName::Copy,
+                                Box::new(CompareRevisions),
+                                !has_head,
+                            )
+                            .separator()
+                            .menu_with_icon_and_disabled(
                                 "Amend latest commit…",
                                 IconName::FileText,
                                 Box::new(AmendCommit),

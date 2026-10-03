@@ -557,8 +557,7 @@ impl Repository {
             None
         };
         let new = commit.tree()?;
-        let mut diff = repo.diff_tree_to_tree(old.as_ref(), Some(&new), None)?;
-        diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
+        let diff = super::inspect::tree_diff(&repo, old.as_ref(), &new)?;
         let files = diff
             .deltas()
             .map(|delta| CommitFile {
@@ -618,13 +617,8 @@ impl Repository {
             None
         };
         let new = commit.tree()?;
-        let mut diff = repo.diff_tree_to_tree(old.as_ref(), Some(&new), None)?;
-        diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
-        let mut paths = vec![file.path.clone()];
-        if let Some(original) = &file.original {
-            paths.push(original.clone());
-        }
-        patch_text(&diff, Some(&paths))
+        let diff = super::inspect::tree_diff(&repo, old.as_ref(), &new)?;
+        super::inspect::single_file_patch(&diff, file)
     }
 
     pub fn execute(&self, operation: Operation) -> Result<String> {

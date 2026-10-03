@@ -168,6 +168,11 @@ pub use partial::{FilePatch, PartialPatch, PatchSelection};
 #[path = "git/recovery.rs"]
 mod recovery;
 pub use recovery::{CommitEdit, HeadState, ReflogEntry, ReflogPage, ReflogTarget};
+#[path = "git/inspect.rs"]
+mod inspect;
+pub use inspect::{
+    BlameLine, BlameView, Comparison, FileHistory, FileHistoryEntry, Revision, TreeFiles,
+};
 
 /// Shared progress sink shown in the status bar during network operations.
 /// `Arc<Mutex<...>>` because libgit2 callbacks fire from worker threads.

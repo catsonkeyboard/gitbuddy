@@ -33,6 +33,8 @@ open dist/GitBuddy.app
 | 差异 | 工作区、暂存区、历史提交按文件折叠；点击文件才加载该文件的统一 diff；红绿增删行、双侧行号、虚拟滚动；二进制和大文件提示 |
 | 提交 | 多行提交说明、提交已暂存文件、Amend、撤销最近一次提交、复制提交 ID、revert、cherry-pick 及继续 / 中止 |
 | 历史 | 所有分支的提交、作者、相对时间、哈希、引用标记；按父提交绘制分支与合并线；在已加载历史中搜索；分页加载 |
+| 文件追踪 | 指定版本的文件列表、跟随重命名的文件历史、按提交展开文件 diff、逐行 Blame 与提交详情跳转 |
+| 比较 | 两个提交 / 分支 / 标签的文件树比较、增删统计、按文件折叠、反向比较、设置比较基准 |
 | 恢复 | HEAD Reflog 分页查看、选择操作前 / 后的提交、创建恢复分支、恢复当前分支位置 |
 | 分支 | 创建并切换、本地切换、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
 | 远程 | 添加 remote、fetch/prune、pull --ff-only、按配置的上游分支 push（支持不同名分支）、首次推送到 origin 并设置 upstream、领先 / 落后计数 |
@@ -49,6 +51,14 @@ open dist/GitBuddy.app
 新增行与删除行独立选择：若要暂存一次完整替换，请同时选中对应的红、绿行。部分操作只更新暂存区，不改写工作区，保留其他文件与未选中行；操作完成后刷新 diff。外部编辑、HEAD 或暂存区变化导致 diff 过期时会拒绝执行，需重新选择。普通的新建、删除文件也支持部分操作；文件权限变化、重命名、二进制、符号链接、子模块、冲突及截断预览应使用整文件操作。
 
 ## 操作约定
+
+### 文件历史、Blame 与版本比较
+
+- **文件历史**：点击工作区或历史提交文件行的 **History**；也可从 **Repository → File history / Blame…** 按路径筛选指定版本的文件，或直接输入已删除文件的路径。历史跟随重命名，遍历可达的合并父提交；点击记录展开该文件 diff，**Commit** 打开完整提交详情。合并提交的 diff 以第一个父提交为基准。
+- **Blame**：文件行的 **Blame** 或历史页的 **Blame at revision** 显示已提交版本的逐行作者、日期、提交 ID 和正文；点击提交 ID 查看详情，**Back to inspection** 返回。未提交编辑不参与归属计算。
+- **比较**：选择 **Repository → Compare commits / branches…**，填写 Base 和 Target（分支、标签、提交 ID 或 `HEAD~1` 等版本表达式）。比较从 Base 到 Target 的两棵文件树，不以共同祖先为基准；**Swap** 反转方向。分支操作菜单提供与 HEAD 比较，提交的 **Actions…** 可设置比较基准，再与另一个提交比较。同名分支 / 标签可使用 `refs/heads/name` / `refs/tags/name` 区分。
+
+结果固定到读取时的提交 ID，分支后续移动不会改变已打开的 diff。各仓库标签保留查看结果和已展开文件；这些查看操作不改动 HEAD、暂存区或工作区。文件历史每页增加 100 条，最多显示 2,000 条、扫描 50,000 个提交；文件选择器最多列出 5,000 个文件（仍可手动输入其他路径）。Blame 只支持常规文本文件，拒绝二进制和超过 2 MB 的内容，最多预览 20,000 行。
 
 ### Amend、撤销提交与 Reflog 恢复
 
@@ -90,15 +100,18 @@ cargo test --locked
 - `src/git/libgit.rs`：基于 `git2` / `libgit2` 的仓库快照（含变化指纹）、差异、Git 操作与网络进度回调。
 - `src/git/partial.rs`：结构化 hunk / 行选择、过期校验与暂存区内容重建，保留原始字节及换行。
 - `src/git/recovery.rs`：Amend、保留暂存区的提交撤销、HEAD Reflog 与恢复；使用引用锁和快照校验防止操作落到已切换的分支。
+- `src/git/inspect.rs`：固定版本的文件浏览、跨父提交跟随重命名的历史、Blame、两棵树比较与精确文件 patch。
 - `src/ui.rs`：状态机核心——多仓库标签（`tabs` + `active` 两段式）、后台任务分发（`dispatch`）、异步代际控制。
 - `src/ui/graph.rs`：提交分支及合并线布局。
 - `src/ui/patches.rs`：按文件懒加载的 diff 面板。
 - `src/ui/history.rs`、`src/ui/sidebar.rs`、`src/ui/toolbar.rs`、`src/ui/detail.rs`、`src/ui/modals.rs`：对应界面区域。
 - `src/ui/recovery.rs`：异步加载历史操作对话框、独立 Amend 编辑器与 Reflog 恢复列表。
+- `src/ui/inspect.rs`：文件选择器、文件历史、Blame 虚拟列表和版本比较页面，后台加载及过期结果隔离。
 - `src/settings.rs`：最近仓库记录（损坏时备份为 `.json.broken` 并重建）。
 - `tests/git_workflows.rs`：真实 Git 仓库的集成测试。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。
 - `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。
+- `tests/repository_inspection.rs`：文件历史 / Blame / 比较的隔离仓库测试，包含合并、重命名后旧名复用、删除后重建、特殊路径和版本固定。
 - `examples/demo_repo.rs`：可重复生成的隔离演示仓库。
 
 ## 性能设计

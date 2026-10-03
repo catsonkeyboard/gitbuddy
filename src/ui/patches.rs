@@ -28,6 +28,9 @@ impl GitBuddy {
                 PatchSource::Commit(id, file) => repo
                     .commit_file_diff(&id, &file)
                     .map(|raw| git::FilePatch::read_only(&raw)),
+                PatchSource::Compare(comparison, file) => repo
+                    .comparison_file_diff(&comparison, &file)
+                    .map(|raw| git::FilePatch::read_only(&raw)),
             }?;
             anyhow::Ok(Arc::new(patch))
         });
@@ -408,7 +411,18 @@ impl GitBuddy {
                                             .text_size(px(12.))
                                             .child(label),
                                     )
-                                    .child(patch_stat(self.active.patches.get(&key))),
+                                    .child(patch_stat(self.active.patches.get(&key)))
+                                    .child(self.file_inspect_buttons(
+                                        file.path.clone(),
+                                        detail.id.clone(),
+                                        if file.status == 'D' {
+                                            None
+                                        } else {
+                                            Some((file.path.clone(), detail.id.clone()))
+                                        },
+                                        ("commit-file-tools", index),
+                                        cx,
+                                    )),
                             )
                             .when(expanded, |col| {
                                 col.child(self.patch_body(&key, ("commit-patch", index), cx))
@@ -453,6 +467,11 @@ impl GitBuddy {
                         .child(Icon::new(if expanded {IconName::ChevronDown} else {IconName::ChevronRight}).size(px(12.)).text_color(rgb(MUTED)))
                         .child(status_badge(status))
                         .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(file.path.display().to_string()))
+                        .when_some(self.snapshot.head_id.clone(), |row, revision| {
+                            let path = file.original.clone().unwrap_or_else(|| file.path.clone());
+                            let blame = if file.index == 'A' || file.index == '?' { None } else { Some((path.clone(), revision.clone())) };
+                            row.child(self.file_inspect_buttons(path, revision, blame, (if staged {"staged-file-tools"} else {"work-file-tools"},index),cx))
+                        })
                         .when(!staged && file.index != '?' && !file.conflict(), |row|row.child(self.button(("discard",index),"Discard…").ghost()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();this.show_modal(Modal::Confirm(format!("Discard unstaged changes to {}? This cannot be undone. Staged content is preserved.",discard.path.display()),Operation::Discard(discard.path.clone())),window,cx);

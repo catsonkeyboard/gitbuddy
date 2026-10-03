@@ -1,6 +1,7 @@
 mod detail;
 mod graph;
 mod history;
+mod inspect;
 mod modals;
 mod patches;
 mod recovery;
@@ -41,6 +42,8 @@ gpui_kit::actions!(
         AmendCommit,
         UndoCommit,
         OpenReflog,
+        OpenFileTools,
+        CompareRevisions,
         Quit,
         CloseModal
     ]
@@ -59,22 +62,30 @@ enum Selection {
     Work,
     File(FileChange, bool),
     Commit(String),
+    Inspect,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum PatchKey {
     Work(PathBuf, bool),
     Commit(String, PathBuf),
+    Compare(String, String, PathBuf),
 }
 #[derive(Clone)]
 enum PatchSource {
     Work(FileChange, bool),
     Commit(String, CommitFile),
+    Compare(Arc<git::Comparison>, CommitFile),
 }
 impl PatchSource {
     fn key(&self) -> PatchKey {
         match self {
             Self::Work(file, staged) => PatchKey::Work(file.path.clone(), *staged),
             Self::Commit(id, file) => PatchKey::Commit(id.clone(), file.path.clone()),
+            Self::Compare(comparison, file) => PatchKey::Compare(
+                comparison.base.id.clone(),
+                comparison.target.id.clone(),
+                file.path.clone(),
+            ),
         }
     }
 }
@@ -135,6 +146,8 @@ enum Modal {
     Confirm(String, Operation),
     History(HistoryKind),
     RecoveryBranch(git::ReflogTarget),
+    FileTools,
+    Compare,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistoryKind {
@@ -184,8 +197,7 @@ impl Loaded {
         };
         let raw = match &selection {
             Selection::File(file, staged) => repo.diff(file, *staged)?,
-            Selection::Commit(_) => String::new(),
-            Selection::Work => String::new(),
+            _ => String::new(),
         };
         let diff = git::diff_preview(&raw);
         // Snapshot refreshes keep the current commit panel; selecting a commit loads
@@ -218,6 +230,8 @@ pub struct RepoTab {
     expanded: HashSet<PatchKey>,
     patches: HashMap<PatchKey, PatchState>,
     show_commit_body: bool,
+    inspection: inspect::InspectState,
+    comparison_base: Option<String>,
     query: String,
     message: String,
     limit: usize,
@@ -237,6 +251,8 @@ impl Default for RepoTab {
             expanded: HashSet::new(),
             patches: HashMap::new(),
             show_commit_body: false,
+            inspection: inspect::InspectState::default(),
+            comparison_base: None,
             query: String::new(),
             message: String::new(),
             limit: HISTORY_PAGE_SIZE,
@@ -268,6 +284,8 @@ pub struct GitBuddy {
     reflog_selected: Option<git::ReflogTarget>,
     amend_message: Entity<TextareaState>,
     restore_amend_message: Option<String>,
+    tool_files: Option<Result<Arc<git::TreeFiles>, String>>,
+    tool_generation: u64,
     busy: bool,
     settings: Settings,
     focus: FocusHandle,
@@ -309,6 +327,11 @@ impl GitBuddy {
                     cx.notify();
                 }
             }),
+            cx.subscribe_in(&form_a, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
         ];
         let settings = Settings::load();
         let initial = path.or_else(|| settings.recent.first().cloned());
@@ -337,6 +360,8 @@ impl GitBuddy {
             reflog_selected: None,
             amend_message,
             restore_amend_message: None,
+            tool_files: None,
+            tool_generation: 0,
             busy: false,
             settings,
             focus,
@@ -399,6 +424,11 @@ impl GitBuddy {
         self.modal = None;
         self.patch_generation += 1;
         self.selection_generation += 1;
+        if matches!(self.active.selection, Selection::Inspect)
+            && let inspect::InspectState::Loading(request) = &self.active.inspection
+        {
+            self.begin_inspection(request.clone(), cx);
+        }
         let sources: Vec<_> = self.work_and_commit_sources();
         for source in sources {
             if self.active.expanded.contains(&source.key())
@@ -538,7 +568,9 @@ impl GitBuddy {
                             this.active.repo.as_ref().map(|r| &r.root) != Some(&loaded.repo.root);
                         let old_id = this.active.commit_detail.as_ref().map(|d| &d.id);
                         let new_id = loaded.commit_detail.as_ref().map(|d| &d.id);
-                        if changed || old_id != new_id {
+                        if changed
+                            || (old_id != new_id && !matches!(loaded.selection, Selection::Inspect))
+                        {
                             this.active.expanded.clear();
                             this.active.patches.clear();
                             this.patch_generation += 1;
@@ -563,7 +595,9 @@ impl GitBuddy {
                         }
                         this.clear_message = loaded.clear_message || changed;
                         // Working tree content can change outside the app. Reload only open patches.
-                        if this.active.commit_detail.is_none() {
+                        if this.active.commit_detail.is_none()
+                            && !matches!(this.active.selection, Selection::Inspect)
+                        {
                             this.patch_generation += 1;
                             let sources: Vec<_> = this
                                 .work_and_commit_sources()
@@ -593,6 +627,7 @@ impl GitBuddy {
     /// unstaged variants), or for the selected commit's files.
     fn work_and_commit_sources(&self) -> Vec<PatchSource> {
         match &self.active.selection {
+            Selection::Inspect => self.inspection_sources(),
             Selection::Commit(id) => {
                 self.active
                     .commit_detail
@@ -687,7 +722,9 @@ impl GitBuddy {
             return;
         }
         if let Selection::File(file, staged) = selection {
-            if self.active.commit_detail.take().is_some() {
+            if self.active.commit_detail.take().is_some()
+                || matches!(self.active.selection, Selection::Inspect)
+            {
                 self.active.expanded.clear();
                 self.active.patches.clear();
                 self.patch_generation += 1;
@@ -703,7 +740,10 @@ impl GitBuddy {
         match selection {
             Selection::Work => {
                 if self.active.commit_detail.take().is_some()
-                    || matches!(self.active.selection, Selection::Commit(_))
+                    || matches!(
+                        self.active.selection,
+                        Selection::Commit(_) | Selection::Inspect
+                    )
                 {
                     self.active.expanded.clear();
                     self.active.patches.clear();
@@ -734,6 +774,18 @@ impl GitBuddy {
                 self.request_commit_detail(id, cx);
             }
             Selection::File(..) => unreachable!(),
+            Selection::Inspect => {
+                self.active.selection = Selection::Inspect;
+                self.active.commit_detail = None;
+                self.active.expanded.clear();
+                self.active.patches.clear();
+                self.patch_generation += 1;
+                self.selection_generation += 1;
+                if let inspect::InspectState::Loading(request) = &self.active.inspection {
+                    self.begin_inspection(request.clone(), cx);
+                }
+                cx.notify();
+            }
         }
     }
     fn request_commit_detail(&mut self, id: String, cx: &mut Context<Self>) {
@@ -938,6 +990,12 @@ impl Render for GitBuddy {
             .on_action(cx.listener(|this, _: &OpenReflog, w, cx| {
                 this.begin_history(HistoryKind::Reflog, w, cx)
             }))
+            .on_action(cx.listener(|this, _: &OpenFileTools, w, cx| this.open_file_tools(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &CompareRevisions, w, cx| {
+                    this.open_compare(None, None, w, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &CloneRepository, window, cx| {
                 this.show_modal(Modal::Clone, window, cx)
             }))

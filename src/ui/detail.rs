@@ -10,6 +10,7 @@ impl GitBuddy {
                 if *staged { "Staged" } else { "Working tree" }
             ),
             Selection::Commit(id) => format!("Commit  {}", &id[..8]),
+            Selection::Inspect => self.inspection_title(),
         };
         v_flex()
             .flex_1()
@@ -27,6 +28,19 @@ impl GitBuddy {
                     .bg(rgb(PANEL))
                     .child(div().text_color(rgb(ACCENT)).child("▤"))
                     .child(div().text_sm().flex_1().child(title))
+                    .when(
+                        !matches!(self.selection, Selection::Inspect)
+                            && !matches!(self.inspection, inspect::InspectState::Empty),
+                        |row| {
+                            row.child(
+                                self.button("back-inspection", "Back to inspection")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.select(Selection::Inspect, cx)
+                                    })),
+                            )
+                        },
+                    )
                     .when(!matches!(self.selection, Selection::Work), |row| {
                         row.child(self.button("summary", "Summary").ghost().on_click(
                             cx.listener(|this, _, _, cx| this.select(Selection::Work, cx)),
@@ -43,7 +57,9 @@ impl GitBuddy {
                         )
                     }),
             )
-            .child(if matches!(self.selection, Selection::Work) {
+            .child(if matches!(self.selection, Selection::Inspect) {
+                self.inspection_view(cx)
+            } else if matches!(self.selection, Selection::Work) {
                 self.summary(cx).into_any_element()
             } else if matches!(self.selection, Selection::Commit(_)) {
                 self.commit_files_view(cx)

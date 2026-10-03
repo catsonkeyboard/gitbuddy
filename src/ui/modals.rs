@@ -60,11 +60,15 @@ impl GitBuddy {
             Modal::RecoveryBranch(target) => {
                 self.perform(Operation::RecoverBranch { target, name: a }, cx)
             }
+            Modal::Compare => self.begin_inspection(inspect::InspectRequest::Compare(a, b), cx),
             _ => {}
         }
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::FileTools) {
+            return self.file_tools_modal(cx);
+        }
         if let Modal::History(kind) = modal {
             return self.history_modal(kind, cx);
         }
@@ -119,6 +123,13 @@ impl GitBuddy {
                 "Create branch",
             ),
             Modal::History(_) => unreachable!(),
+            Modal::FileTools => unreachable!(),
+            Modal::Compare => (
+                "Compare commits / branches",
+                "Base: branch, tag or commit ID",
+                Some("Target: branch, tag or commit ID"),
+                "Compare",
+            ),
         };
         let mut card = v_flex()
             .w(px(540.))
@@ -164,11 +175,19 @@ impl GitBuddy {
                     .on_click(cx.listener(|this, _, _, cx| this.browse(cx))),
             );
         }
+        let is_compare = matches!(modal, Modal::Compare);
         match modal {
             Modal::Confirm(ref message, _) => {
                 card = card.child(div().text_sm().child(message.clone()));
             }
             Modal::BranchActions(name, remote) => {
+                let compare = format!("refs/{}/{}", if remote { "remotes" } else { "heads" }, name);
+                card = card.child(
+                    self.button("branch-compare", "Compare HEAD → this branch…")
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.open_compare(Some("HEAD".into()), Some(compare.clone()), w, cx)
+                        })),
+                );
                 let checkout = name.clone();
                 let merge = name.clone();
                 let delete = name.clone();
@@ -229,6 +248,33 @@ impl GitBuddy {
                         );
             }
             Modal::CommitActions(id) => {
+                let base = id.clone();
+                let target = id.clone();
+                let against = self
+                    .comparison_base
+                    .clone()
+                    .unwrap_or_else(|| "HEAD".into());
+                card = card
+                    .child(
+                        self.button("set-compare-base", "Set as comparison base")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.active.comparison_base = Some(base.clone());
+                                this.active.notice = format!("Comparison base: {}", &base[..8]);
+                                this.modal = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        self.button("compare-commit", "Compare base / HEAD → this commit…")
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.open_compare(
+                                    Some(against.clone()),
+                                    Some(target.clone()),
+                                    w,
+                                    cx,
+                                )
+                            })),
+                    );
                 if self.snapshot.head_id.as_ref() == Some(&id) {
                     card = card
                         .child(
@@ -337,6 +383,9 @@ impl GitBuddy {
                 );
             }
             _ => {}
+        }
+        if is_compare {
+            card = card.child(self.compare_choices(cx));
         }
         if !submit.is_empty() {
             card = card.child(
