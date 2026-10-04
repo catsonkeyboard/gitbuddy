@@ -241,7 +241,7 @@ impl GitBuddy {
                         })),
                 );
                 let checkout = name.clone();
-                let merge = name.clone();
+                let merge = format!("refs/{}/{}", if remote { "remotes" } else { "heads" }, name);
                 let delete = name.clone();
                 card = card.child(div().text_color(rgb(ACCENT)).child(name));
                 if !remote {

@@ -60,6 +60,10 @@ struct State {
     steps: Vec<RebaseStep>,
     cursor: usize,
     pending: bool,
+    // CHERRY_PICK_HEAD is written before checkout/index by libgit2. Only
+    // this durable acknowledgement proves the apply call completed.
+    #[serde(default)]
+    applied: bool,
     backup: String,
     // Journal the new object before moving HEAD, allowing either side of a crash
     // between the ref update and the next state write to resume exactly once.
@@ -314,6 +318,7 @@ impl Repository {
             steps,
             cursor: 0,
             pending: false,
+            applied: false,
             backup,
             prepared: None,
             finishing: false,
@@ -413,6 +418,7 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
             state.current = prepared;
             state.cursor += 1;
             state.pending = false;
+            state.applied = false;
             state.prepared = None;
             if repo.state() != RepositoryState::Clean {
                 repo.cleanup_state()?;
@@ -435,6 +441,7 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
                 "Working tree changed during rebase; review it before continuing"
             );
             state.pending = true;
+            state.applied = false;
             save(repo, state)?;
             let mut checkout = CheckoutBuilder::new();
             checkout
@@ -444,7 +451,17 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
             let mut options = CherrypickOptions::new();
             options.checkout_builder(checkout);
             repo.cherrypick(&picked, Some(&mut options))?;
+            state.applied = true;
+            save(repo, state)?;
         }
+        ensure!(
+            state.applied,
+            "Interrupted while applying a rebase step; application cannot be verified. Preserve any resolutions, then Abort rebase and rebuild the plan. No commit was created"
+        );
+        ensure!(
+            !repo.path().join("index.lock").exists(),
+            "An index lock exists; verify no Git process is running before recovering the interrupted operation"
+        );
         let marker = fs::read_to_string(repo.path().join("CHERRY_PICK_HEAD"))
             .context("Interrupted before applying a rebase step; abort and rebuild the plan")?;
         ensure!(
@@ -674,6 +691,7 @@ mod tests {
             steps: preview.steps,
             cursor: 0,
             pending: false,
+            applied: false,
             backup: "refs/gitbuddy/fixture".into(),
             prepared: None,
             finishing: false,

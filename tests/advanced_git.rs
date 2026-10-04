@@ -716,8 +716,8 @@ fn lfs_stash_requires_staging_and_hydrates_restored_working_files() {
         "one"
     );
     assert!(!repo.root.join("new.bin").exists());
-    repo.execute(Operation::ApplyStash("stash@{0}".into()))
-        .unwrap();
+    let stash_id = repo.snapshot(100).unwrap().stashes[0].0.clone();
+    repo.execute(Operation::ApplyStash(stash_id)).unwrap();
     assert_eq!(
         std::fs::read_to_string(repo.root.join("data.bin")).unwrap(),
         "changed"

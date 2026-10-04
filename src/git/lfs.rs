@@ -126,7 +126,16 @@ pub(super) fn tracked(repo: &git2::Repository, path: &Path) -> Result<bool> {
             if let Some(part) = part {
                 directory.push(part);
             }
-            reject_quoted_rules(&directory.join(".gitattributes"))?;
+            let attributes = directory.join(".gitattributes");
+            // FILE_THEN_INDEX also reads indexed attributes if the working
+            // file is missing; validate that fallback with the same policy.
+            if !attributes.exists() {
+                let relative = attributes.strip_prefix(root)?;
+                if let Some(entry) = repo.index()?.get_path(relative, 0) {
+                    reject_quoted_bytes(repo.find_blob(entry.id)?.content())?;
+                }
+            }
+            reject_quoted_rules(&attributes)?;
         }
         reject_quoted_rules(&repo.commondir().join("info/attributes"))?;
         if let Ok(global) = repo.config()?.get_path("core.attributesfile") {
@@ -135,15 +144,25 @@ pub(super) fn tracked(repo: &git2::Repository, path: &Path) -> Result<bool> {
     }
     Ok(repo.get_attr(path, "filter", git2::AttrCheckFlags::FILE_THEN_INDEX)? == Some("lfs"))
 }
-fn reject_quoted_rules(path: &Path) -> Result<()> {
-    if let Ok(text) = fs::read_to_string(path) {
-        ensure!(
-            !text.lines().any(|line| line.trim_start().starts_with('"')
-                && line.split_whitespace().any(|word| word == "filter=lfs")),
-            "Quoted LFS attribute patterns are not supported by libgit2; replace them with unquoted globs before staging"
-        );
-    }
+fn reject_quoted_bytes(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        !bytes.split(|b| *b == b'\n').any(|line| {
+            line.iter()
+                .copied()
+                .find(|b| !matches!(b, b' ' | b'\t' | b'\r'))
+                == Some(b'"')
+        }),
+        "Quoted attribute patterns (including LFS macros) are not supported by libgit2; replace them with unquoted globs before staging"
+    );
     Ok(())
+}
+fn reject_quoted_rules(path: &Path) -> Result<()> {
+    match fs::read(path) {
+        Ok(bytes) => reject_quoted_bytes(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("Cannot check attribute rules in {}", path.display())),
+    }
 }
 fn index_pointer(repo: &git2::Repository, entry: &git2::IndexEntry) -> Result<Option<Pointer>> {
     if (entry.flags >> 12) & 3 != 0 {
@@ -187,24 +206,10 @@ pub(super) fn matches_index(repo: &git2::Repository, path: &Path) -> Result<bool
     }
     Ok(fs::metadata(&file)?.len() == pointer.size && hash(&file)? == pointer)
 }
-pub(super) fn stage(repo: &git2::Repository, index: &mut git2::Index, path: &Path) -> Result<()> {
-    if !tracked(repo, path)? {
-        let file = repo.workdir().context("No working tree")?.join(path);
-        if fs::symlink_metadata(file).is_ok() {
-            index.add_path(path)?;
-        } else {
-            index.remove_path(path)?;
-        }
-        return Ok(());
-    }
-    let file = safe_path(repo, path)?;
-    if !file.exists() {
-        index.remove_path(path)?;
-        return Ok(());
-    }
-    ensure!(file.is_file(), "An LFS path must be a regular file");
+/// Clean through one implementation for ordinary staging and conflict results.
+fn clean_reader(repo: &git2::Repository, mut source: impl Read) -> Result<Vec<u8>> {
     let mut probe = Vec::new();
-    fs::File::open(&file)?.take(1025).read_to_end(&mut probe)?;
+    source.by_ref().take(1025).read_to_end(&mut probe)?;
     let pointer = Pointer::parse(&probe);
     ensure!(
         pointer.is_some() || !probe.starts_with(VERSION.as_bytes()),
@@ -214,12 +219,12 @@ pub(super) fn stage(repo: &git2::Repository, index: &mut git2::Index, path: &Pat
         pointer
     } else {
         let mut temp = tempfile::NamedTempFile::new_in(repo.commondir())?;
-        let mut source = fs::File::open(&file)?;
+        let mut input = std::io::Cursor::new(probe).chain(source);
         let mut digest = Sha256::new();
         let mut size = 0;
         let mut buffer = [0u8; 65536];
         loop {
-            let count = source.read(&mut buffer)?;
+            let count = input.read(&mut buffer)?;
             if count == 0 {
                 break;
             }
@@ -241,7 +246,38 @@ pub(super) fn stage(repo: &git2::Repository, index: &mut git2::Index, path: &Pat
         }
         pointer
     };
-    let text = pointer.text();
+    Ok(pointer.text().into_bytes())
+}
+
+pub(super) fn clean_content(repo: &git2::Repository, bytes: &[u8]) -> Result<Vec<u8>> {
+    clean_reader(repo, std::io::Cursor::new(bytes))
+}
+
+pub(super) fn stage(repo: &git2::Repository, index: &mut git2::Index, path: &Path) -> Result<()> {
+    if !tracked(repo, path)? {
+        let file = repo.workdir().context("No working tree")?.join(path);
+        match fs::symlink_metadata(file) {
+            Ok(_) => index.add_path(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if index.get_path(path, 0).is_some() {
+                    index.remove_path(path)?;
+                }
+            }
+            Err(error) => {
+                return Err(error).context("Cannot inspect the working file before staging");
+            }
+        }
+        return Ok(());
+    }
+    let file = safe_path(repo, path)?;
+    if !file.exists() {
+        if index.get_path(path, 0).is_some() {
+            index.remove_path(path)?;
+        }
+        return Ok(());
+    }
+    ensure!(file.is_file(), "An LFS path must be a regular file");
+    let text = clean_reader(repo, fs::File::open(&file)?)?;
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -267,7 +303,7 @@ pub(super) fn stage(repo: &git2::Repository, index: &mut git2::Index, path: &Pat
         flags_extended: 0,
         path: super::libgit::path_bytes(path),
     };
-    index.add_frombuffer(&entry, text.as_bytes())?;
+    index.add_frombuffer(&entry, &text)?;
     Ok(())
 }
 fn replace(path: &Path, bytes: &[u8]) -> Result<()> {

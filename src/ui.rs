@@ -841,7 +841,13 @@ impl GitBuddy {
         cx.notify();
     }
     fn commit(&mut self, cx: &mut Context<Self>) {
-        if self.busy() || self.modal.is_some() {
+        if self.busy()
+            || self.modal.is_some()
+            || !matches!(
+                self.snapshot.conflict_operation,
+                git::ConflictOperation::None | git::ConflictOperation::Merge
+            )
+        {
             return;
         }
         self.perform(

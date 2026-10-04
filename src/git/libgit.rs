@@ -142,32 +142,52 @@ pub(super) fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
         .renames_head_to_index(true)
         .renames_index_to_workdir(true);
     let statuses = repo.statuses(Some(&mut opts))?;
-    let mut files: Vec<_> = statuses
-        .iter()
-        .map(|entry| {
-            let (index, worktree) = status_chars(entry.status());
-            let rename = entry
-                .head_to_index()
-                .filter(|d| d.status() == Delta::Renamed)
-                .or_else(|| {
-                    entry
-                        .index_to_workdir()
-                        .filter(|d| d.status() == Delta::Renamed)
-                });
-            let original = rename
-                .as_ref()
-                .and_then(|d| d.old_file().path_bytes().map(path_from_bytes));
-            let path = rename
-                .and_then(|d| d.new_file().path_bytes().map(path_from_bytes))
-                .unwrap_or_else(|| path_from_bytes(entry.path_bytes()));
-            FileChange {
-                path,
-                original,
+    let mut files = Vec::new();
+    for entry in statuses.iter() {
+        let (index, worktree) = status_chars(entry.status());
+        let indexed = entry.head_to_index();
+        let working = entry.index_to_workdir();
+        let indexed_path = indexed.as_ref().and_then(|d| d.new_file().path_bytes());
+        let working_path = working.as_ref().and_then(|d| d.new_file().path_bytes());
+        let indexed_original = indexed
+            .as_ref()
+            .filter(|d| d.status() == Delta::Renamed)
+            .and_then(|d| d.old_file().path_bytes())
+            .map(path_from_bytes);
+        let working_original = working
+            .as_ref()
+            .filter(|d| d.status() == Delta::Renamed)
+            .and_then(|d| d.old_file().path_bytes())
+            .map(path_from_bytes);
+        // A -> B in the index and B -> C on disk are two different deltas.
+        // Keep each layer's paths for its diff and stage/unstage actions.
+        if let (Some(indexed_path), Some(working_path)) = (indexed_path, working_path)
+            && index != ' '
+            && index != '?'
+            && worktree != ' '
+            && indexed_path != working_path
+        {
+            files.push(FileChange {
+                path: path_from_bytes(indexed_path),
+                original: indexed_original,
+                index,
+                worktree: ' ',
+            });
+            files.push(FileChange {
+                path: path_from_bytes(working_path),
+                original: working_original,
+                index: ' ',
+                worktree,
+            });
+        } else {
+            files.push(FileChange {
+                path: path_from_bytes(working_path.or(indexed_path).unwrap_or(entry.path_bytes())),
+                original: indexed_original.or(working_original),
                 index,
                 worktree,
-            }
-        })
-        .collect();
+            });
+        }
+    }
     for file in &mut files {
         if file.worktree == 'M'
             && super::lfs::tracked(repo, &file.path)?
@@ -571,8 +591,8 @@ impl Repository {
             .collect();
         tags.sort();
         let mut stashes = Vec::new();
-        repo.stash_foreach(|i, message, _| {
-            stashes.push((format!("stash@{{{i}}}"), message.to_string()));
+        repo.stash_foreach(|_, message, id| {
+            stashes.push((id.to_string(), message.to_string()));
             true
         })?;
         let remotes = repo
@@ -828,13 +848,15 @@ impl Repository {
                 Operation::StageAll => {
                     let mut index = repo.index()?;
                     ensure!(!index.has_conflicts(), "Resolve conflicts first");
+                    // Resolve all paths against the final worktree. A rename's
+                    // old name may already have been reused by a new file.
+                    let mut paths = std::collections::BTreeSet::new();
                     for file in file_changes(&repo)? {
-                        if let Some(original) = &file.original
-                            && index.get_path(original, 0).is_some()
-                        {
-                            index.remove_path(original)?;
-                        }
-                        super::lfs::stage(&repo, &mut index, &file.path)?;
+                        paths.insert(file.path);
+                        paths.extend(file.original);
+                    }
+                    for path in paths {
+                        super::lfs::stage(&repo, &mut index, &path)?;
                     }
                     index.write()?;
                     Ok("All changes staged".into())
@@ -866,7 +888,16 @@ impl Repository {
                     repo.checkout_index(None, Some(&mut checkout))?;
                     Ok("Working tree changes discarded".into())
                 }
-                Operation::Commit(message) => commit_index(&repo, &message, None),
+                Operation::Commit(message) => {
+                    ensure!(
+                        matches!(
+                            repo.state(),
+                            RepositoryState::Clean | RepositoryState::Merge
+                        ),
+                        "A repository operation is in progress; use its Continue action (external rebases must be continued with Git)"
+                    );
+                    commit_index(&repo, &message, None)
+                }
                 Operation::CreateBranch(name) => {
                     validate_branch(&name)?;
                     let head = repo.head()?.peel_to_commit()?;
@@ -904,11 +935,8 @@ impl Repository {
                     Ok(format!("Deleted branch {name}"))
                 }
                 Operation::Merge(name) => {
-                    validate_branch(&name)?;
-                    let branch = repo
-                        .find_branch(&name, BranchType::Local)
-                        .or_else(|_| repo.find_branch(&name, BranchType::Remote))?;
-                    let target = branch.get().target().context("目标分支没有提交")?;
+                    let reference = merge_reference(&repo, &name)?;
+                    let target = reference.target().context("目标分支没有提交")?;
                     merge_target(&repo, target, &name, false)
                 }
                 Operation::AbortMerge | Operation::AbortRevert | Operation::AbortCherryPick => {
@@ -1061,11 +1089,17 @@ impl Repository {
                     Ok("Changes stashed".into())
                 }
                 Operation::ApplyStash(id) => {
-                    repo.stash_apply(stash_index(&id)?, None)?;
+                    // Pin the stash reflog while libgit2 applies its index-based
+                    // API, so an external push/drop cannot change that index.
+                    let locked = RawRepo::open(&self.root)?;
+                    let mut transaction = locked.transaction()?;
+                    transaction.lock_ref("refs/stash")?;
+                    let position = stash_position(&locked.reflog("refs/stash")?, &id)?;
+                    repo.stash_apply(position, None)?;
                     Ok("Stash applied".into())
                 }
                 Operation::DropStash(id) => {
-                    repo.stash_drop(stash_index(&id)?)?;
+                    drop_stash(&repo, &id)?;
                     Ok("Stash deleted".into())
                 }
                 Operation::Tag(name) => {
@@ -1105,6 +1139,21 @@ impl Repository {
         };
         control.normalize(result)
     }
+}
+
+fn merge_reference<'a>(repo: &'a RawRepo, name: &str) -> Result<git2::Reference<'a>> {
+    if name.starts_with("refs/heads/") || name.starts_with("refs/remotes/") {
+        ensure!(git2::Reference::is_valid_name(name), "无效的引用名称");
+        return Ok(repo.find_reference(name)?);
+    }
+    validate_branch(name)?;
+    let local = repo.find_reference(&format!("refs/heads/{name}")).ok();
+    let remote = repo.find_reference(&format!("refs/remotes/{name}")).ok();
+    ensure!(
+        local.is_none() || remote.is_none(),
+        "Ambiguous branch name; select a fully qualified local or remote reference"
+    );
+    local.or(remote).context("目标分支不存在")
 }
 
 fn validate_branch(name: &str) -> Result<()> {
@@ -1159,16 +1208,56 @@ fn unstage_paths(repo: &RawRepo, paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn stash_index(id: &str) -> Result<usize> {
-    let number = id
-        .strip_prefix("stash@{")
-        .and_then(|s| s.strip_suffix('}'))
-        .context("无效的 stash ID")?;
-    Ok(number.parse()?)
+fn stash_position(log: &git2::Reflog, id: &str) -> Result<usize> {
+    let expected = oid(id).context("Select a stash by its stable object ID, not stash@{n}")?;
+    let matches: Vec<_> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.id_new() == expected)
+        .map(|(i, _)| i)
+        .collect();
+    ensure!(
+        matches.len() == 1,
+        "The selected stash disappeared or is ambiguous; reload the stash list. No changes made"
+    );
+    Ok(matches[0])
+}
+
+fn drop_stash(repo: &RawRepo, id: &str) -> Result<()> {
+    // Match libgit2's stash-drop transaction, but resolve the selected object
+    // only AFTER acquiring the ref lock rather than using a stale UI index.
+    let mut transaction = repo.transaction()?;
+    transaction.lock_ref("refs/stash")?;
+    let mut log = repo.reflog("refs/stash")?;
+    let position = stash_position(&log, id)?;
+    log.remove(position, true)?;
+    if log.is_empty() {
+        transaction.remove("refs/stash")?;
+    } else if position == 0 {
+        transaction.set_target(
+            "refs/stash",
+            log.get(0).context("Missing stash entry")?.id_new(),
+            None,
+            "",
+        )?;
+    }
+    transaction.set_reflog("refs/stash", log)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Result<String> {
     ensure!(!message.trim().is_empty(), "请填写提交说明");
+    ensure!(
+        matches!(
+            repo.state(),
+            RepositoryState::Clean
+                | RepositoryState::Merge
+                | RepositoryState::CherryPick
+                | RepositoryState::Revert
+        ),
+        "Cannot create a commit in this repository operation; continue it with its owning sequencer"
+    );
     let mut index = repo.index()?;
     ensure!(!index.has_conflicts(), "请先解决冲突");
     let tree_id = index.write_tree()?;
@@ -1197,7 +1286,12 @@ fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Res
         &tree,
         &parents,
     )?;
-    if repo.state() != RepositoryState::Clean {
+    // Only the operation that owns the state may clear it. This helper
+    // completes merges, single cherry-picks and single reverts, never a rebase.
+    if matches!(
+        repo.state(),
+        RepositoryState::Merge | RepositoryState::CherryPick | RepositoryState::Revert
+    ) {
         repo.cleanup_state()?;
     }
     Ok(format!("Created commit {id}"))

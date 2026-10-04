@@ -72,6 +72,7 @@ pub struct Snapshot {
     pub commits: Vec<Commit>,
     pub branches: Vec<Branch>,
     pub tags: Vec<String>,
+    /// Stable stash commit OID and summary; positions like stash@{0} can change.
     pub stashes: Vec<(String, String)>,
     pub remotes: Vec<String>,
     pub merging: bool,

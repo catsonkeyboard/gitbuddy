@@ -71,6 +71,57 @@ fn clean(repo: &git2::Repository) -> Result<()> {
     );
     Ok(())
 }
+// A display ignore policy must never hide data from a deletion guard.
+fn clean_for_removal(repo: &git2::Repository, depth: usize) -> Result<()> {
+    ensure!(
+        depth < 64,
+        "Submodule nesting is too deep to safely remove this worktree"
+    );
+    clean(repo)?;
+    for module in repo.submodules()? {
+        let name = module.name()?;
+        let status = repo.submodule_status(name, SubmoduleIgnore::None)?;
+        ensure!(
+            !status.intersects(
+                git2::SubmoduleStatus::WD_MODIFIED
+                    | git2::SubmoduleStatus::WD_INDEX_MODIFIED
+                    | git2::SubmoduleStatus::WD_WD_MODIFIED
+                    | git2::SubmoduleStatus::WD_UNTRACKED
+                    | git2::SubmoduleStatus::WD_ADDED
+                    | git2::SubmoduleStatus::WD_DELETED
+            ),
+            "Submodule {name} has changes; commit or stash them before removing the worktree"
+        );
+        let path = repo
+            .workdir()
+            .context("No working directory")?
+            .join(module.path());
+        if status.contains(git2::SubmoduleStatus::IN_WD)
+            && !status.contains(git2::SubmoduleStatus::WD_UNINITIALIZED)
+        {
+            let child = module.open().with_context(|| {
+                format!("Cannot inspect submodule {name}; worktree was not removed")
+            })?;
+            ensure!(
+                child
+                    .workdir()
+                    .context("Submodule has no working directory")?
+                    .canonicalize()?
+                    == path.canonicalize()?,
+                "Submodule {name} points outside its checkout; worktree was not removed"
+            );
+            clean_for_removal(&child, depth + 1)
+                .with_context(|| format!("Submodule {name} is not safe to remove"))?;
+        } else if path.exists() {
+            ensure!(
+                path.is_dir() && std::fs::read_dir(&path)?.next().is_none(),
+                "Uninitialized submodule {name} contains files; worktree was not removed"
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Repository {
     pub fn worktrees(&self) -> Result<Vec<WorktreeInfo>> {
         let repo = raw(self)?;
@@ -91,7 +142,9 @@ impl Repository {
                 head: head.and_then(|h| h.target()).map(|id| id.to_string()),
                 locked: !matches!(tree.is_locked()?, WorktreeLockStatus::Unlocked),
                 valid: tree.validate().is_ok(),
-                dirty: child.as_ref().is_none_or(|r| clean(r).is_err()),
+                dirty: child
+                    .as_ref()
+                    .is_none_or(|r| clean_for_removal(r, 0).is_err()),
             });
         }
         Ok(trees)
@@ -158,7 +211,7 @@ impl Repository {
                     != self.root.canonicalize()?,
                 "Cannot remove the current worktree"
             );
-            clean(&child)?;
+            clean_for_removal(&child, 0)?;
             ensure!(
                 child.head()?.target().map(|id| id.to_string()) == expected.head,
                 "Worktree HEAD changed; reload before removing"

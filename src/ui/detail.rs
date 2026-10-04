@@ -121,7 +121,12 @@ impl GitBuddy {
                                 .disabled(
                                     self.busy()
                                         || staged == 0
-                                        || self.snapshot.files.iter().any(|f| f.conflict()),
+                                        || self.snapshot.files.iter().any(|f| f.conflict())
+                                        || !matches!(
+                                            self.snapshot.conflict_operation,
+                                            git::ConflictOperation::None
+                                                | git::ConflictOperation::Merge
+                                        ),
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| this.commit(cx))),
                             ),

@@ -491,6 +491,13 @@ impl Repository {
                 .flatten()
                 .next()
                 .context("Empty conflict")?;
+            let clean;
+            let staged_bytes = if super::lfs::tracked(&repo, &context.file.path)? {
+                clean = super::lfs::clean_content(&repo, bytes)?;
+                clean.as_slice()
+            } else {
+                bytes.as_slice()
+            };
             next.add(&IndexEntry {
                 ctime: IndexTime::new(0, 0),
                 mtime: IndexTime::new(0, 0),
@@ -499,8 +506,8 @@ impl Repository {
                 mode,
                 uid: 0,
                 gid: 0,
-                file_size: bytes.len() as u32,
-                id: repo.blob(bytes)?,
+                file_size: staged_bytes.len() as u32,
+                id: repo.blob(staged_bytes)?,
                 flags: 0,
                 flags_extended: 0,
                 path: e.bytes.clone(),
