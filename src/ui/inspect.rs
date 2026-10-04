@@ -1,11 +1,6 @@
 use super::*;
 
-#[derive(Clone, Debug)]
-pub(super) enum InspectRequest {
-    History(PathBuf, String, usize),
-    Blame(PathBuf, String),
-    Compare(String, String),
-}
+pub(super) use gitbuddy::session::Inspection as InspectRequest;
 #[derive(Clone, Debug)]
 pub(super) enum InspectResult {
     History(Arc<git::FileHistory>),
@@ -23,6 +18,14 @@ pub(super) enum InspectState {
 
 impl GitBuddy {
     pub(super) fn begin_inspection(&mut self, request: InspectRequest, cx: &mut Context<Self>) {
+        self.load_inspection(request, false, cx);
+    }
+    pub(super) fn load_inspection(
+        &mut self,
+        request: InspectRequest,
+        restoring: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.busy() {
             return;
         }
@@ -33,8 +36,10 @@ impl GitBuddy {
         self.active.selection = Selection::Inspect;
         self.active.commit_detail = None;
         self.active.inspection = InspectState::Loading(request.clone());
-        self.active.expanded.clear();
-        self.active.patches.clear();
+        if !restoring {
+            self.active.expanded.clear();
+            self.active.patches.clear();
+        }
         self.active.error = false;
         self.patch_generation += 1;
         self.selection_generation += 1;
@@ -67,6 +72,7 @@ impl GitBuddy {
                     Ok(result) => InspectState::Ready(result),
                     Err(error) => InspectState::Error(request, format!("{error:#}")),
                 };
+                this.resume_expanded(cx);
                 cx.notify();
             });
         })
@@ -423,7 +429,7 @@ impl GitBuddy {
             .child(h_flex().px_3().py_2().gap_2().bg(rgb(PANEL))
                 .child(div().flex_1().min_w_0().truncate().text_xs().text_color(rgb(MUTED)).child(format!("At {} · {} · follows renames across parents",&history.revision.id[..8],history.entries.len())))
                 .child(self.button("history-blame","Blame at revision").ghost().on_click(cx.listener(move|this,_,_,cx|this.begin_inspection(start_blame.clone(),cx)))))
-            .child(v_flex().id("file-history-scroll").flex_1().min_h_0().overflow_y_scroll()
+                .child(v_flex().id("file-history-scroll").track_scroll(&self.active.scroll.area("file-history-scroll")).flex_1().min_h_0().overflow_y_scroll()
                 .children(history.entries.iter().enumerate().map(|(i,entry)| {
                     let source=PatchSource::Commit(entry.commit.id.clone(),entry.file.clone());
                     let key=source.key(); let open=self.expanded.contains(&key);
@@ -466,7 +472,7 @@ impl GitBuddy {
                         .child(div().w(px(40.)).flex_shrink_0().text_right().text_color(rgb(MUTED)).child(line.number.to_string()))
                         .child(div().whitespace_nowrap().child(line.text.replace('\t',"    ")))
                 })).collect::<Vec<_>>()
-            })).with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained).flex_1().min_h_0()).into_any_element()
+            })).with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained).track_scroll(&self.active.scroll.list("blame-lines")).flex_1().min_h_0()).into_any_element()
     }
 
     fn comparison_view(
@@ -543,6 +549,7 @@ impl GitBuddy {
             .child(
                 v_flex()
                     .id("comparison-scroll")
+                    .track_scroll(&self.active.scroll.area("comparison-scroll"))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

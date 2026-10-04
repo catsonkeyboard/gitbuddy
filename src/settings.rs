@@ -1,16 +1,23 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub fn config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("GITBUDDY_CONFIG_DIR") {
+        return path.into();
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_default();
+    PathBuf::from(home).join(".config/gitbuddy")
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Settings {
     pub recent: Vec<PathBuf>,
 }
 impl Settings {
     fn path() -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .unwrap_or_default();
-        PathBuf::from(home).join(".config/gitbuddy/settings.json")
+        config_dir().join("settings.json")
     }
     pub fn load() -> Self {
         let path = Self::path();

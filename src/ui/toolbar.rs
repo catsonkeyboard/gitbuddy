@@ -212,6 +212,7 @@ impl GitBuddy {
             .child(
                 h_flex()
                     .id("repository-tabs")
+                    .track_scroll(&self.tab_scroll.area("repository-tabs"))
                     .flex_1()
                     .min_w_0()
                     .h_full()

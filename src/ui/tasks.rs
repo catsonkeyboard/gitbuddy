@@ -81,7 +81,7 @@ impl GitBuddy {
             .iter()
             .position(|t| t.as_ref().is_some_and(|t| t.id == id))
     }
-    pub(super) fn current_message(&self, cx: &Context<Self>) -> String {
+    pub(super) fn current_message(&self, cx: &App) -> String {
         if self.clear_message {
             String::new()
         } else if let Some(value) = &self.restore_message {
@@ -141,6 +141,7 @@ impl GitBuddy {
         }
         self.modal = None;
         self.active.retry_preparation = Some(preparation.clone());
+        let limit = self.active.limit;
         self.dispatch(
             label,
             cancellable,
@@ -155,7 +156,7 @@ impl GitBuddy {
                 Loaded::read(
                     repo,
                     Selection::Work,
-                    HISTORY_PAGE_SIZE,
+                    limit,
                     "Repository ready".into(),
                     false,
                     false,
@@ -310,7 +311,7 @@ impl GitBuddy {
         if matches!(self.active.selection, Selection::Inspect)
             && let inspect::InspectState::Loading(request) = &self.active.inspection
         {
-            self.begin_inspection(request.clone(), cx);
+            self.load_inspection(request.clone(), true, cx);
         }
         // Cached commit/comparison patches survive switching; interrupted loads
         // are resumed only after this repository's write task has finished.
@@ -400,7 +401,7 @@ fn tab_mut_by_id<'a>(
 }
 
 impl RepoTab {
-    fn apply_loaded(&mut self, mut loaded: Loaded, requested: &Selection) {
+    pub(super) fn apply_loaded(&mut self, mut loaded: Loaded, requested: &Selection) {
         let changed = self.snapshot.fingerprint != loaded.snapshot.fingerprint;
         if self.selection != *requested {
             loaded.selection = self.selection.clone();
@@ -439,6 +440,9 @@ impl RepoTab {
             self.patches.clear();
         }
         self.refresh_views = true;
+        if let Some(saved) = self.restoring.take() {
+            self.apply_session(saved);
+        }
     }
 }
 

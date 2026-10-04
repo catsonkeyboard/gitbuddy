@@ -4,6 +4,7 @@ impl GitBuddy {
     pub(super) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut sidebar = v_flex()
             .id("sidebar")
+            .track_scroll(&self.active.scroll.area("sidebar"))
             .w(px(180.))
             .h_full()
             .flex_shrink_0()

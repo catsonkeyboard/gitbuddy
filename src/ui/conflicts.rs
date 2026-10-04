@@ -1,19 +1,13 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ResultChoice {
-    Edited,
-    Ours,
-    Theirs,
-    Worktree,
-    Delete,
-}
+pub(super) use gitbuddy::session::ConflictChoice as ResultChoice;
 #[derive(Clone)]
 pub(super) struct ConflictDraft {
     pub context: Arc<git::ConflictContext>,
     pub text: String,
     pub choice: ResultChoice,
     pub dirty: bool,
+    pub editor: gitbuddy::session::EditorView,
 }
 #[derive(Clone, Default)]
 pub(super) struct ConflictViewState {
@@ -23,6 +17,11 @@ pub(super) struct ConflictViewState {
     loading: bool,
     loading_file: bool,
     error: Option<String>,
+}
+impl ConflictViewState {
+    pub(super) fn is_ready(&self) -> bool {
+        !self.loading && !self.loading_file
+    }
 }
 impl GitBuddy {
     pub(super) fn open_conflicts(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
@@ -104,6 +103,7 @@ impl GitBuddy {
         if self.busy() || self.active.conflicts.loading {
             return;
         }
+        self.sync_editor_views(cx);
         self.active.conflicts.selected = Some(path.clone());
         self.active.conflicts.error = None;
         self.conflict_generation += 1;
@@ -144,7 +144,19 @@ impl GitBuddy {
                             context: Arc::new(context),
                             choice: ResultChoice::Edited,
                             dirty: false,
+                            editor: gitbuddy::session::EditorView::default(),
                         };
+                        if let Some(saved) = this.active.restored_conflicts.remove(&path) {
+                            let unchanged = saved.fingerprint == gitbuddy::session::conflict_fingerprint(&draft.context);
+                            draft.text = saved.text;
+                            draft.dirty = saved.dirty;
+                            draft.editor = saved.editor;
+                            draft.choice = if unchanged { saved.choice } else { ResultChoice::Edited };
+                            if !unchanged {
+                                draft.dirty = true;
+                                this.active.notice = "Conflict changed since the saved session; restored text needs review before saving.".into();
+                            }
+                        }
                         if reload
                             && let Some(previous) = this.active.conflicts.drafts.get(&path)
                             && previous.dirty
@@ -250,7 +262,7 @@ impl GitBuddy {
             .when_some(self.active.conflicts.error.clone(), |col,error| col.child(div().px_3().py_2().text_xs().text_color(rgb(0xe9a3a9)).child(error)))
             .when(self.active.error, |col| col.child(div().px_3().py_2().text_xs().text_color(rgb(0xe9a3a9)).child(self.active.notice.clone())))
             .child(h_flex().flex_1().min_h_0().items_start()
-                .child(v_flex().id("conflict-files").w(px(170.)).h_full().flex_shrink_0().overflow_y_scroll().bg(rgb(BG)).border_r_1().border_color(rgb(BORDER))
+                .child(v_flex().id("conflict-files").track_scroll(&self.active.scroll.area("conflict-files")).w(px(170.)).h_full().flex_shrink_0().overflow_y_scroll().bg(rgb(BG)).border_r_1().border_color(rgb(BORDER))
                     .children(session.iter().flat_map(|s| s.files.iter()).enumerate().map(|(i,file)| {
                         let path = file.path.clone();
                         let selected = self.active.conflicts.selected.as_ref() == Some(&path);
@@ -275,6 +287,7 @@ impl GitBuddy {
     fn conflict_editor_view(&self, draft: &ConflictDraft, cx: &mut Context<Self>) -> AnyElement {
         let context = &draft.context;
         let path = context.file.path.clone();
+        let scroll_path = path.display().to_string();
         let deletion = draft.choice == ResultChoice::Delete
             || (draft.choice == ResultChoice::Ours && context.ours.is_none())
             || (draft.choice == ResultChoice::Theirs && context.theirs.is_none())
@@ -304,9 +317,9 @@ impl GitBuddy {
                 .child(div().flex_1().min_w_0().truncate().text_sm().child(format!("{}{}",path.display(),if draft.dirty {" · unsaved result"} else {""})))
                 .child(self.button("reload-conflict-file","Reload file").ghost().disabled(self.busy()).on_click(cx.listener(move|this,_,_,cx|this.choose_conflict(path.clone(),true,cx)))))
             .child(h_flex().h(px(200.)).w_full().items_start().border_b_1().border_color(rgb(BORDER))
-                .child(conflict_side("Ours · current side",context.ours.as_ref(),"ours-lines",0x2b423d))
-                .child(conflict_side("Base · ancestor",context.base.as_ref(),"base-lines",0x303846))
-                .child(conflict_side("Theirs · incoming side",context.theirs.as_ref(),"theirs-lines",0x44353b)))
+                .child(conflict_side("Ours · current side",context.ours.as_ref(),"ours-lines",0x2b423d, &self.active.scroll.list(&format!("conflict:{scroll_path}:ours"))))
+                .child(conflict_side("Base · ancestor",context.base.as_ref(),"base-lines",0x303846, &self.active.scroll.list(&format!("conflict:{scroll_path}:base"))))
+                .child(conflict_side("Theirs · incoming side",context.theirs.as_ref(),"theirs-lines",0x44353b, &self.active.scroll.list(&format!("conflict:{scroll_path}:theirs")))))
             .child(h_flex().px_3().py_1().gap_1().bg(rgb(PANEL))
                 .child(self.button("use-ours",if context.ours.is_some(){"Use ours"}else{"Ours: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Ours,cx))))
                 .child(self.button("use-theirs",if context.theirs.is_some(){"Use theirs"}else{"Theirs: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Theirs,cx))))
@@ -328,6 +341,7 @@ fn conflict_side(
     side: Option<&git::ConflictSide>,
     id: &'static str,
     background: u32,
+    scroll: &UniformListScrollHandle,
 ) -> AnyElement {
     let lines = side.map(|s| s.lines.clone()).unwrap_or_default();
     v_flex()
@@ -393,6 +407,7 @@ fn conflict_side(
                 },
             )
             .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+            .track_scroll(scroll)
             .flex_1()
             .min_h_0(),
         )

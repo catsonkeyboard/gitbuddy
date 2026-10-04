@@ -152,6 +152,7 @@ impl GitBuddy {
             .child(
                 v_flex()
                     .id("changes-scroll")
+                    .track_scroll(&self.active.scroll.area("changes-scroll"))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -197,6 +198,6 @@ impl GitBuddy {
                         .child(div().w(px(45.)).flex_shrink_0().text_right().pr_3().text_color(rgb(MUTED)).child(line.map(|l|l.new.clone()).unwrap_or_default()))
                         .child(div().flex_1().min_w_0().whitespace_nowrap().text_color(rgb(foreground)).child(line.map(|l|l.text.replace('\t',"    ")).unwrap_or_else(||"No text diff. The file may be binary, unchanged, or a submodule.".into())))
                 }).collect::<Vec<_>>()
-            })).with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained).flex_1().min_h_0())
+            })).with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained).track_scroll(&self.active.scroll.list("diff-lines")).flex_1().min_h_0())
     }
 }

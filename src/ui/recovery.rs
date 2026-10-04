@@ -51,7 +51,17 @@ impl GitBuddy {
                 if kind == HistoryKind::Amend
                     && let Ok(HistoryData::Edit(edit)) = &result
                 {
-                    this.restore_amend_message = Some(edit.message.clone());
+                    this.restore_amend_message = Some(
+                        this.active
+                            .amend_draft
+                            .as_ref()
+                            .filter(|draft| {
+                                Some(&draft.head) == edit.head.id.as_ref()
+                                    && draft.reference == edit.head.reference
+                            })
+                            .map(|draft| draft.message.clone())
+                            .unwrap_or_else(|| edit.message.clone()),
+                    );
                 }
                 this.history_data =
                     result.unwrap_or_else(|error| HistoryData::Error(format!("{error:#}")));

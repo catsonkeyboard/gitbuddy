@@ -41,7 +41,7 @@ impl GitBuddy {
                 if this.patch_generation != generation {
                     return;
                 }
-                let selection = match (&result, this.active.patches.get(&key)) {
+                let mut selection = match (&result, this.active.patches.get(&key)) {
                     (Ok(next), Some(PatchState::Ready(previous, selection)))
                         if next.partial == previous.partial && next.lines == previous.lines =>
                     {
@@ -49,6 +49,13 @@ impl GitBuddy {
                     }
                     _ => PatchLineSelection::default(),
                 };
+                if let Ok(patch) = &result
+                    && let Some(saved) = this.active.restored_lines.remove(&key)
+                    && let Some((rows, anchor)) = saved.restore(&patch.lines)
+                {
+                    selection.rows = rows;
+                    selection.anchor = anchor;
+                }
                 this.active.patches.insert(
                     key,
                     match result {
@@ -73,6 +80,7 @@ impl GitBuddy {
             Some(PatchState::Ready(patch, selection)) if !patch.lines.is_empty() => {
                 let height = (patch.lines.len() as f32 * 20.).min(420.);
                 let key = key.clone();
+                let scroll = self.active.scroll.list(&key.scroll_id());
                 let action_key = key.clone();
                 let clear_key = key.clone();
                 let staged = matches!(key, PatchKey::Work(_, true));
@@ -168,6 +176,7 @@ impl GitBuddy {
                     }),
                 )
                 .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                .track_scroll(&scroll)
                 .h(px(height))
                 .w_full();
                 v_flex()
@@ -319,6 +328,7 @@ impl GitBuddy {
                 col.child(
                     div()
                         .id("commit-description")
+                        .track_scroll(&self.active.scroll.area("commit-description"))
                         .max_h(px(160.))
                         .overflow_y_scroll()
                         .text_xs()
@@ -365,6 +375,7 @@ impl GitBuddy {
             .child(
                 v_flex()
                     .id("commit-files-scroll")
+                    .track_scroll(&self.active.scroll.area("commit-files-scroll"))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

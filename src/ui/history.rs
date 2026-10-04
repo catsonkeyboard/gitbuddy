@@ -2,6 +2,7 @@ use super::*;
 
 impl GitBuddy {
     pub(super) fn history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.query.to_lowercase();
         let filtered: Vec<_> = self
             .snapshot
             .commits
@@ -10,7 +11,7 @@ impl GitBuddy {
                 self.query.is_empty()
                     || format!("{} {} {} {}", c.subject, c.author, c.id, c.refs)
                         .to_lowercase()
-                        .contains(&self.query)
+                        .contains(&query)
             })
             .collect();
         let graph = graph::rows(&filtered, !self.query.is_empty());
@@ -102,6 +103,7 @@ impl GitBuddy {
             .child(if self.history_tab == 0 {
                 v_flex()
                     .id("commit-list")
+                    .track_scroll(&self.active.scroll.area("commit-list"))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -134,6 +136,7 @@ impl GitBuddy {
             } else {
                 v_flex()
                     .id("file-list")
+                    .track_scroll(&self.active.scroll.area("file-list"))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -142,12 +145,7 @@ impl GitBuddy {
                         self.snapshot
                             .files
                             .iter()
-                            .filter(|f| {
-                                f.path
-                                    .to_string_lossy()
-                                    .to_lowercase()
-                                    .contains(&self.query)
-                            })
+                            .filter(|f| f.path.to_string_lossy().to_lowercase().contains(&query))
                             .enumerate()
                             .map(|(i, file)| {
                                 let file = file.clone();

@@ -6,9 +6,11 @@ mod inspect;
 mod modals;
 mod patches;
 mod recovery;
+mod session;
 mod sidebar;
 mod tasks;
 mod toolbar;
+use gitbuddy::session::PatchKey;
 use gitbuddy::{
     git::{
         self, Commit, CommitDetail, CommitFile, DiffLine, FileChange, Operation, Repository,
@@ -67,12 +69,6 @@ enum Selection {
     Commit(String),
     Inspect,
     Conflicts,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum PatchKey {
-    Work(PathBuf, bool),
-    Commit(String, PathBuf),
-    Compare(String, String, PathBuf),
 }
 #[derive(Clone)]
 enum PatchSource {
@@ -245,10 +241,16 @@ pub struct RepoTab {
     conflicts: conflicts::ConflictViewState,
     query: String,
     message: String,
+    message_view: gitbuddy::session::EditorView,
+    amend_draft: Option<gitbuddy::session::AmendDraft>,
     limit: usize,
     history_tab: usize,
     notice: String,
     error: bool,
+    scroll: session::ViewScroll,
+    restoring: Option<gitbuddy::session::Tab>,
+    restored_lines: HashMap<PatchKey, gitbuddy::session::LineSelection>,
+    restored_conflicts: HashMap<PathBuf, gitbuddy::session::ConflictDraft>,
 }
 impl Default for RepoTab {
     fn default() -> Self {
@@ -273,10 +275,16 @@ impl Default for RepoTab {
             conflicts: conflicts::ConflictViewState::default(),
             query: String::new(),
             message: String::new(),
+            message_view: gitbuddy::session::EditorView::default(),
+            amend_draft: None,
             limit: HISTORY_PAGE_SIZE,
             history_tab: 0,
             notice: String::new(),
             error: false,
+            scroll: session::ViewScroll::default(),
+            restoring: None,
+            restored_lines: HashMap::new(),
+            restored_conflicts: HashMap::new(),
         }
     }
 }
@@ -310,6 +318,10 @@ pub struct GitBuddy {
     restore_conflict: Option<String>,
     tasks: tasks::RepositoryTasks,
     settings: Settings,
+    session_store: gitbuddy::session::Store,
+    session_revision: u64,
+    session_warning: Option<String>,
+    tab_scroll: session::ViewScroll,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -339,6 +351,11 @@ impl GitBuddy {
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Commit message"));
         let conflict_editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
         let subscriptions = vec![
+            cx.on_app_quit(|this, cx| {
+                this.flush_session(cx);
+                async {}
+            }),
+            cx.on_release(|this, cx| this.flush_session(cx)),
             cx.subscribe_in(
                 &conflict_editor,
                 window,
@@ -362,15 +379,20 @@ impl GitBuddy {
             ),
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.active.query = this.search.read(cx).value().to_string().to_lowercase();
+                    this.active.query = this.search.read(cx).value().to_string();
                     cx.notify();
                 }
             }),
-            cx.subscribe_in(&amend_message, window, |_, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
-            }),
+            cx.subscribe_in(
+                &amend_message,
+                window,
+                |this, _, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.active.amend_draft = this.current_amend(cx);
+                        cx.notify();
+                    }
+                },
+            ),
             cx.subscribe_in(&form_a, window, |_, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
@@ -378,7 +400,15 @@ impl GitBuddy {
             }),
         ];
         let settings = Settings::load();
-        let initial = path.or_else(|| settings.recent.first().cloned());
+        let session_store =
+            gitbuddy::session::Store::new(gitbuddy::settings::config_dir().join("session.json"));
+        let saved = session_store.load();
+        let load_error = saved.as_ref().err().map(|error| format!("{error:#}"));
+        let initial = if matches!(saved, Ok(Some(_))) {
+            path
+        } else {
+            path.or_else(|| settings.recent.first().cloned())
+        };
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut this = Self {
@@ -412,12 +442,25 @@ impl GitBuddy {
             restore_conflict: None,
             tasks: tasks::RepositoryTasks::default(),
             settings,
+            session_store,
+            session_revision: 0,
+            session_warning: load_error.clone(),
+            tab_scroll: session::ViewScroll::default(),
             focus,
             _subscriptions: subscriptions,
         };
+        if let Ok(Some(saved)) = saved {
+            this.restore_session(saved, cx);
+        }
         if let Some(path) = initial {
             this.open(path, cx);
         }
+        if let Some(error) = load_error {
+            eprintln!("Cannot restore session: {error}");
+            this.active.notice = error;
+            this.active.error = true;
+        }
+        this.start_session_autosave(cx);
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -447,6 +490,11 @@ impl GitBuddy {
             return;
         };
         self.active.message = self.current_message(cx);
+        self.active.query = self
+            .restore_search
+            .clone()
+            .unwrap_or_else(|| self.search.read(cx).value().to_string());
+        self.sync_editor_views(cx);
         self.tabs[index] = Some(std::mem::take(&mut self.active));
     }
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -687,10 +735,14 @@ impl GitBuddy {
                             .commit_cache
                             .insert(detail.id.clone(), detail.clone());
                         this.active.commit_detail = Some(detail);
+                        this.resume_expanded(cx);
                     }
                     Err(err) => {
                         this.active.notice = format!("{err:#}");
                         this.active.error = true;
+                        // Saved objects may have been pruned while the app was closed.
+                        this.active.selection = Selection::Work;
+                        this.active.expanded.clear();
                     }
                 }
                 cx.notify();
@@ -829,25 +881,50 @@ impl GitBuddy {
 }
 impl Render for GitBuddy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.restore_scroll_on_next_frame(window, cx);
         if let Some(value) = self.restore_search.take() {
             self.search
                 .update(cx, |state, cx| state.set_value(value, window, cx));
         }
         if let Some(value) = self.restore_message.take() {
-            self.message
-                .update(cx, |state, cx| state.set_value(value, window, cx));
+            let view = self.active.message_view.clone();
+            self.message.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+                state.set_selected_range(view.start..view.end, cx);
+                state.set_scroll_offset(point(px(view.scroll.x), px(view.scroll.y)), cx);
+            });
         }
         if let Some(value) = self.restore_amend_message.take() {
-            self.amend_message
-                .update(cx, |state, cx| state.set_value(value, window, cx));
+            let view = self
+                .active
+                .amend_draft
+                .as_ref()
+                .map(|draft| draft.editor.clone())
+                .unwrap_or_default();
+            self.amend_message.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+                state.set_selected_range(view.start..view.end, cx);
+                state.set_scroll_offset(point(px(view.scroll.x), px(view.scroll.y)), cx);
+            });
             self.amend_message
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx);
         }
         if let Some(value) = self.restore_conflict.take() {
-            self.conflict_editor
-                .update(cx, |state, cx| state.set_value(value, window, cx));
+            let view = self
+                .active
+                .conflicts
+                .selected
+                .as_ref()
+                .and_then(|p| self.active.conflicts.drafts.get(p))
+                .map(|draft| draft.editor.clone())
+                .unwrap_or_default();
+            self.conflict_editor.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+                state.set_selected_range(view.start..view.end, cx);
+                state.set_scroll_offset(point(px(view.scroll.x), px(view.scroll.y)), cx);
+            });
         }
         if self.clear_message {
             self.clear_message = false;
@@ -983,7 +1060,16 @@ impl Render for GitBuddy {
                         div()
                             .text_color(rgb(MUTED))
                             .child("GitBuddy  ·  Rust + GPUI"),
-                    ),
+                    )
+                    .when_some(self.session_warning.clone(), |row, warning| {
+                        row.child(
+                            div()
+                                .max_w(px(420.))
+                                .truncate()
+                                .text_color(rgb(0xf0a4aa))
+                                .child(format!("Session: {warning}")),
+                        )
+                    }),
             )
             .when_some(self.modal.clone(), |root, modal| {
                 root.child(self.modal_view(modal, cx))
