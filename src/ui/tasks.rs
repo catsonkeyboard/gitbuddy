@@ -1,5 +1,31 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+
+// Completion is signalled by the worker itself, independently of UI delivery.
+// Native app shutdown cannot wait for callbacks on the UI thread it occupies.
+#[derive(Default)]
+struct Completion {
+    done: Mutex<bool>,
+    changed: Condvar,
+}
+struct CompletionGuard(Arc<Completion>);
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        *self.0.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.changed.notify_all();
+    }
+}
+impl Completion {
+    fn wait(&self) {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = self.changed.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct TabId(u64);
@@ -18,18 +44,37 @@ pub(super) struct RunningTask {
     pub label: String,
     pub cancellation: Option<git::CancellationToken>,
     ticket: Ticket,
+    completion: Arc<Completion>,
 }
 #[derive(Default)]
 pub(super) struct RepositoryTasks {
     next_job: u64,
+    closing: bool,
     running: HashMap<TabId, RunningTask>,
 }
 impl RepositoryTasks {
+    pub fn closing(&self) -> bool {
+        self.closing
+    }
+    fn request_shutdown(&mut self) {
+        self.closing = true;
+        for task in self.running.values() {
+            if let Some(token) = &task.cancellation {
+                token.cancel();
+            }
+        }
+    }
+    pub fn shutdown_and_wait(&mut self) {
+        self.request_shutdown();
+        for task in self.running.values() {
+            task.completion.wait();
+        }
+    }
     pub fn get(&self, tab: TabId) -> Option<&RunningTask> {
         self.running.get(&tab)
     }
     fn start(&mut self, tab: TabId, label: &str, cancellable: bool) -> Option<Ticket> {
-        if self.get(tab).is_some() {
+        if self.closing || self.get(tab).is_some() {
             return None;
         }
         self.next_job += 1;
@@ -42,6 +87,7 @@ impl RepositoryTasks {
             RunningTask {
                 label: label.into(),
                 ticket,
+                completion: Arc::new(Completion::default()),
                 cancellation: cancellable.then(git::CancellationToken::default),
             },
         );
@@ -67,8 +113,21 @@ pub(super) enum Preparation {
 }
 
 impl GitBuddy {
+    pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        self.tasks.request_shutdown();
+        if self.tasks.running.is_empty() {
+            self.flush_session(cx);
+            cx.quit();
+            true
+        } else {
+            self.active.notice =
+                "Stopping network transfers; waiting for repository writes before quitting…".into();
+            cx.notify();
+            false
+        }
+    }
     pub(super) fn busy(&self) -> bool {
-        self.tasks.get(self.active.id).is_some()
+        self.tasks.closing() || self.tasks.get(self.active.id).is_some()
     }
     fn tab_mut(&mut self, id: TabId) -> Option<&mut RepoTab> {
         tab_mut_by_id(&mut self.active, &mut self.tabs, id)
@@ -193,9 +252,11 @@ impl GitBuddy {
         let sink: git::ProgressSink = Arc::new(std::sync::Mutex::new(move |text: &str| {
             let _ = tx.try_send(text.to_owned());
         }));
-        let task = cx
-            .background_executor()
-            .spawn(async move { work(git::NetworkControl::new(Some(sink), cancellation)) });
+        let completion = CompletionGuard(self.tasks.get(ticket.tab).unwrap().completion.clone());
+        let task = cx.background_executor().spawn(async move {
+            let _completion = completion;
+            work(git::NetworkControl::new(Some(sink), cancellation))
+        });
         cx.spawn(async move |this, cx| {
             while let Ok(text) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
@@ -244,11 +305,19 @@ impl GitBuddy {
                                 if active && let Some(index) = this.tab_index(id) {
                                     this.activate_tab(index, cx);
                                 }
+                                if this.tasks.closing && this.tasks.running.is_empty() {
+                                    this.flush_session(cx);
+                                    cx.quit();
+                                }
                                 cx.notify();
                                 return;
                             }
                             if let Err(e) = this.settings.remember(loaded.repo.root.clone()) {
-                                eprintln!("Cannot save recent repositories: {e}");
+                                loaded.notice = format!(
+                                    "{}; Cannot save recent repositories: {e:#}",
+                                    loaded.notice
+                                );
+                                loaded.error = true;
                             }
                         }
                         let current_message = if active {
@@ -288,6 +357,10 @@ impl GitBuddy {
                             this.refresh_task_views(cx);
                         }
                     }
+                }
+                if this.tasks.closing && this.tasks.running.is_empty() {
+                    this.flush_session(cx);
+                    cx.quit();
                 }
                 cx.notify();
             });
@@ -463,6 +536,64 @@ mod tests {
     use super::{RepositoryTasks, TabId, tab_mut_by_id};
     use crate::ui::{Loaded, PatchKey, PatchLineSelection, PatchState, RepoTab, Selection};
     use gitbuddy::git::{Repository, Snapshot};
+    #[test]
+    fn shutdown_cancels_all_tabs_and_waits_for_final_writes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let mut jobs = RepositoryTasks::default();
+        let fetch = jobs.start(TabId::new(), "Fetch", true).unwrap();
+        let push = jobs.start(TabId::new(), "Push", true).unwrap();
+        let commit = jobs.start(TabId::new(), "Commit", false).unwrap();
+        let fetch_token = jobs.get(fetch.tab).unwrap().cancellation.clone().unwrap();
+        let push_token = jobs.get(push.tab).unwrap().cancellation.clone().unwrap();
+        let guards = [fetch, push, commit]
+            .map(|ticket| super::CompletionGuard(jobs.get(ticket.tab).unwrap().completion.clone()));
+        let wrote = Arc::new(AtomicBool::new(false));
+        let wrote_worker = wrote.clone();
+        let cancellation = fetch_token.clone();
+        let worker = std::thread::spawn(move || {
+            let _guards = guards;
+            // Shutdown must cancel the fetch, then wait for these final writes.
+            while !cancellation.is_requested() {
+                std::thread::yield_now();
+            }
+            wrote_worker.store(true, Ordering::SeqCst);
+        });
+        jobs.shutdown_and_wait();
+        assert!(wrote.load(Ordering::SeqCst));
+        assert!(fetch_token.is_requested());
+        assert!(push_token.is_requested());
+        assert!(jobs.start(TabId::new(), "New task", true).is_none());
+        worker.join().unwrap();
+    }
+    #[test]
+    fn worker_unwind_also_signals_completion() {
+        let completion = std::sync::Arc::new(super::Completion::default());
+        let guard = super::CompletionGuard(completion.clone());
+        let worker = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("simulated worker failure");
+        });
+        completion.wait();
+        assert!(worker.join().is_err());
+    }
+    #[test]
+    fn operation_error_does_not_disable_automatic_refresh() {
+        let tab = RepoTab {
+            repo: Some(Repository {
+                root: "/test/repo".into(),
+            }),
+            error: true,
+            notice: "Previous operation failed".into(),
+            ..RepoTab::default()
+        };
+        assert!(tab.ready_for_refresh(false, false));
+        assert!(!tab.ready_for_refresh(true, false));
+        assert!(!tab.ready_for_refresh(false, true));
+        assert!(!RepoTab::default().ready_for_refresh(false, false));
+    }
     #[test]
     fn repositories_run_independently_and_stale_job_results_are_rejected() {
         let mut jobs = RepositoryTasks::default();

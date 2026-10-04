@@ -249,6 +249,15 @@ fn fingerprint_of(
     }
     references.sort();
     references.hash(&mut hasher);
+    // Effective local/global/include configuration can change remotes, upstream
+    // and authentication without touching HEAD, references or working files.
+    repo.config()?
+        .snapshot()?
+        .entries(None)?
+        .for_each(|entry| {
+            entry.name_bytes().hash(&mut hasher);
+            entry.value_bytes().hash(&mut hasher);
+        })?;
     let index = repo.index()?;
     let workdir = repo.workdir().context("仓库没有工作区")?;
     for change in files {
@@ -307,7 +316,10 @@ fn hash_worktree_metadata(path: &Path, hasher: &mut impl Hasher) -> Result<()> {
 /// SSH agent / credential helper auth, plus optional transfer progress for
 /// the status bar. Progress messages are rate-limited to one per 100ms so a
 /// fast transfer cannot flood the UI thread.
-pub(super) fn network_callbacks<'a>(control: NetworkControl) -> RemoteCallbacks<'a> {
+pub(super) fn network_callbacks<'a>(
+    control: NetworkControl,
+    config: git2::Config,
+) -> RemoteCallbacks<'a> {
     let mut callbacks = RemoteCallbacks::new();
     let sideband = control.clone();
     callbacks.sideband_progress(move |data| {
@@ -367,7 +379,6 @@ pub(super) fn network_callbacks<'a>(control: NetworkControl) -> RemoteCallbacks<
             return Ok(credential);
         }
         if allowed.contains(CredentialType::USER_PASS_PLAINTEXT)
-            && let Ok(config) = git2::Config::open_default()
             && let Ok(credential) = Cred::credential_helper(&config, url, username)
         {
             return Ok(credential);
@@ -466,7 +477,10 @@ impl Repository {
             let staging = tempfile::tempdir_in(parent)?;
             let clone_path = staging.path().join("repository");
             let mut fetch = FetchOptions::new();
-            fetch.remote_callbacks(network_callbacks(control.clone()));
+            fetch.remote_callbacks(network_callbacks(
+                control.clone(),
+                git2::Config::open_default()?.snapshot()?,
+            ));
             // Unlike an existing working tree, this isolated checkout can safely
             // stop midway and be discarded with its owned temporary directory.
             let checkout_control = control.clone();
@@ -896,6 +910,13 @@ impl Repository {
                         ),
                         "A repository operation is in progress; use its Continue action (external rebases must be continued with Git)"
                     );
+                    ensure!(
+                        Snapshot::commit_allowed(
+                            &file_changes(&repo)?,
+                            super::conflicts::operation(repo.state())
+                        ),
+                        "No staged changes to commit; empty commits require an explicit allow-empty action"
+                    );
                     commit_index(&repo, &message, None)
                 }
                 Operation::CreateBranch(name) => {
@@ -977,9 +998,8 @@ impl Repository {
                         matches!(state, RepositoryState::CherryPick | RepositoryState::Revert),
                         "没有待继续的操作"
                     );
-                    let message = fs::read_to_string(repo.path().join("MERGE_MSG"))
-                        .unwrap_or_else(|_| "Continue operation".into());
-                    commit_index(&repo, &message, None)
+                    let session = self.conflict_session()?;
+                    self.continue_conflict(&session)
                 }
                 Operation::SetIdentity(name, email) => {
                     ensure!(
@@ -999,17 +1019,31 @@ impl Repository {
                 }
                 Operation::Pull => {
                     let head = repo.head()?;
-                    let local_name = head.shorthand().context("当前不在分支上")?.to_string();
-                    let local = repo.find_branch(&local_name, BranchType::Local)?;
-                    let upstream = local.upstream().context("当前分支没有上游")?;
-                    let upstream_name = upstream.name()?.context("上游名称无效")?.to_string();
-                    let remote_name = upstream_name
-                        .split('/')
-                        .next()
-                        .context("上游远程名称无效")?;
-                    fetch_one(&repo, remote_name, control.clone())?;
-                    let updated = repo.find_branch(&upstream_name, BranchType::Remote)?;
-                    let target = updated.get().target().context("上游没有提交")?;
+                    ensure!(head.is_branch(), "请先切换到本地分支再 Pull");
+                    let source = head.name()?;
+                    let remote = repo
+                        .branch_upstream_remote(source)
+                        .context("当前分支没有上游远程配置")?;
+                    let remote_name = remote.as_str().context("上游远程名称编码无效")?;
+                    let merge = repo
+                        .branch_upstream_merge(source)
+                        .context("当前分支没有上游分支配置")?;
+                    let merge_name = merge.as_str().context("上游分支编码无效")?;
+                    ensure!(
+                        merge_name.starts_with("refs/heads/")
+                            && git2::Reference::is_valid_name(merge_name),
+                        "上游目标不是有效的分支引用"
+                    );
+                    let upstream_name = if remote_name == "." {
+                        merge_name.to_string()
+                    } else {
+                        fetch_one(&repo, remote_name, control.clone())?;
+                        repo.branch_upstream_name(source)?
+                            .as_str()
+                            .context("上游引用编码无效")?
+                            .to_string()
+                    };
+                    let target = repo.find_reference(&upstream_name)?.peel_to_commit()?.id();
                     control.cancellation.finish()?;
                     control.phase("Pull: applying fast-forward…");
                     merge_target(&repo, target, &upstream_name, true)
@@ -1049,7 +1083,8 @@ impl Repository {
                     );
                     let mut remote = repo.find_remote(&remote_name)?;
                     super::lfs::upload_before_push(&repo, &remote_name, &source, &control)?;
-                    let mut callbacks = network_callbacks(control.clone());
+                    let mut callbacks =
+                        network_callbacks(control.clone(), repo.config()?.snapshot()?);
                     let push_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
                     let error_slot = push_error.clone();
                     callbacks.push_update_reference(move |_, status| {
@@ -1278,9 +1313,18 @@ fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Res
     if let Some(extra) = &extra {
         parents.push(extra);
     }
+    let picked = if repo.state() == RepositoryState::CherryPick {
+        let marker = fs::read_to_string(repo.path().join("CHERRY_PICK_HEAD"))?;
+        Some(repo.find_commit(oid(marker.trim())?)?)
+    } else {
+        None
+    };
+    let original_author = picked
+        .as_ref()
+        .map_or_else(|| signature.clone(), |c| c.author().to_owned());
     let id = repo.commit(
         Some("HEAD"),
-        &signature,
+        &original_author,
         &signature,
         message,
         &tree,
@@ -1356,7 +1400,10 @@ fn fetch_one(repo: &RawRepo, name: &str, control: NetworkControl) -> Result<()> 
     let mut remote = repo.find_remote(name)?;
     let mut options = FetchOptions::new();
     options
-        .remote_callbacks(network_callbacks(control.clone()))
+        .remote_callbacks(network_callbacks(
+            control.clone(),
+            repo.config()?.snapshot()?,
+        ))
         .prune(git2::FetchPrune::On);
     remote.fetch(&[] as &[&str], Some(&mut options), None)?;
     Ok(())

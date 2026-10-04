@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::component::scroll::ScrollableElement;
 
 impl GitBuddy {
     pub(super) fn history(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -15,18 +16,7 @@ impl GitBuddy {
             })
             .collect();
         let graph = graph::rows(&filtered, !self.query.is_empty());
-        let graph_width = graph
-            .iter()
-            .flat_map(|row| {
-                row.through
-                    .iter()
-                    .chain(row.outgoing.iter())
-                    .chain(std::iter::once(&row.lane))
-            })
-            .copied()
-            .max()
-            .map_or(36., |lane| ((lane + 1) * 14 + 20).max(36) as f32)
-            .min(130.);
+        let graph_width = graph::width(&graph);
         v_flex()
             .w(px(340.))
             .min_w(px(270.))
@@ -103,7 +93,9 @@ impl GitBuddy {
             .child(if self.history_tab == 0 {
                 v_flex()
                     .id("commit-list")
+                    .overflow_x_scroll()
                     .track_scroll(&self.active.scroll.area("commit-list"))
+                    .horizontal_scrollbar(&self.active.scroll.area("commit-list"))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -198,12 +190,13 @@ impl GitBuddy {
         let id = commit.id.clone();
         let selected = matches!(&self.selection, Selection::Commit(oid) if oid == &commit.id);
         let merge = commit.parents.len() > 1;
-        let lane_x = |lane: usize| 16. + lane as f32 * 14.;
+        let lane_x = graph::lane_x;
         let line_color =
             |lane: usize| rgb([0x86b7f3, 0xb6a2ec, 0x86c7ad, 0xe2b87b, 0x8cc6d7][lane % 5]);
         let node_x = lane_x(graph.lane);
         div()
             .id(("commit-row", index))
+            .min_w(px(graph_width + 180.))
             .relative()
             .flex_shrink_0()
             .pl(px(graph_width))

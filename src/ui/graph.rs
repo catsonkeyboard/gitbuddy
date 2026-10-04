@@ -10,6 +10,24 @@ pub(super) struct GraphRow {
     pub links: Vec<(usize, usize)>,
 }
 
+pub(super) fn lane_x(lane: usize) -> f32 {
+    16. + lane as f32 * 14.
+}
+
+pub(super) fn width(rows: &[GraphRow]) -> f32 {
+    rows.iter()
+        .flat_map(|row| {
+            row.through
+                .iter()
+                .chain(row.outgoing.iter())
+                .copied()
+                .chain(std::iter::once(row.lane))
+                .chain(row.links.iter().flat_map(|(a, b)| [*a, *b]))
+        })
+        .max()
+        .map_or(36., |lane| (lane_x(lane) + 18.).max(36.))
+}
+
 /// Lay out parent edges in stable columns. Vacated columns are reused rather
 /// than shifting existing branches, so adjacent rows join at the same x value.
 pub(super) fn rows(commits: &[&Commit], filtered: bool) -> Vec<GraphRow> {
@@ -86,6 +104,24 @@ mod tests {
             author: String::new(),
             date: String::new(),
             refs: String::new(),
+        }
+    }
+    #[test]
+    fn many_merge_lanes_fit_inside_graph_without_overlapping_commit_text() {
+        let parents: Vec<_> = (0..16).map(|i| format!("parent-{i}")).collect();
+        let data = [commit(
+            "octopus",
+            &parents.iter().map(String::as_str).collect::<Vec<_>>(),
+        )];
+        let graph = rows(&data.iter().collect::<Vec<_>>(), false);
+        assert_eq!(graph[0].outgoing.len(), 16);
+        assert!(width(&graph) > 130.);
+        for lane in &graph[0].outgoing {
+            assert!(lane_x(*lane) + 6. < width(&graph));
+        }
+        for (start, end) in &graph[0].links {
+            assert!(lane_x(*start) < width(&graph));
+            assert!(lane_x(*end) < width(&graph));
         }
     }
     #[test]

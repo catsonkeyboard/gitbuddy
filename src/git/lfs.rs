@@ -584,6 +584,35 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+// Own the process group even when the worker unwinds or returns early.
+struct TransferChild {
+    child: std::process::Child,
+    cleaned: bool,
+}
+impl TransferChild {
+    fn cleanup(&mut self) {
+        if !self.cleaned {
+            stop(&mut self.child);
+            self.cleaned = true;
+        }
+    }
+}
+impl std::ops::Deref for TransferChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for TransferChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+impl Drop for TransferChild {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
 fn run_lfs_program(
     root: &Path,
     args: &[&str],
@@ -605,9 +634,12 @@ fn run_lfs_program(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().context(
-        "Install git-lfs to transfer LFS objects; ordinary Git operations still use libgit2",
-    )?;
+    let mut child = TransferChild {
+        child: command.spawn().context(
+            "Install git-lfs to transfer LFS objects; ordinary Git operations still use libgit2",
+        )?,
+        cleaned: false,
+    };
     let mut stderr = child.stderr.take().context("Missing LFS error pipe")?;
     let reader = std::thread::spawn(move || {
         let mut kept = Vec::new();
@@ -625,19 +657,21 @@ fn run_lfs_program(
     });
     loop {
         if let Err(cancel) = control.check() {
-            stop(&mut child);
+            child.cleanup();
             let _ = reader.join();
             return Err(cancel);
         }
         let status = match child.try_wait() {
             Ok(status) => status,
             Err(error) => {
-                stop(&mut child);
+                child.cleanup();
                 let _ = reader.join();
                 return Err(error.into());
             }
         };
         if let Some(status) = status {
+            // A descendant may still hold stderr after its parent has exited.
+            child.cleanup();
             let error = reader.join().unwrap_or_default();
             ensure!(
                 status.success(),
@@ -694,6 +728,45 @@ mod tests {
             "fetch\na;touch injected\nHEAD\n"
         );
         assert!(!dir.path().join("injected").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn dropped_transfer_owner_terminates_and_reaps_child() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(dir.path(), "touch ready\nsleep 30 &\nwait");
+        let child = Command::new(path)
+            .current_dir(dir.path())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = std::time::Instant::now();
+        while !dir.path().join("ready").exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dir.path().join("ready").exists());
+        drop(TransferChild {
+            child,
+            cleaned: false,
+        });
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn completed_parent_does_not_leave_stderr_descendant_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(dir.path(), "sleep 30 &\nexit 0");
+        let start = std::time::Instant::now();
+        run_lfs_program(
+            dir.path(),
+            &[],
+            &NetworkControl::default(),
+            path.as_os_str(),
+        )
+        .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
     #[cfg(unix)]
     #[test]

@@ -278,7 +278,10 @@ impl Repository {
         );
         let mut module = repo.submodule(url, path, true)?;
         let mut fetch = FetchOptions::new();
-        fetch.remote_callbacks(network_callbacks(control.clone()));
+        fetch.remote_callbacks(network_callbacks(
+            control.clone(),
+            repo.config()?.snapshot()?,
+        ));
         let mut options = SubmoduleUpdateOptions::new();
         options.fetch(fetch);
         module.clone(Some(&mut options)).context(
@@ -342,7 +345,10 @@ fn update(
         }
         module.init(false)?;
         let mut fetch = FetchOptions::new();
-        fetch.remote_callbacks(network_callbacks(control.clone()));
+        fetch.remote_callbacks(network_callbacks(
+            control.clone(),
+            repo.config()?.snapshot()?,
+        ));
         let mut checkout = CheckoutBuilder::new();
         checkout.safe();
         let mut options = SubmoduleUpdateOptions::new();

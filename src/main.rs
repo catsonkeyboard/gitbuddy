@@ -24,7 +24,6 @@ fn main() {
                 KeyBinding::new("secondary-q", ui::Quit, None),
                 KeyBinding::new("escape", ui::CloseModal, None),
             ]);
-            cx.on_action(|_: &ui::Quit, cx| cx.quit());
             let close_subscription = cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -45,6 +44,18 @@ fn main() {
                     },
                     |window, cx| {
                         let view = cx.new(|cx| ui::GitBuddy::new(path, window, cx));
+                        let quit_view = view.downgrade();
+                        cx.on_action(move |_: &ui::Quit, cx| {
+                            let _ = quit_view.update(cx, |view, cx| {
+                                view.request_quit(cx);
+                            });
+                        });
+                        let close_view = view.downgrade();
+                        window.on_window_should_close(cx, move |_, cx| {
+                            close_view
+                                .update(cx, |view, cx| view.request_quit(cx))
+                                .unwrap_or(true)
+                        });
                         cx.new(|cx| Root::new(view, window, cx))
                     },
                 )

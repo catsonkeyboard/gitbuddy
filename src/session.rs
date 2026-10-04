@@ -10,13 +10,13 @@ use std::{
 
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
-enum EncodedPath {
+pub(crate) enum EncodedPath {
     Text(String),
     Unix { unix: Vec<u8> },
     Windows { windows: Vec<u16> },
 }
 impl EncodedPath {
-    fn from_path(path: &std::path::Path) -> Self {
+    pub(crate) fn from_path(path: &std::path::Path) -> Self {
         if let Some(text) = path.to_str() {
             return Self::Text(text.into());
         }
@@ -35,7 +35,7 @@ impl EncodedPath {
             }
         }
     }
-    fn into_path(self) -> Result<PathBuf, String> {
+    pub(crate) fn into_path(self) -> Result<PathBuf, String> {
         match self {
             Self::Text(text) => Ok(text.into()),
             #[cfg(unix)]
@@ -50,6 +50,27 @@ impl EncodedPath {
             }
             _ => Err("Session contains a path encoded for another platform".into()),
         }
+    }
+}
+pub(crate) mod paths_encoding {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        paths: &[PathBuf],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        paths
+            .iter()
+            .map(|p| EncodedPath::from_path(p))
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<PathBuf>, D::Error> {
+        Vec::<EncodedPath>::deserialize(deserializer)?
+            .into_iter()
+            .map(|p| p.into_path().map_err(serde::de::Error::custom))
+            .collect()
     }
 }
 mod path_encoding {

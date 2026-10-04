@@ -266,6 +266,11 @@ pub struct RepoTab {
     restored_lines: HashMap<PatchKey, gitbuddy::session::LineSelection>,
     restored_conflicts: HashMap<PathBuf, gitbuddy::session::ConflictDraft>,
 }
+impl RepoTab {
+    fn ready_for_refresh(&self, busy: bool, modal_open: bool) -> bool {
+        !busy && !modal_open && self.repo.is_some()
+    }
+}
 impl Default for RepoTab {
     fn default() -> Self {
         Self {
@@ -368,10 +373,14 @@ impl GitBuddy {
         let conflict_editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
+                this.tasks.shutdown_and_wait();
                 this.flush_session(cx);
                 async {}
             }),
-            cx.on_release(|this, cx| this.flush_session(cx)),
+            cx.on_release(|this, cx| {
+                this.tasks.shutdown_and_wait();
+                this.flush_session(cx);
+            }),
             cx.subscribe_in(
                 &conflict_editor,
                 window,
@@ -486,10 +495,9 @@ impl GitBuddy {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if !this.busy()
-                            && this.modal.is_none()
-                            && this.active.repo.is_some()
-                            && !this.active.error
+                        if this
+                            .active
+                            .ready_for_refresh(this.busy(), this.modal.is_some())
                         {
                             this.auto_refresh(cx);
                         }
@@ -650,9 +658,9 @@ impl GitBuddy {
             if task.await {
                 let _ = this.update(cx, |this, cx| {
                     if this.active.id == tab_id
-                        && !this.busy()
-                        && this.modal.is_none()
-                        && this.active.repo.is_some()
+                        && this
+                            .active
+                            .ready_for_refresh(this.busy(), this.modal.is_some())
                     {
                         this.refresh_with_notice(String::new(), cx);
                     }
@@ -841,13 +849,7 @@ impl GitBuddy {
         cx.notify();
     }
     fn commit(&mut self, cx: &mut Context<Self>) {
-        if self.busy()
-            || self.modal.is_some()
-            || !matches!(
-                self.snapshot.conflict_operation,
-                git::ConflictOperation::None | git::ConflictOperation::Merge
-            )
-        {
+        if self.busy() || self.modal.is_some() || !self.snapshot.can_commit() {
             return;
         }
         self.perform(

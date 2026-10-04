@@ -78,6 +78,19 @@ pub struct Snapshot {
     pub merging: bool,
     pub conflict_operation: ConflictOperation,
 }
+impl Snapshot {
+    /// Shared eligibility for the button, keyboard action and backend entry.
+    pub fn can_commit(&self) -> bool {
+        Self::commit_allowed(&self.files, self.conflict_operation)
+    }
+    pub(crate) fn commit_allowed(files: &[FileChange], operation: ConflictOperation) -> bool {
+        matches!(
+            operation,
+            ConflictOperation::None | ConflictOperation::Merge
+        ) && !files.iter().any(FileChange::conflict)
+            && (files.iter().any(FileChange::staged) || operation == ConflictOperation::Merge)
+    }
+}
 #[derive(Clone, Debug)]
 pub enum Operation {
     Rebase {

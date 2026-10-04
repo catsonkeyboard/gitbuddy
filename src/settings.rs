@@ -13,6 +13,7 @@ pub fn config_dir() -> PathBuf {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default, with = "crate::session::paths_encoding")]
     pub recent: Vec<PathBuf>,
 }
 impl Settings {
@@ -50,12 +51,94 @@ impl Settings {
         }
     }
     pub fn remember(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        self.recent.retain(|p| p != &path);
-        self.recent.insert(0, path);
-        self.recent.truncate(12);
-        let file = Self::path();
-        std::fs::create_dir_all(file.parent().unwrap())?;
-        std::fs::write(&file, serde_json::to_vec_pretty(self)?)?;
+        self.remember_at(path, &Self::path())
+    }
+    fn remember_at(&mut self, path: PathBuf, file: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut next = Self {
+            recent: self.recent.clone(),
+        };
+        next.recent.retain(|p| p != &path);
+        next.recent.insert(0, path);
+        next.recent.truncate(12);
+        let bytes = serde_json::to_vec_pretty(&next)?;
+        let parent = file
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Missing settings parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        temp.write_all(&bytes)?;
+        temp.as_file().sync_all()?;
+        temp.persist(file)?;
+        *self = next;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn legacy_recent_strings_remain_readable_and_order_is_preserved() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"recent":["/old/a","/old/b"]}"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        settings.remember_at("/old/b".into(), &file).unwrap();
+        for i in 0..15 {
+            settings
+                .remember_at(format!("/new/{i}").into(), &file)
+                .unwrap();
+        }
+        assert_eq!(settings.recent.len(), 12);
+        let restored: Settings = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(restored.recent, settings.recent);
+        assert_eq!(restored.recent[0], PathBuf::from("/new/14"));
+        assert!(
+            serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .recent
+                .is_empty()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_recent_path_round_trips_without_poisoning_later_saves() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        let invalid = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"repo-\xff".to_vec()));
+        let mut settings = Settings::default();
+        settings.remember_at(invalid.clone(), &file).unwrap();
+        settings.remember_at("/normal/repo".into(), &file).unwrap();
+        let restored: Settings = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(
+            restored.recent,
+            vec![PathBuf::from("/normal/repo"), invalid]
+        );
+    }
+    #[test]
+    fn failed_atomic_save_keeps_previous_in_memory_and_disk_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.remember_at("/first".into(), &file).unwrap();
+        let previous = std::fs::read(&file).unwrap();
+        let invalid = dir.path().join("not-a-directory");
+        std::fs::write(&invalid, b"block").unwrap();
+        assert!(
+            settings
+                .remember_at("/second".into(), &invalid.join("settings.json"))
+                .is_err()
+        );
+        assert_eq!(settings.recent, vec![PathBuf::from("/first")]);
+        assert_eq!(std::fs::read(&file).unwrap(), previous);
+        // Failure of the final rename must also leave the in-memory list intact.
+        let directory = dir.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(settings.remember_at("/third".into(), &directory).is_err());
+        assert_eq!(settings.recent, vec![PathBuf::from("/first")]);
     }
 }
