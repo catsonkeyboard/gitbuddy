@@ -68,6 +68,10 @@ pub(super) fn head_state(repo: &RawRepo) -> Result<HeadState> {
 
 fn editable(repo: &RawRepo) -> Result<()> {
     ensure!(
+        !super::rebase::active(repo),
+        "Finish or abort the GitBuddy rebase before editing history."
+    );
+    ensure!(
         repo.state() == RepositoryState::Clean,
         "Finish or abort the merge, rebase, cherry-pick or revert before editing history."
     );
@@ -90,6 +94,9 @@ fn rewrite_head(
         repo.path() == expected.git_dir,
         "This selection belongs to a different repository."
     );
+    if expected.reference != "HEAD" {
+        super::workspaces::branch_available(repo, &expected.reference)?;
+    }
     let mut head_lock = repo.transaction()?;
     head_lock.lock_ref("HEAD")?;
     let mut branch_lock = if expected.reference != "HEAD" {

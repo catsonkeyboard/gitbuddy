@@ -3,6 +3,7 @@ mod detail;
 mod graph;
 mod history;
 mod inspect;
+mod management;
 mod modals;
 mod patches;
 mod recovery;
@@ -49,6 +50,10 @@ gpui_kit::actions!(
         OpenFileTools,
         CompareRevisions,
         OpenConflicts,
+        OpenRebase,
+        OpenWorktrees,
+        OpenSubmodules,
+        OpenLfs,
         Quit,
         CloseModal
     ]
@@ -131,6 +136,15 @@ impl PatchLineSelection {
 }
 #[derive(Clone)]
 enum Modal {
+    RebaseSetup,
+    RebasePlan,
+    RebaseMessage(usize),
+    Worktrees,
+    WorktreeCreate,
+    Submodules,
+    SubmoduleAdd,
+    Lfs,
+    LfsPattern(bool),
     Open,
     Init,
     Clone,
@@ -313,6 +327,8 @@ pub struct GitBuddy {
     restore_amend_message: Option<String>,
     tool_files: Option<Result<Arc<git::TreeFiles>, String>>,
     tool_generation: u64,
+    management_data: management::Data,
+    management_generation: u64,
     conflict_generation: u64,
     conflict_editor: Entity<EditorState>,
     restore_conflict: Option<String>,
@@ -437,6 +453,8 @@ impl GitBuddy {
             restore_amend_message: None,
             tool_files: None,
             tool_generation: 0,
+            management_data: management::Data::Loading,
+            management_generation: 0,
             conflict_generation: 0,
             conflict_editor,
             restore_conflict: None,
@@ -760,7 +778,12 @@ impl GitBuddy {
         let clear_message = matches!(operation, Operation::Commit(_));
         let history_edit = matches!(
             operation,
-            Operation::Amend { .. } | Operation::UndoLast(_) | Operation::RestoreReflog { .. }
+            Operation::Amend { .. }
+                | Operation::UndoLast(_)
+                | Operation::RestoreReflog { .. }
+                | Operation::Rebase { .. }
+                | Operation::ContinueRebase
+                | Operation::AbortRebase
         );
         let retry_modal = if matches!(operation, Operation::Amend { .. }) {
             self.modal.clone()
@@ -957,6 +980,18 @@ impl Render for GitBuddy {
             }))
             .on_action(cx.listener(|this, _: &OpenFileTools, w, cx| this.open_file_tools(w, cx)))
             .on_action(cx.listener(|this, _: &OpenConflicts, _, cx| this.open_conflicts(None, cx)))
+            .on_action(cx.listener(|this, _: &OpenRebase, w, cx| {
+                this.open_management(Modal::RebaseSetup, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenWorktrees, w, cx| {
+                this.open_management(Modal::Worktrees, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenSubmodules, w, cx| {
+                this.open_management(Modal::Submodules, w, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &OpenLfs, w, cx| this.open_management(Modal::Lfs, w, cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &CompareRevisions, w, cx| {
                     this.open_compare(None, None, w, cx)

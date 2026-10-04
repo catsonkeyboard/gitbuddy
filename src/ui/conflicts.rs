@@ -256,7 +256,7 @@ impl GitBuddy {
                 .when(operation.can_continue(), |row| row.child(self.button("continue-conflict",format!("Continue {}…", operation.label())).primary().disabled(self.busy() || count != 0 || self.active.conflicts.loading)
                     .on_click(cx.listener(|this,_,w,cx| { if let Some(session)=this.active.conflicts.session.clone() {this.show_modal(Modal::Confirm(format!("Complete {} using all staged changes?\n\n{}",session.operation.label(),session.message.trim()),Operation::ContinueConflict(session)),w,cx);} }))))
                 .when(operation.can_continue(), |row| row.child(self.button("abort-conflict","Abort…").disabled(self.busy()).on_click(cx.listener(|this,_,w,cx| {
-                    let op = match this.active.conflicts.session.as_ref().map(|s|s.operation) { Some(git::ConflictOperation::CherryPick)=>Operation::AbortCherryPick,Some(git::ConflictOperation::Revert)=>Operation::AbortRevert,_=>Operation::AbortMerge };
+                    let op = match this.active.conflicts.session.as_ref().map(|s|s.operation) { Some(git::ConflictOperation::Rebase)=>Operation::AbortRebase,Some(git::ConflictOperation::CherryPick)=>Operation::AbortCherryPick,Some(git::ConflictOperation::Revert)=>Operation::AbortRevert,_=>Operation::AbortMerge };
                     this.show_modal(Modal::Confirm("Abort this operation and reset tracked files to HEAD? Saved resolutions and other tracked edits made during the operation will be discarded.".into(),op),w,cx);
                 })))))
             .when_some(self.active.conflicts.error.clone(), |col,error| col.child(div().px_3().py_2().text_xs().text_color(rgb(0xe9a3a9)).child(error)))

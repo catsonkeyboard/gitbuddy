@@ -13,6 +13,22 @@ impl GitBuddy {
             return;
         };
         match modal {
+            Modal::RebaseSetup => self.preview_rebase(a, cx),
+            Modal::WorktreeCreate => self.perform(
+                Operation::CreateWorktree {
+                    name: a,
+                    path: expand_path(&b),
+                },
+                cx,
+            ),
+            Modal::SubmoduleAdd => self.perform(
+                Operation::AddSubmodule {
+                    url: a,
+                    path: b.into(),
+                },
+                cx,
+            ),
+            Modal::LfsPattern(track) => self.perform(Operation::LfsTrack { pattern: a, track }, cx),
             Modal::Open | Modal::Init | Modal::Clone => {
                 if a.is_empty() || (matches!(modal, Modal::Clone) && b.is_empty()) {
                     self.modal_error = Some("请填写完整的仓库地址 / 路径".into());
@@ -45,6 +61,16 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(
+            modal,
+            Modal::RebasePlan
+                | Modal::Worktrees
+                | Modal::Submodules
+                | Modal::Lfs
+                | Modal::RebaseMessage(_)
+        ) {
+            return self.management_modal(modal, cx);
+        }
         let preparation = matches!(modal, Modal::Open | Modal::Init | Modal::Clone);
         if matches!(modal, Modal::FileTools) {
             return self.file_tools_modal(cx);
@@ -53,6 +79,39 @@ impl GitBuddy {
             return self.history_modal(kind, cx);
         }
         let (title, label_a, label_b, submit) = match &modal {
+            Modal::RebaseSetup => (
+                "Interactive rebase",
+                "Upstream / new base: branch, tag or commit",
+                None,
+                "Build plan",
+            ),
+            Modal::WorktreeCreate => (
+                "Create worktree",
+                "New branch / worktree name",
+                Some("Absolute destination directory"),
+                "Create",
+            ),
+            Modal::SubmoduleAdd => (
+                "Add submodule",
+                "Repository URL",
+                Some("Relative destination path"),
+                "Add",
+            ),
+            Modal::LfsPattern(track) => (
+                if *track {
+                    "Track with LFS"
+                } else {
+                    "Untrack LFS pattern"
+                },
+                "Pattern, e.g. *.psd (changes .gitattributes)",
+                None,
+                "Apply",
+            ),
+            Modal::RebasePlan
+            | Modal::Worktrees
+            | Modal::Submodules
+            | Modal::Lfs
+            | Modal::RebaseMessage(_) => unreachable!(),
             Modal::Open => ("Open repository", "Local repository path", None, "Open"),
             Modal::Init => (
                 "Initialize repository",
@@ -156,6 +215,9 @@ impl GitBuddy {
                     .disabled(false)
                     .on_click(cx.listener(|this, _, _, cx| this.browse(cx))),
             );
+        }
+        if matches!(modal, Modal::RebaseSetup) {
+            card=card.child(div().text_xs().text_color(rgb(MUTED)).child("The chosen upstream becomes the new base. To edit / squash the last N commits on this branch, use HEAD~N. Start with a clean working tree; merge commits in the range are rejected."));
         }
         if let Some(error) = &self.modal_error {
             card = card.child(

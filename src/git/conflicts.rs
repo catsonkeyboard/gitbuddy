@@ -19,6 +19,7 @@ pub enum ConflictOperation {
     Merge,
     CherryPick,
     Revert,
+    Rebase,
     Other,
 }
 impl ConflictOperation {
@@ -28,11 +29,15 @@ impl ConflictOperation {
             Self::Merge => "Merge",
             Self::CherryPick => "Cherry-pick",
             Self::Revert => "Revert",
+            Self::Rebase => "Rebase",
             Self::Other => "Repository operation",
         }
     }
     pub fn can_continue(self) -> bool {
-        matches!(self, Self::Merge | Self::CherryPick | Self::Revert)
+        matches!(
+            self,
+            Self::Merge | Self::CherryPick | Self::Revert | Self::Rebase
+        )
     }
 }
 pub(super) fn operation(state: RepositoryState) -> ConflictOperation {
@@ -126,14 +131,20 @@ pub fn has_conflict_markers(text: &str) -> bool {
     })
 }
 fn token(repo: &git2::Repository) -> Result<Token> {
-    let markers = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_MSG"]
-        .iter()
-        .map(|name| match fs::read(repo.path().join(name)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let markers = [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "MERGE_MSG",
+        "gitbuddy-rebase.json",
+    ]
+    .iter()
+    .map(|name| match fs::read(repo.path().join(name)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    })
+    .collect::<Result<Vec<_>>>()?;
     Ok(Token {
         head: head_state(repo)?,
         state: repo.state(),
@@ -324,7 +335,11 @@ impl Repository {
         let mut index = repo.index()?;
         index.read(true)?;
         let token = token(&repo)?;
-        let operation = operation(token.state);
+        let operation = if super::rebase::active(&repo) {
+            ConflictOperation::Rebase
+        } else {
+            operation(token.state)
+        };
         let message = token.markers[3]
             .as_ref()
             .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -557,6 +572,13 @@ impl Repository {
     }
     pub(super) fn continue_conflict(&self, session: &ConflictSession) -> Result<String> {
         let repo = raw(self)?;
+        if session.operation == ConflictOperation::Rebase {
+            ensure!(
+                token(&repo)? == session.token && index_bytes(&repo.index()?)? == session.index,
+                "Rebase or staged content changed; refresh before continuing"
+            );
+            return self.continue_rebase();
+        }
         ensure!(
             session.operation.can_continue(),
             "This operation must be continued with an external tool."

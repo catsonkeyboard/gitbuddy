@@ -88,6 +88,14 @@ impl Repository {
         }
         let repo = raw(self)?;
         let index = repo.index()?;
+        if super::lfs::tracked(&repo, &file.path)? {
+            return Ok(FilePatch {
+                unavailable: Some("LFS files must be staged or unstaged as a whole file.".into()),
+                ..FilePatch::read_only(
+                    "LFS content is stored separately; use the file's Stage / Unstage action.",
+                )
+            });
+        }
         let version = entry_version(index.get_path(&file.path, 0));
         let readonly = |reason: &str| -> Result<FilePatch> {
             let mut patch = FilePatch::read_only(&self.diff(file, staged)?);

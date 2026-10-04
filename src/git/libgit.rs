@@ -3,8 +3,8 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{Local, TimeZone, Utc};
 use git2::{
     BranchType, Cred, CredentialType, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode,
-    FetchOptions, IndexAddOption, Oid, Patch, PushOptions, RemoteCallbacks, Repository as RawRepo,
-    RepositoryState, ResetType, Sort, StashFlags, Status, StatusOptions,
+    FetchOptions, Oid, Patch, PushOptions, RemoteCallbacks, Repository as RawRepo, RepositoryState,
+    ResetType, Sort, StashFlags, Status, StatusOptions,
     build::{CheckoutBuilder, RepoBuilder},
 };
 use std::{
@@ -135,14 +135,14 @@ pub(super) fn diff_for(repo: &RawRepo, staged: bool) -> Result<Diff<'_>> {
     }
 }
 
-fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
+pub(super) fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .renames_head_to_index(true)
         .renames_index_to_workdir(true);
     let statuses = repo.statuses(Some(&mut opts))?;
-    Ok(statuses
+    let mut files: Vec<_> = statuses
         .iter()
         .map(|entry| {
             let (index, worktree) = status_chars(entry.status());
@@ -167,7 +167,17 @@ fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
                 worktree,
             }
         })
-        .collect())
+        .collect();
+    for file in &mut files {
+        if file.worktree == 'M'
+            && super::lfs::tracked(repo, &file.path)?
+            && super::lfs::matches_index(repo, &file.path)?
+        {
+            file.worktree = ' ';
+        }
+    }
+    files.retain(|f| f.index != ' ' || f.worktree != ' ');
+    Ok(files)
 }
 
 fn refs_by_oid(repo: &RawRepo) -> Result<HashMap<Oid, Vec<String>>> {
@@ -177,7 +187,7 @@ fn refs_by_oid(repo: &RawRepo) -> Result<HashMap<Oid, Vec<String>>> {
         let Ok(name) = reference.name() else {
             continue;
         };
-        if name.ends_with("/HEAD") {
+        if name.ends_with("/HEAD") || name.starts_with("refs/gitbuddy/") {
             continue;
         }
         let Ok(commit) = reference.peel_to_commit() else {
@@ -277,7 +287,7 @@ fn hash_worktree_metadata(path: &Path, hasher: &mut impl Hasher) -> Result<()> {
 /// SSH agent / credential helper auth, plus optional transfer progress for
 /// the status bar. Progress messages are rate-limited to one per 100ms so a
 /// fast transfer cannot flood the UI thread.
-fn network_callbacks<'a>(control: NetworkControl) -> RemoteCallbacks<'a> {
+pub(super) fn network_callbacks<'a>(control: NetworkControl) -> RemoteCallbacks<'a> {
     let mut callbacks = RemoteCallbacks::new();
     let sideband = control.clone();
     callbacks.sideband_progress(move |data| {
@@ -572,7 +582,11 @@ impl Repository {
             .collect();
         let merging = repo.state() == RepositoryState::Merge;
         Ok(Snapshot {
-            conflict_operation: super::conflicts::operation(repo.state()),
+            conflict_operation: if super::rebase::active(&repo) {
+                ConflictOperation::Rebase
+            } else {
+                super::conflicts::operation(repo.state())
+            },
             fingerprint,
             head_id,
             branch,
@@ -722,12 +736,72 @@ impl Repository {
         operation: Operation,
         control: NetworkControl,
     ) -> Result<String> {
+        let checkout = matches!(
+            &operation,
+            Operation::Checkout(_)
+                | Operation::TrackBranch(_)
+                | Operation::CreateBranch(_)
+                | Operation::Merge(_)
+                | Operation::Pull
+                | Operation::Revert(_)
+                | Operation::CherryPick(_)
+                | Operation::AbortMerge
+                | Operation::AbortRevert
+                | Operation::AbortCherryPick
+                | Operation::Stash(_)
+                | Operation::ApplyStash(_)
+                | Operation::Rebase { .. }
+                | Operation::ContinueRebase
+                | Operation::AbortRebase
+                | Operation::Discard(_)
+                | Operation::ContinueConflict(_)
+        );
+        let initial = raw(self)?;
+        if super::rebase::active(&initial) {
+            ensure!(
+                matches!(
+                    &operation,
+                    Operation::ContinueRebase
+                        | Operation::AbortRebase
+                        | Operation::Stage(_)
+                        | Operation::Unstage(_)
+                        | Operation::StageAll
+                        | Operation::UnstageAll
+                        | Operation::Discard(_)
+                        | Operation::ResolveConflict { .. }
+                        | Operation::ContinueConflict(_)
+                ),
+                "A GitBuddy rebase is in progress; resolve, continue or abort it first"
+            );
+        }
+        if checkout && let Err(error) = super::lfs::dehydrate(&initial) {
+            let _ = super::lfs::hydrate(&initial);
+            return Err(error);
+        }
         let result = (|| {
             if operation.is_network() {
                 control.check()?;
             }
             let mut repo = raw(self)?;
             match operation {
+                Operation::Rebase { context, steps } => self.start_rebase(&context, steps),
+                Operation::ContinueRebase => self.continue_rebase(),
+                Operation::AbortRebase => self.abort_rebase(),
+                Operation::CreateWorktree { name, path } => self.create_worktree(&name, &path),
+                Operation::LockWorktree { name, locked } => self.lock_worktree(&name, locked),
+                Operation::RemoveWorktree(expected) => self.remove_worktree(&expected),
+                Operation::AddSubmodule { url, path } => {
+                    self.add_submodule(&url, &path, control.clone())
+                }
+                Operation::UpdateSubmodules { names, recursive } => {
+                    self.update_submodules(&names, recursive, control.clone())
+                }
+                Operation::SyncSubmodules => self.sync_submodules(),
+                Operation::StageSubmodule(name) => self.stage_submodule(&name),
+                Operation::LfsTrack { pattern, track } => self.lfs_track(&pattern, track),
+                Operation::LfsCheckout => self.lfs_checkout(),
+                Operation::LfsFetch(remote) => self.lfs_transfer(false, &remote, control.clone()),
+                Operation::LfsPush(remote) => self.lfs_transfer(true, &remote, control.clone()),
                 Operation::Amend { context, message } => self.amend(&context, &message),
                 Operation::UndoLast(expected) => self.undo_last(&expected),
                 Operation::RestoreReflog { expected, target } => {
@@ -746,19 +820,22 @@ impl Repository {
                     ensure!(!paths.is_empty(), "没有选择文件");
                     let mut index = repo.index()?;
                     for path in paths {
-                        if self.root.join(&path).exists() {
-                            index.add_path(&path)?;
-                        } else {
-                            index.remove_path(&path)?;
-                        }
+                        super::lfs::stage(&repo, &mut index, &path)?;
                     }
                     index.write()?;
                     Ok("Files staged".into())
                 }
                 Operation::StageAll => {
                     let mut index = repo.index()?;
-                    index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
-                    index.update_all(["*"], None)?;
+                    ensure!(!index.has_conflicts(), "Resolve conflicts first");
+                    for file in file_changes(&repo)? {
+                        if let Some(original) = &file.original
+                            && index.get_path(original, 0).is_some()
+                        {
+                            index.remove_path(original)?;
+                        }
+                        super::lfs::stage(&repo, &mut index, &file.path)?;
+                    }
                     index.write()?;
                     Ok("All changes staged".into())
                 }
@@ -816,6 +893,7 @@ impl Repository {
                     validate_branch(&name)?;
                     let mut branch = repo.find_branch(&name, BranchType::Local)?;
                     ensure!(!branch.is_head(), "不能删除当前分支");
+                    super::workspaces::branch_available(&repo, &format!("refs/heads/{name}"))?;
                     let head = repo.head()?.target().context("HEAD 不存在")?;
                     let branch_id = branch.get().target().context("分支引用无效")?;
                     ensure!(
@@ -942,6 +1020,7 @@ impl Repository {
                         "上游目标不是有效的分支引用"
                     );
                     let mut remote = repo.find_remote(&remote_name)?;
+                    super::lfs::upload_before_push(&repo, &remote_name, &source, &control)?;
                     let mut callbacks = network_callbacks(control.clone());
                     let push_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
                     let error_slot = push_error.clone();
@@ -966,6 +1045,12 @@ impl Repository {
                     Ok("Push completed".into())
                 }
                 Operation::Stash(message) => {
+                    for file in file_changes(&repo)? {
+                        ensure!(
+                            !file.unstaged() || !super::lfs::tracked(&repo, &file.path)?,
+                            "Stage modified LFS files before stashing; unstaged LFS content cannot be captured by libgit2's stash filter"
+                        );
+                    }
                     let signature = author(&repo)?;
                     let name = if message.trim().is_empty() {
                         "GitBuddy stash"
@@ -1004,6 +1089,20 @@ impl Repository {
                 }
             }
         })();
+        let result = if checkout {
+            match super::lfs::hydrate(&raw(self)?) {
+                Ok(missing) => result.map(|text| {
+                    if missing > 0 {
+                        format!("{text}; {missing} LFS objects missing locally (use LFS Fetch)")
+                    } else {
+                        text
+                    }
+                }),
+                Err(error) => result.and_then(|_| Err(error)),
+            }
+        } else {
+            result
+        };
         control.normalize(result)
     }
 }
@@ -1018,7 +1117,7 @@ fn validate_branch(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn path_bytes(path: &Path) -> Vec<u8> {
+pub(super) fn path_bytes(path: &Path) -> Vec<u8> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -1105,6 +1204,7 @@ fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Res
 }
 
 fn checkout_branch(repo: &RawRepo, name: &str, kind: BranchType) -> Result<()> {
+    super::workspaces::branch_available(repo, &format!("refs/heads/{name}"))?;
     let branch = repo.find_branch(name, kind)?;
     let commit = branch.get().peel_to_commit()?;
     let mut checkout = CheckoutBuilder::new();

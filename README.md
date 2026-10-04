@@ -4,7 +4,7 @@
 
 ## 运行
 
-构建需要 Rust 1.95+。macOS 需要 Xcode Command Line Tools 和支持 Metal 的设备。应用运行时通过 `git2` / `libgit2` 访问仓库，不需要系统 `git` 可执行文件。本项目使用 `gpui-kit = 0.6.6`，并提交 Cargo.lock 固定依赖。集成测试和演示仓库生成器使用系统 Git 准备测试数据。
+构建需要 Rust 1.95+。macOS 需要 Xcode Command Line Tools 和支持 Metal 的设备。普通 Git 操作通过 `git2` / `libgit2` 完成，不依赖系统 `git` 可执行文件；LFS 远程传输单独依赖官方 `git-lfs` 及其 Git 运行环境，通过进程参数直接调用，不经过 Bash。本项目使用 `gpui-kit = 0.6.6`，并提交 Cargo.lock 固定依赖。部分集成测试和演示仓库生成器使用系统 Git 准备测试数据。
 
 ```sh
 cargo run --locked
@@ -23,6 +23,10 @@ cargo run --locked -- ./target/demo-repo
 cargo run --locked --example demo_conflicts
 cargo run --locked -- ./target/demo-conflicts
 
+# 创建包含可 Squash 提交、Worktree、子模块和 LFS 对象的演示仓库
+cargo run --locked --example demo_advanced
+cargo run --locked -- ./target/advanced-ui-20261004/project
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -34,13 +38,17 @@ open dist/GitBuddy.app
 | --- | --- |
 | 仓库 | 打开、初始化、克隆、多仓库标签、完整会话恢复、按仓库独立后台任务、最近仓库、每 10 秒刷新、手动刷新 |
 | 工作区 | 已暂存 / 未暂存状态、按文件 / hunk / 选中行暂存与取消暂存、全部暂存 / 取消暂存、重命名、删除、冲突识别 |
-| 冲突处理 | 按文件查看 Ours / Base / Theirs、编辑合并结果、选择完整版本或删除、保存并标记解决、继续 / 中止 merge、cherry-pick、revert |
+| 冲突处理 | 按文件查看 Ours / Base / Theirs、编辑合并结果、选择完整版本或删除、保存并标记解决、继续 / 中止 merge、cherry-pick、revert 和 GitBuddy Rebase |
 | 差异 | 工作区、暂存区、历史提交按文件折叠；点击文件才加载该文件的统一 diff；红绿增删行、双侧行号、虚拟滚动；二进制和大文件提示 |
 | 提交 | 多行提交说明、提交已暂存文件、Amend、撤销最近一次提交、复制提交 ID、revert、cherry-pick 及继续 / 中止 |
 | 历史 | 所有分支的提交、作者、相对时间、哈希、引用标记；按父提交绘制分支与合并线；在已加载历史中搜索；分页加载 |
 | 文件追踪 | 指定版本的文件列表、跟随重命名的文件历史、按提交展开文件 diff、逐行 Blame 与提交详情跳转 |
 | 比较 | 两个提交 / 分支 / 标签的文件树比较、增删统计、按文件折叠、反向比较、设置比较基准 |
 | 恢复 | HEAD Reflog 分页查看、选择操作前 / 后的提交、创建恢复分支、恢复当前分支位置 |
+| Rebase / Squash | 编辑线性提交计划、调整顺序、Pick / Reword / Squash / Fixup / Drop、批量 Squash、冲突继续 / 中止、持久化进度和原历史备份 |
+| Worktree | 列出关联工作树、新建分支及工作树、独立标签打开、锁定 / 解锁、移除干净工作树、清理失效登记 |
+| 子模块 | 添加、初始化 / 更新、递归更新、同步 URL、暂存当前 gitlink、独立标签打开、脏工作区保护及网络取消 |
+| Git LFS | Track / Untrack、原生 SHA-256 对象缓存及指针暂存、本地对象展开、缺失对象提示、按 remote Fetch / Push、普通 Push 前上传 LFS 对象 |
 | 分支 | 创建并切换、本地切换、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
 | 远程 | 添加 remote、fetch/prune、pull --ff-only、按配置的上游分支 push（支持不同名分支）、首次推送到 origin 并设置 upstream、传输进度及取消、领先 / 落后计数 |
 | Stash | 保存（包含未跟踪文件）、应用并保留、确认后删除 |
@@ -77,7 +85,7 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 全部解决后可先 **Review working tree** 查看暂存内容，再 **Continue Merge / Cherry-pick / Revert…**。继续操作使用全部已暂存内容和操作原有提交说明，merge 保留两个父提交，cherry-pick 保留原作者；确认后再次校验暂存区和 HEAD。**Abort…** 会恢复 tracked 文件到 HEAD，丢弃操作期间保存的解决结果及其他 tracked 编辑。
 
-内置结果编辑仅支持不超过 2 MB 的 UTF-8 常规文本，三方预览最多显示 20,000 行。二进制、非 UTF-8 和大文件可选择完整版本或使用外部编辑后的工作文件，按原始字节保存。重命名、符号链接和子模块冲突需使用外部工具；rebase 等其他操作可查看 / 解决支持的索引冲突，继续 / 中止需使用外部工具。暂不提供按冲突块自动合并或同步三方滚动。
+内置结果编辑仅支持不超过 2 MB 的 UTF-8 常规文本，三方预览最多显示 20,000 行。二进制、非 UTF-8 和大文件可选择完整版本或使用外部编辑后的工作文件，按原始字节保存。重命名、符号链接和子模块冲突需使用外部工具。GitBuddy 发起的 Rebase 可在内置界面继续 / 中止；外部工具发起的 Rebase 仍需由原工具继续 / 中止。暂不提供按冲突块自动合并或同步三方滚动。
 
 ### 文件历史、Blame 与版本比较
 
@@ -95,9 +103,31 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 改写前会再次校验 HEAD；Amend 还校验暂存快照，打开对话框后发生变化则拒绝执行。未完成的合并、rebase、cherry-pick、revert 或索引冲突会阻止改写历史，但仍可从 Reflog 创建独立恢复分支。历史改写会保留 HEAD Reflog 记录，不自动推送；已被 Git 清理的提交对象无法恢复。
 
+### 交互式 Rebase 与 Squash
+
+打开 **Repository → Interactive rebase / Squash…**，输入基准版本（例如 `HEAD~3` 编辑最近三次提交，或输入上游分支将当前分支的独有提交重放到该版本）。计划从旧到新列出提交，可调整顺序、编辑说明，并选择 **Pick / Reword / Squash / Fixup / Drop**。**Squash all into one** 将第一条保留，其余合并；Squash 拼接说明，Fixup 保留前一组的说明。第一条保留的提交不能选 Squash / Fixup。开始前要求工作区及暂存区干净，再次校验分支、HEAD 和计划。
+
+发生冲突时转到工作区，进入已有冲突处理页；解决并暂存所有文件后，选择 **Continue rebase…**。也可再次打开管理页查看进度并继续或中止。进度保存在该工作树的 Git 管理目录，重启后可继续；原分支直到计划完成才更新，原历史保留在 `refs/gitbuddy/rewrites/` 和 Reflog 中。中止恢复原分支及 tracked 文件，保留未跟踪文件。未提交的计划编辑属于临时对话框内容，不随会话保存。
+
+这是 GitBuddy 通过 libgit2 实现的提交序列，必须使用 GitBuddy 继续 / 中止，不能用外部 `git rebase --continue` 接管。当前最多 2,000 条，只支持本地分支、有共同祖先、无合并提交的线性区间；不自动 force push，也不自动签名。
+
+### Worktree 与子模块
+
+**Repository → Worktrees…** 列出关联工作树（主工作区不在列表中），可创建、打开为独立标签、锁定 / 解锁或移除。创建时从当前 HEAD 新建简单名称的分支，目标使用尚不存在的绝对路径；暂不支持复用已有分支。移除前再次确认名称、路径、HEAD、锁定状态和干净状态，拒绝移除当前工作树，移除后保留分支。目录已缺失时可清理登记。切换、删除和改写分支时检查其他工作树是否占用该分支。
+
+**Repository → Submodules…** 支持添加 URL 与相对路径、初始化 / 更新、递归更新、同步 `.gitmodules` URL、暂存当前子仓库提交，以及打开为独立标签。更新到父仓库暂存区记录的 gitlink，不自动追踪远程最新分支；拒绝覆盖子仓库的未提交编辑。新增子模块要求父工作区干净，成功后 `.gitmodules` 与 gitlink 进入暂存区；克隆失败可能保留登记，可通过更新重试。递归更新最多 32 层，网络阶段支持取消，已完成的子模块不会回滚。
+
+### Git LFS
+
+**Repository → Git LFS…** 查看根 `.gitattributes` 中的 LFS 规则、暂存区指针及缓存状态。**Track pattern… / Untrack pattern…** 修改本客户端生成的规则，例如 `*.bin`，修改仍需暂存及提交；不会迁移既有历史。由于当前 libgit2 对属性模式的支持限制，规则不接受空白、引号或反斜杠；可以用 `*.bin` 匹配含空格的文件名。已有带引号的 LFS 规则会明确拒绝暂存，需先改为无引号的 glob。
+
+整文件暂存原生计算 SHA-256、缓存对象并写入标准 LFS 指针，Git 提交不会包含大文件正文。LFS 不支持 hunk / 行暂存；Stash 前需先暂存新增 / 已修改的 LFS 文件。切换版本、丢弃、Rebase 和 Stash 恢复会展开本地对象，写入前校验哈希及大小；缺失对象时保留指针，不覆盖用户编辑，可随后下载对象。使用默认共享 LFS 对象目录，不支持自定义 `lfs.storage` 或扩展指针。
+
+本地 Track、暂存和 **Checkout local objects** 不需要 `git-lfs`。远程 Fetch / Push 需要安装官方 `git-lfs` 及其 Git 运行环境；选择 remote 后下载 / 上传 HEAD 所需的 LFS 对象，Fetch 成功后展开本地文件。普通 Push 先上传待推送历史涉及的 LFS 对象，上传失败则不更新远程 Git 引用。普通 Clone / Fetch 不自动下载 LFS 对象。LFS 传输提供取消，停止进程及其 Unix 子进程组，但已上传 / 下载的对象不会回滚。
+
 ### 通用约定
 
-- 仓库操作由 Rust `git2` 在后台调用 `libgit2` 完成，应用运行时不会启动 Bash 或系统 `git`。单文件操作按字面路径匹配，支持空格、换行、通配字符及 Unix 非 UTF-8 文件名。
+- 普通仓库操作由 Rust `git2` 在后台调用 `libgit2` 完成；LFS 远程传输直接启动官方 `git-lfs`（它自身依赖 Git），不经过 Bash。单文件操作按字面路径匹配，支持空格、换行、通配字符及 Unix 非 UTF-8 文件名；LFS 路径与规则的限制见上文。
 - 丢弃操作只恢复工作区到暂存区版本，不清除已暂存内容；不提供批量删除未跟踪文件的快捷操作。
 - 删除 stash、丢弃修改、合并、revert 等操作需要在应用内确认。删除分支前检查分支是否已合入当前 HEAD，推送不使用 force。
 - 远程操作通过 `libgit2` 使用 SSH agent / Git credential helper。GUI 不提供终端密码输入，首次 SSH 信任及凭据准备应先完成；错误可在状态栏复制。
@@ -125,7 +155,7 @@ cargo test --locked
 
 ## 当前边界
 
-这是可运行的首版客户端，尚未实现交互式 rebase、Git LFS / 子模块专用管理。提交图依据已加载提交的父子关系绘制；搜索过滤或分页边界外的提交不会显示连线。`libgit2` 创建提交时不会执行用户的 Git hooks 或自动进行 GPG 签名。
+Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根提交重写或保留合并提交。LFS 当前支持默认对象目录和标准 SHA-256 指针，不支持扩展指针、自定义 `lfs.storage` 或历史迁移。提交图依据已加载提交的父子关系绘制；搜索过滤或分页边界外的提交不会显示连线，内部历史备份引用不作为普通分支显示。`libgit2` 创建提交时不会执行用户的 Git hooks 或自动进行 GPG 签名。
 
 差异预览最多 20,000 行，未跟踪文件超过 2 MB 不加载正文。网络传输进度每 100ms 节流，阶段切换即时显示；取消边界见上文。真实外部服务器认证尚未验收。当前在 macOS 验证，Windows/Linux 尚未验收。生成的 .app 用于本地运行，未做发行签名或公证。
 
@@ -138,6 +168,9 @@ cargo test --locked
 - `src/git/recovery.rs`：Amend、保留暂存区的提交撤销、HEAD Reflog 与恢复；使用引用锁和快照校验防止操作落到已切换的分支。
 - `src/git/inspect.rs`：固定版本的文件浏览、跨父提交跟随重命名的历史、Blame、两棵树比较与精确文件 patch。
 - `src/git/conflicts.rs`：索引三方内容、结果保存、引用 / 索引锁和过期校验、继续冲突操作。
+- `src/git/rebase.rs`：基于 libgit2 的可编辑提交序列、引用事务、持久化进度、冲突继续与中止。
+- `src/git/workspaces.rs`：Worktree 与子模块管理、跨工作树分支占用检查。
+- `src/git/lfs.rs`：原生指针暂存 / 本地展开、对象校验，以及可取消的官方 git-lfs 传输进程。
 - `src/ui.rs`：状态机核心——多仓库标签（`tabs` + `active` 两段式）与异步代际控制。
 - `src/ui/tasks.rs`：按稳定仓库标签 ID 分发后台任务、结果与进度归属、取消和失败后重试。
 - `src/ui/graph.rs`：提交分支及合并线布局。
@@ -146,6 +179,7 @@ cargo test --locked
 - `src/ui/recovery.rs`：异步加载历史操作对话框、独立 Amend 编辑器与 Reflog 恢复列表。
 - `src/ui/inspect.rs`：文件选择器、文件历史、Blame 虚拟列表和版本比较页面，后台加载及过期结果隔离。
 - `src/ui/conflicts.rs`：三方预览、独立文件草稿、结果编辑、删除确认与继续 / 中止入口。
+- `src/ui/management.rs`：Rebase 计划编辑与进度、Worktree / 子模块 / LFS 管理对话框。
 - `src/settings.rs`：最近仓库记录（损坏时备份为 `.json.broken` 并重建）。
 - `src/session.rs`：带版本的会话格式、路径编码、原子保存与旧快照保护。
 - `src/ui/session.rs`：按仓库捕获 / 恢复界面状态、独立滚动句柄及退出保存。
@@ -154,10 +188,12 @@ cargo test --locked
 - `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。
 - `tests/repository_inspection.rs`：文件历史 / Blame / 比较的隔离仓库测试，包含合并、重命名后旧名复用、删除后重建、特殊路径和版本固定。
 - `tests/conflict_resolution.rs`：三方版本、删除 / 二进制 / 可执行文件、过期请求、索引锁、多文件独立解决和继续操作的 libgit2 隔离仓库测试。
+- `tests/advanced_git.rs`：提交重写、跨工作树保护、子模块及 LFS 指针 / 缓存 / Stash 的隔离仓库回归测试。
 - `examples/demo_repo.rs`：可重复生成的隔离演示仓库。
 - `examples/demo_conflicts.rs`：包含文本、二进制、修改 / 删除冲突的隔离演示仓库。
+- `examples/demo_advanced.rs`：包含 Rebase / Squash、Worktree、子模块与 LFS 对象的隔离演示仓库。
 
 ## 性能设计
 
-- 每 10 秒的自动刷新先计算指纹（HEAD、引用、状态列表、暂存区 blob ID 与模式、变更文件的大小及修改时间；Unix 另含 ctime / inode），与上次快照一致则跳过全量重建。已修改文件再次编辑或暂存区内容更新也会触发刷新，无需每次遍历提交历史或读取所有工作区文件正文。
+- 每 10 秒的自动刷新先计算指纹（HEAD、引用、状态列表、暂存区 blob ID 与模式、变更文件的大小及修改时间；Unix 另含 ctime / inode），与上次快照一致则跳过全量重建。已修改文件再次编辑或暂存区内容更新也会触发刷新，无需每次遍历提交历史；已展开的 LFS 文件可能需要流式计算 SHA-256 以判断是否修改，不把大文件正文一次性加载到内存。
 - 切换仓库标签是对 `RepoTab` 结构体的整体交换（`mem::take`），不再逐字段拷贝 15 个状态。

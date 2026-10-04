@@ -104,6 +104,31 @@ impl GitBuddy {
                             )
                             .separator()
                             .menu_with_icon_and_disabled(
+                                "Interactive rebase / Squash…",
+                                IconName::RotateCw,
+                                Box::new(OpenRebase),
+                                busy || !has_head,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Worktrees…",
+                                IconName::FolderOpen,
+                                Box::new(OpenWorktrees),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Submodules…",
+                                IconName::Network,
+                                Box::new(OpenSubmodules),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Git LFS…",
+                                IconName::FileText,
+                                Box::new(OpenLfs),
+                                busy || !has_repo,
+                            )
+                            .separator()
+                            .menu_with_icon_and_disabled(
                                 "Commit identity…",
                                 IconName::User,
                                 Box::new(EditIdentity),

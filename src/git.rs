@@ -79,6 +79,38 @@ pub struct Snapshot {
 }
 #[derive(Clone, Debug)]
 pub enum Operation {
+    Rebase {
+        context: std::sync::Arc<RebasePreview>,
+        steps: Vec<RebaseStep>,
+    },
+    ContinueRebase,
+    AbortRebase,
+    CreateWorktree {
+        name: String,
+        path: PathBuf,
+    },
+    LockWorktree {
+        name: String,
+        locked: bool,
+    },
+    RemoveWorktree(WorktreeInfo),
+    AddSubmodule {
+        url: String,
+        path: PathBuf,
+    },
+    UpdateSubmodules {
+        names: Vec<String>,
+        recursive: bool,
+    },
+    SyncSubmodules,
+    StageSubmodule(String),
+    LfsTrack {
+        pattern: String,
+        track: bool,
+    },
+    LfsCheckout,
+    LfsFetch(String),
+    LfsPush(String),
     Stage(Vec<PathBuf>),
     Unstage(Vec<PathBuf>),
     ApplyPartial {
@@ -194,15 +226,41 @@ pub type ProgressSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(&str) + Send>>
 mod network;
 pub use network::{CancellationToken, Cancelled, NetworkControl, is_cancelled};
 
+#[path = "git/rebase.rs"]
+mod rebase;
+pub use rebase::{RebaseAction, RebasePreview, RebaseStatus, RebaseStep};
+#[path = "git/workspaces.rs"]
+mod workspaces;
+pub use workspaces::{SubmoduleInfo, WorktreeInfo};
+#[path = "git/lfs.rs"]
+mod lfs;
+pub use lfs::{LfsFile, LfsStatus};
+
 impl Operation {
     pub fn is_network(&self) -> bool {
-        matches!(self, Self::Fetch | Self::Pull | Self::Push)
+        matches!(
+            self,
+            Self::Fetch
+                | Self::Pull
+                | Self::Push
+                | Self::AddSubmodule { .. }
+                | Self::UpdateSubmodules { .. }
+                | Self::LfsFetch(_)
+                | Self::LfsPush(_)
+        )
     }
     pub fn label(&self) -> &'static str {
         match self {
             Self::Fetch => "Fetch",
             Self::Pull => "Pull",
             Self::Push => "Push",
+            Self::Rebase { .. } => "Rebase",
+            Self::ContinueRebase => "Continue rebase",
+            Self::AbortRebase => "Abort rebase",
+            Self::CreateWorktree { .. } => "Create worktree",
+            Self::AddSubmodule { .. } | Self::UpdateSubmodules { .. } => "Update submodules",
+            Self::LfsFetch(_) => "LFS fetch",
+            Self::LfsPush(_) => "LFS push",
             _ => "Git operation",
         }
     }
