@@ -2,6 +2,16 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-05 历史操作、多选、旧提交编辑与拆分
+
+- 新增任意提交创建分支（不切换 checkout）、固定提交与 HEAD / 指纹校验的 Soft / Mixed / Hard Reset。按已选模式明确展示 index / worktree 影响，再确认；原提交留在 `refs/gitbuddy/rewrites/reset-*`、ORIG_HEAD 与 Reflog，未提交的编辑不进入备份。Reset 期间持有 HEAD / 分支引用锁，拒绝跨仓库、过期 HEAD / 内容以及进行中的仓库操作。
+- 多选支持 Shift 可见范围、⌘ / Ctrl 点选及行尾勾选；提供 IDs 复制、两个选中提交比较、Squash / Drop / Edit / Split 改写计划。选择和锚点按标签保存，旧会话字段使用默认值；未加载的选择不会被静默丢弃或作为部分批量操作执行。Squash 校验当前分支中真实相邻关系，不依赖画面中的索引或 OID 字典排序。
+- Rebase 新增 Edit / Split 暂停点；Edit 保留暂存改动，Split 重置 index 到当前重放父提交并保留文件。使用工作区已有按文件 / hunk / 行暂存生成替代提交，保留原作者；全部剩余内容提交后 Continue，未选中后续提交继续 Pick。专用 CommitRebase 维护进度、提交准备日志和引用锁，普通 Commit 不接管 sequencer。状态文件纳入刷新指纹，ApplyPartial 可在暂停期使用；按钮与快捷键使用同一暂停资格检查。
+- 新增 `tests/history_operations.rs` 中 **14 项**隔离 libgit2 回归：任意提交建分支且保留脏工作区 / 重名拒绝，三种 Reset 的不同效果 / 备份，过期 HEAD / index / 工作文件 / 跨仓库保护，detached HEAD / 引用锁，旧提交按 hunk 拆成两条及重启继续，内容与说明编辑、多暂停点 / Abort，祖先 / 连续性 / root / merge / dirty / 空提交校验，LFS 指针与展开内容、冲突解决后编辑暂停。扩展会话重启测试覆盖每个标签的多选集合和锚点。
+- 新增 3 项单元测试：选择按可见顺序连选及增减；替代提交准备记录在 HEAD 更新前 / 后恢复恰好一次；Split index / cleanup 完成但暂停日志未保存时拒绝 Continue 并保留现场，可 Abort。全量 194 项通过后新增空提交回归，历史操作 14 项全部通过，当前累计 **195 项（161 集成 + 34 单元）**。Clippy `-D warnings`、格式检查和 `git diff --check` 通过；macOS 开发包重建。既有 block 0.1.6 未来兼容性提示仍存在。
+- 原生 GPUI 使用 `examples/demo_history.rs` 创建的 `target/history-ui-20261005` 及独立 bundle / 配置目录：选择旧提交 38296d35，新建 from-old-ui，main 与工作文件保持；Reset 页展示三个模式及影响、Hard 的最终确认（取消未执行）；Split 计划保留后续 824cc12e 为 Pick，确认后 HEAD 停在 b4cc1362，旧提交改动退回工作区。展开 README.md，Stage hunk，提交第一部分为 3a0be662；进度页提供继续 / 中止入口。正常退出并重启后，暂停提示、文件展开和原提交选择恢复；磁盘状态 editing=true / replacement_commits=1，backup 保留原 tip。
+- 原生重启后的剩余 Commit / Continue 点击及行内勾选多选点击验收因 Mac 锁屏暂停，不能声称完成完整 GUI 回路；完整拆分后续重放 / 中止、范围点选和多标签磁盘保存已分别由集成 / 单元测试验证。没有修改真实仓库历史或向真实远程推送。根 / 合并历史改写、其他分支非祖先提交、外部 Rebase 接管仍不支持；编辑工作文件使用外部编辑器，空提交使用 Reword / Drop。真实断电、大仓库及 Windows / Linux 界面未验收。
+
 ## 2026-10-05 远程管理与推送选项
 
 - 通过 git2 / libgit2 添加远程 URL 编辑（Fetch / Push）、重命名 / 删除、设置 / 取消 upstream、选择推送 remote / 源分支 / 目标分支、force-with-lease、选定 / 全部标签推送。管理页和 Push 旁的 ▾ 提供入口；标签菜单直接打开只推该标签的选项。所有写入沿用按仓库独立任务队列。

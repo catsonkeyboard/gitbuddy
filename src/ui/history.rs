@@ -17,6 +17,7 @@ impl GitBuddy {
             .collect();
         let graph = graph::rows(&filtered, !self.query.is_empty());
         let graph_width = graph::width(&graph);
+        let visible: Arc<Vec<String>> = Arc::new(filtered.iter().map(|c| c.id.clone()).collect());
         v_flex()
             .w(px(340.))
             .min_w(px(270.))
@@ -48,6 +49,18 @@ impl GitBuddy {
                                 this.active.history_tab = 1;
                                 cx.notify();
                             })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        self.button(
+                            "selected-actions",
+                            format!("{} selected…", self.commit_selection.ids.len()),
+                        )
+                        .ghost()
+                        .disabled(self.commit_selection.ids.is_empty())
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.show_modal(Modal::CommitSelection, w, cx)
+                        })),
                     ),
             )
             .child(div().px_2().py_1().child(Input::new(&self.search).small()))
@@ -100,11 +113,9 @@ impl GitBuddy {
                     .min_h_0()
                     .overflow_y_scroll()
                     .mt_1()
-                    .children(
-                        filtered.iter().enumerate().map(|(i, commit)| {
-                            self.commit_row(i, commit, &graph[i], graph_width, cx)
-                        }),
-                    )
+                    .children(filtered.iter().enumerate().map(|(i, commit)| {
+                        self.commit_row(i, commit, &graph[i], graph_width, visible.clone(), cx)
+                    }))
                     .when(filtered.is_empty(), |col| {
                         col.child(div().p_5().text_sm().text_color(rgb(MUTED)).child(
                             if self.query.is_empty() {
@@ -185,10 +196,15 @@ impl GitBuddy {
         commit: &Commit,
         graph: &graph::GraphRow,
         graph_width: f32,
+        visible: Arc<Vec<String>>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = commit.id.clone();
-        let selected = matches!(&self.selection, Selection::Commit(oid) if oid == &commit.id);
+        let toggle_id = id.clone();
+        let toggle_visible = visible.clone();
+        let selected = self.commit_selection.ids.contains(&commit.id)
+            || (self.commit_selection.ids.is_empty()
+                && matches!(&self.selection, Selection::Commit(oid) if oid == &commit.id));
         let merge = commit.parents.len() > 1;
         let lane_x = graph::lane_x;
         let line_color =
@@ -200,13 +216,40 @@ impl GitBuddy {
             .relative()
             .flex_shrink_0()
             .pl(px(graph_width))
-            .pr_2()
+            .pr(px(30.))
             .py(px(6.))
             .cursor_pointer()
             .bg(rgb(if selected { 0x334152 } else { PANEL }))
             .hover(|s| s.bg(rgb(0x303946)))
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.select(Selection::Commit(id.clone()), cx)),
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                let modifiers = event.modifiers();
+                this.select_commit(
+                    id.clone(),
+                    &visible,
+                    modifiers.shift,
+                    modifiers.platform || modifiers.control,
+                    cx,
+                );
+            }))
+            .child(
+                self.button(
+                    "toggle-selection",
+                    if self.commit_selection.ids.contains(&commit.id) {
+                        "☑"
+                    } else {
+                        "☐"
+                    },
+                )
+                .ghost()
+                .absolute()
+                .right(px(4.))
+                .top(px(4.))
+                .w(px(22.))
+                .h(px(22.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.select_commit(toggle_id.clone(), &toggle_visible, false, true, cx);
+                })),
             )
             .children(graph.through.clone().into_iter().map(|lane| {
                 div()

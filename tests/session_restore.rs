@@ -22,6 +22,8 @@ fn state() -> Session {
                     editor: EditorView::default(),
                 }),
                 selection: Selection::Commit("abc123".into()),
+                selected_commits: vec!["abc123".into(), "def456".into()],
+                commit_anchor: Some("abc123".into()),
                 query: "author".into(),
                 expanded: vec![PatchKey::Commit("abc123".into(), "src/main.rs".into())],
                 show_commit_body: true,
@@ -39,6 +41,7 @@ fn state() -> Session {
                 history_tab: 1,
                 inspection: Some(Inspection::Compare("base-oid".into(), "target-oid".into())),
                 comparison_base: Some("base-oid".into()),
+                selected_commits: vec!["other-tab-oid".into()],
                 lines: vec![LineSelection {
                     key: PatchKey::Work("file with spaces.rs".into(), false),
                     fingerprint: 42,

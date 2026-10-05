@@ -66,7 +66,7 @@ pub(super) fn head_state(repo: &RawRepo) -> Result<HeadState> {
     })
 }
 
-fn editable(repo: &RawRepo) -> Result<()> {
+pub(super) fn editable(repo: &RawRepo) -> Result<()> {
     ensure!(
         !super::rebase::active(repo),
         "Finish or abort the GitBuddy rebase before editing history."
@@ -84,7 +84,7 @@ fn editable(repo: &RawRepo) -> Result<()> {
 
 /// Keep HEAD locked while updating its branch so a concurrent checkout cannot
 /// redirect the operation to a different branch. Recheck after taking locks.
-fn rewrite_head(
+pub(super) fn rewrite_head(
     repo: &RawRepo,
     expected: &HeadState,
     message: &str,

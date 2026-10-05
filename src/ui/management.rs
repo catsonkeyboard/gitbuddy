@@ -239,7 +239,7 @@ impl GitBuddy {
                             .child(self.button("edit","Message…").ghost().on_click(cx.listener(move|this,_,w,cx|{
                                 this.modal=Some(Modal::RebaseMessage(index));this.amend_message.update(cx,|s,cx|s.set_value(message.clone(),w,cx));cx.notify();
                             }))))
-                        .child(h_flex().gap_1().children([git::RebaseAction::Pick,git::RebaseAction::Reword,git::RebaseAction::Squash,git::RebaseAction::Fixup,git::RebaseAction::Drop].into_iter().map(|action|{
+                        .child(h_flex().gap_1().children([git::RebaseAction::Pick,git::RebaseAction::Reword,git::RebaseAction::Squash,git::RebaseAction::Fixup,git::RebaseAction::Drop,git::RebaseAction::Edit,git::RebaseAction::Split].into_iter().map(|action|{
                             self.button(action.label(),action.label()).ghost().when(step.action==action,|b|b.bg(rgb(0x375776)))
                                 .on_click(cx.listener(move|this,_,_,cx|{if let Data::Rebase(_,steps)=&mut this.management_data{steps[index].action=action;}cx.notify();}))
                         })))
@@ -255,9 +255,11 @@ impl GitBuddy {
             .child(div().child(format!("{} · {} / {} completed",status.branch.trim_start_matches("refs/heads/"),status.completed,status.total)))
             .child(div().text_xs().text_color(rgb(MUTED)).child(format!("Original {} · onto {}",&status.original[..8],&status.onto[..8])))
             .when_some(status.current.clone(),|v,s|v.child(div().text_sm().child(format!("{} {} · {}",s.action.label(),&s.id[..8],s.message.lines().next().unwrap_or_default()))))
+            .when(status.editing,|v|v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("Paused for editing / splitting · {} replacement commits. Edit files, stage hunks / lines and commit each part. Commit all remaining changes before Continue.",status.replacement_commits))))
             .child(h_flex().gap_2()
-                .child(self.button("rebase-resolve","Resolve conflicts…").on_click(cx.listener(|this,_,_,cx|{this.modal=None;this.open_conflicts(None,cx);})))
-                .child(self.button("rebase-continue","Continue rebase…").primary().on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm("Continue rebase using all staged resolutions?".into(),Operation::ContinueRebase),w,cx))))
+                .child(self.button("rebase-resolve",if status.editing {"Edit working files…"}else{"Resolve conflicts…"}).on_click(cx.listener(|this,_,_,cx|{this.modal=None;if this.snapshot.rebase_editing {this.select(Selection::Work,cx);}else{this.open_conflicts(None,cx);}})))
+                .when(status.editing, |v| v.child(self.button("rebase-use-message","Use original message").ghost().on_click(cx.listener({let message=status.current.as_ref().map(|s|s.message.clone()).unwrap_or_default();move |this,_,w,cx|{this.message.update(cx,|s,cx|s.set_value(message.clone(),w,cx));this.modal=None;this.select(Selection::Work,cx);}}))))
+                .child(self.button("rebase-continue","Continue rebase…").primary().on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm(if this.snapshot.rebase_editing { "Continue after committing all parts? Remaining commits will be replayed." } else { "Continue rebase using all staged resolutions?" }.into(),Operation::ContinueRebase),w,cx))))
                 .child(self.button("rebase-abort","Abort rebase…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm("Restore the original branch and tracked files? Resolutions and tracked edits made during this rebase will be discarded.".into(),Operation::AbortRebase),w,cx))))).into_any_element()
     }
     fn worktree_list(&self, trees: &[git::WorktreeInfo], cx: &mut Context<Self>) -> AnyElement {

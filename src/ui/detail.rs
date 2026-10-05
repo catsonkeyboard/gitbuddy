@@ -101,21 +101,21 @@ impl GitBuddy {
                             .child(
                                 self.button("amend-latest", "Amend…")
                                     .ghost()
-                                    .disabled(self.busy() || self.snapshot.head_id.is_none())
+                                    .disabled(self.busy() || self.snapshot.head_id.is_none() || self.snapshot.conflict_operation != git::ConflictOperation::None)
                                     .on_click(cx.listener(|this, _, w, cx| {
                                         this.begin_history(HistoryKind::Amend, w, cx)
                                     })),
                             )
-                            .child(self.button("stash-work", "Stash…").on_click(
+                            .child(self.button("stash-work", "Stash…").disabled(self.snapshot.conflict_operation != git::ConflictOperation::None).on_click(
                                 cx.listener(|this, _, w, cx| this.show_modal(Modal::Stash, w, cx)),
                             ))
                             .child(
                                 self.button(
                                     "commit",
-                                    format!(
+                                    if self.snapshot.rebase_editing { format!("Commit part ({staged} files)") } else { format!(
                                         "Commit {staged} file{}",
                                         if staged == 1 { "" } else { "s" }
-                                    ),
+                                    ) },
                                 )
                                 .primary()
                                 .disabled(self.busy() || !self.snapshot.can_commit())
@@ -133,13 +133,11 @@ impl GitBuddy {
                             .py_2()
                             .gap_2()
                             .bg(rgb(0x51432d))
-                            .child(div().flex_1().text_xs().child(
-                                "Review and resolve conflicts, then continue the operation.",
-                            ))
+                            .child(div().flex_1().text_xs().child(if self.snapshot.rebase_editing { "Rebase paused for editing / splitting. Stage and commit each part, then Continue rebase." } else { "Review and resolve conflicts, then continue the operation." }))
                             .child(
-                                self.button("resolve-conflicts", "Resolve conflicts…")
+                                self.button("resolve-conflicts", if self.snapshot.conflict_operation == git::ConflictOperation::Rebase { "Rebase progress…" } else { "Resolve conflicts…" })
                                     .on_click(
-                                        cx.listener(|this, _, _, cx| this.open_conflicts(None, cx)),
+                                        cx.listener(|this, _, w, cx| { if this.snapshot.conflict_operation == git::ConflictOperation::Rebase { this.open_management(Modal::RebaseSetup,w,cx); } else { this.open_conflicts(None,cx); } }),
                                     ),
                             ),
                     )

@@ -2,6 +2,7 @@ mod conflicts;
 mod detail;
 mod graph;
 mod history;
+mod history_actions;
 mod inspect;
 mod management;
 mod modals;
@@ -152,6 +153,9 @@ enum Modal {
     Init,
     Clone,
     Branch,
+    BranchAt(String),
+    ResetHistory(Option<Arc<git::ResetContext>>),
+    CommitSelection,
     Tag,
     Remote,
     Remotes,
@@ -255,6 +259,7 @@ pub struct RepoTab {
     diff: Vec<DiffLine>,
     commit_detail: Option<CommitDetail>,
     commit_cache: HashMap<String, CommitDetail>,
+    commit_selection: history_actions::CommitSelection,
     expanded: HashSet<PatchKey>,
     patches: HashMap<PatchKey, PatchState>,
     show_commit_body: bool,
@@ -294,6 +299,7 @@ impl Default for RepoTab {
             diff: Vec::new(),
             commit_detail: None,
             commit_cache: HashMap::new(),
+            commit_selection: history_actions::CommitSelection::default(),
             expanded: HashSet::new(),
             patches: HashMap::new(),
             show_commit_body: false,
@@ -801,7 +807,7 @@ impl GitBuddy {
         let Some(repo) = self.active.repo.clone() else {
             return;
         };
-        let clear_message = matches!(operation, Operation::Commit(_));
+        let clear_message = matches!(operation, Operation::Commit(_) | Operation::CommitRebase(_));
         let history_edit = matches!(
             operation,
             Operation::Amend { .. }
@@ -810,6 +816,7 @@ impl GitBuddy {
                 | Operation::Rebase { .. }
                 | Operation::ContinueRebase
                 | Operation::AbortRebase
+                | Operation::Reset { .. }
         );
         let retry_modal = if matches!(operation, Operation::Amend { .. }) {
             self.modal.clone()
@@ -870,8 +877,13 @@ impl GitBuddy {
         if self.busy() || self.modal.is_some() || !self.snapshot.can_commit() {
             return;
         }
+        let message = self.message.read(cx).value().to_string();
         self.perform(
-            Operation::Commit(self.message.read(cx).value().to_string()),
+            if self.snapshot.rebase_editing {
+                Operation::CommitRebase(message)
+            } else {
+                Operation::Commit(message)
+            },
             cx,
         );
     }

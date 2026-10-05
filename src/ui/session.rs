@@ -146,6 +146,8 @@ impl RepoTab {
             amend: self.amend_draft.clone(),
             query: self.query.clone(),
             selection,
+            selected_commits: self.commit_selection.ids.iter().cloned().collect(),
+            commit_anchor: self.commit_selection.anchor.clone(),
             inspection,
             comparison_base: self.comparison_base.clone(),
             history_tab: self.history_tab,
@@ -159,6 +161,8 @@ impl RepoTab {
         })
     }
     pub(super) fn apply_session(&mut self, saved: disk::Tab) {
+        self.commit_selection.ids = saved.selected_commits.into_iter().collect();
+        self.commit_selection.anchor = saved.commit_anchor;
         self.message_view = saved.message_view;
         self.amend_draft = saved.amend;
         self.selection = match saved.selection {

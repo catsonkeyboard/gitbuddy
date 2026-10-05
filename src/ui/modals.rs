@@ -47,6 +47,9 @@ impl GitBuddy {
                 self.prepare_repository(preparation, cx);
             }
             Modal::Branch => self.perform(Operation::CreateBranch(a), cx),
+            Modal::BranchAt(target) => {
+                self.perform(Operation::CreateBranchAt { name: a, target }, cx)
+            }
             Modal::Tag => self.perform(Operation::Tag(a), cx),
             Modal::Remote => self.perform(Operation::AddRemote(a, b), cx),
             Modal::EditRemote(expected) => self.perform(
@@ -72,6 +75,9 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::ResetHistory(_) | Modal::CommitSelection) {
+            return self.history_actions_modal(modal, cx);
+        }
         if matches!(
             modal,
             Modal::Remotes | Modal::PushSettings | Modal::Upstream(_)
@@ -148,6 +154,13 @@ impl GitBuddy {
                 None,
                 "Create & switch",
             ),
+            Modal::BranchAt(_) => (
+                "Create branch from commit",
+                "New branch name (current checkout stays unchanged)",
+                None,
+                "Create branch",
+            ),
+            Modal::ResetHistory(_) | Modal::CommitSelection => unreachable!(),
             Modal::Tag => ("Create tag", "Tag name (at HEAD)", None, "Create tag"),
             Modal::Remote => (
                 "Add remote",
@@ -196,6 +209,9 @@ impl GitBuddy {
             ),
         };
         let mut card = v_flex()
+            .id("modal-card-scroll")
+            .max_h(px(700.))
+            .overflow_y_scroll()
             .w(px(540.))
             .p_6()
             .gap_4()
@@ -343,6 +359,43 @@ impl GitBuddy {
                         );
             }
             Modal::CommitActions(id) => {
+                let branch_id = id.clone();
+                let reset_id = id.clone();
+                let edit_id = id.clone();
+                let split_id = id.clone();
+                card = card
+                    .child(
+                        self.button("branch-at", "Create branch from this commit…")
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.show_modal(Modal::BranchAt(branch_id.clone()), w, cx)
+                            })),
+                    )
+                    .child(
+                        self.button("reset-to", "Reset current branch to this commit…")
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.begin_reset(reset_id.clone(), w, cx)
+                            })),
+                    )
+                    .child(
+                        self.button("edit-old", "Edit this commit…")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.preview_history_rewrite(
+                                    vec![edit_id.clone()],
+                                    git::RebaseAction::Edit,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .child(
+                        self.button("split-old", "Split this commit…")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.preview_history_rewrite(
+                                    vec![split_id.clone()],
+                                    git::RebaseAction::Split,
+                                    cx,
+                                )
+                            })),
+                    );
                 let base = id.clone();
                 let target = id.clone();
                 let against = self

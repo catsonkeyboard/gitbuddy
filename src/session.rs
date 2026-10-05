@@ -137,6 +137,8 @@ pub struct Tab {
     pub amend: Option<AmendDraft>,
     pub query: String,
     pub selection: Selection,
+    pub selected_commits: Vec<String>,
+    pub commit_anchor: Option<String>,
     pub inspection: Option<Inspection>,
     pub comparison_base: Option<String>,
     pub history_tab: usize,

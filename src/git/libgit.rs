@@ -237,6 +237,11 @@ fn fingerprint_of(
         "unborn".hash(&mut hasher);
     }
     format!("{:?}", repo.state()).hash(&mut hasher);
+    match fs::read(repo.path().join("gitbuddy-rebase.json")) {
+        Ok(state) => state.hash(&mut hasher),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     let mut references: Vec<String> = Vec::new();
     for item in repo.references()? {
         let Ok(reference) = item else {
@@ -616,6 +621,7 @@ impl Repository {
             .collect();
         let merging = repo.state() == RepositoryState::Merge;
         Ok(Snapshot {
+            rebase_editing: self.rebase_status()?.is_some_and(|s| s.editing),
             conflict_operation: if super::rebase::active(&repo) {
                 ConflictOperation::Rebase
             } else {
@@ -789,6 +795,10 @@ impl Repository {
                 | Operation::AbortRebase
                 | Operation::Discard(_)
                 | Operation::ContinueConflict(_)
+                | Operation::Reset {
+                    mode: super::ResetMode::Hard,
+                    ..
+                }
         );
         let initial = raw(self)?;
         if super::rebase::active(&initial) {
@@ -796,11 +806,13 @@ impl Repository {
                 matches!(
                     &operation,
                     Operation::ContinueRebase
+                        | Operation::CommitRebase(_)
                         | Operation::AbortRebase
                         | Operation::Stage(_)
                         | Operation::Unstage(_)
                         | Operation::StageAll
                         | Operation::UnstageAll
+                        | Operation::ApplyPartial { .. }
                         | Operation::Discard(_)
                         | Operation::ResolveConflict { .. }
                         | Operation::ContinueConflict(_)
@@ -808,7 +820,10 @@ impl Repository {
                 "A GitBuddy rebase is in progress; resolve, continue or abort it first"
             );
         }
-        if checkout && let Err(error) = super::lfs::dehydrate(&initial) {
+        if checkout
+            && !matches!(&operation, Operation::Reset { .. })
+            && let Err(error) = super::lfs::dehydrate(&initial)
+        {
             let _ = super::lfs::hydrate(&initial);
             return Err(error);
         }
@@ -820,6 +835,7 @@ impl Repository {
             match operation {
                 Operation::Rebase { context, steps } => self.start_rebase(&context, steps),
                 Operation::ContinueRebase => self.continue_rebase(),
+                Operation::CommitRebase(message) => self.commit_rebase(&message),
                 Operation::AbortRebase => self.abort_rebase(),
                 Operation::CreateWorktree { name, path } => self.create_worktree(&name, &path),
                 Operation::LockWorktree { name, locked } => self.lock_worktree(&name, locked),
@@ -926,6 +942,8 @@ impl Repository {
                     checkout_branch(&repo, &name, BranchType::Local)?;
                     Ok(format!("Switched to {name}"))
                 }
+                Operation::CreateBranchAt { name, target } => self.create_branch_at(&name, &target),
+                Operation::Reset { context, mode } => self.reset_history(&context, mode),
                 Operation::Checkout(name) => {
                     validate_branch(&name)?;
                     checkout_branch(&repo, &name, BranchType::Local)?;

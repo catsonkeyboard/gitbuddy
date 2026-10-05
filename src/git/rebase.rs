@@ -15,6 +15,8 @@ pub enum RebaseAction {
     Squash,
     Fixup,
     Drop,
+    Edit,
+    Split,
 }
 impl RebaseAction {
     pub fn label(self) -> &'static str {
@@ -24,6 +26,8 @@ impl RebaseAction {
             Self::Squash => "Squash",
             Self::Fixup => "Fixup",
             Self::Drop => "Drop",
+            Self::Edit => "Edit",
+            Self::Split => "Split",
         }
     }
 }
@@ -49,6 +53,8 @@ pub struct RebaseStatus {
     pub total: usize,
     pub current: Option<RebaseStep>,
     pub backup: String,
+    pub editing: bool,
+    pub replacement_commits: usize,
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -70,6 +76,12 @@ struct State {
     prepared: Option<String>,
     #[serde(default)]
     finishing: bool,
+    #[serde(default)]
+    editing: bool,
+    #[serde(default)]
+    replacement_commits: usize,
+    #[serde(default)]
+    prepared_edit: bool,
 }
 pub(super) fn active(repo: &Raw) -> bool {
     repo.path().join(STATE).exists()
@@ -94,6 +106,16 @@ fn load(repo: &Raw) -> Result<State> {
     ensure!(
         state.branch.starts_with("refs/heads/") && git2::Reference::is_valid_name(&state.branch),
         "Invalid rebase branch"
+    );
+    ensure!(
+        (!state.editing
+            || (!state.finishing
+                && state.steps.get(state.cursor).is_some_and(|s| matches!(
+                    s.action,
+                    RebaseAction::Edit | RebaseAction::Split
+                ))))
+            && (!state.prepared_edit || (state.editing && state.prepared.is_some())),
+        "Invalid edit / split journal; preserve it for recovery"
     );
     Ok(state)
 }
@@ -247,6 +269,8 @@ impl Repository {
             total: s.steps.len(),
             current: s.steps.get(s.cursor).cloned(),
             backup: s.backup,
+            editing: s.editing,
+            replacement_commits: s.replacement_commits,
         }))
     }
     pub(super) fn start_rebase(
@@ -293,6 +317,13 @@ impl Repository {
                 !step.message.trim().is_empty(),
                 "Retained commits need a message"
             );
+            if matches!(step.action, RebaseAction::Edit | RebaseAction::Split) {
+                let commit = repo.find_commit(oid(&step.id)?)?;
+                ensure!(
+                    commit.tree_id() != commit.parent(0)?.tree_id(),
+                    "Empty commits cannot be split or edited as changes; use Reword or Drop in the plan"
+                );
+            }
             first = false;
         }
         let signature = author(&repo)?;
@@ -322,6 +353,9 @@ impl Repository {
             backup,
             prepared: None,
             finishing: false,
+            editing: false,
+            replacement_commits: 0,
+            prepared_edit: false,
         };
         // Lock both references through the initial checkout and detachment.
         let mut refs = repo.transaction()?;
@@ -354,7 +388,132 @@ impl Repository {
         let _lock = Lock::acquire(&repo)?;
         let mut state = load(&repo)?;
         checked_branch(&repo, &state)?;
+        settle_prepared(&repo, &mut state)?;
+        if state.editing {
+            ensure!(
+                state.replacement_commits > 0,
+                "Create at least one replacement commit before continuing (Abort and choose Drop to remove the commit)"
+            );
+            ensure!(
+                repo.state() == RepositoryState::Clean
+                    && super::libgit::file_changes(&repo)?.is_empty(),
+                "Commit all remaining staged, unstaged and untracked changes before continuing"
+            );
+            state.editing = false;
+            state.replacement_commits = 0;
+            state.cursor += 1;
+            state.pending = false;
+            state.applied = false;
+            save(&repo, &state)?;
+        }
         run(&repo, &mut state)
+    }
+    pub(super) fn commit_rebase(&self, message: &str) -> Result<String> {
+        ensure!(
+            !message.trim().is_empty(),
+            "Enter a replacement commit message"
+        );
+        let repo = raw(self)?;
+        let _lock = Lock::acquire(&repo)?;
+        let mut state = load(&repo)?;
+        checked_branch(&repo, &state)?;
+        settle_prepared(&repo, &mut state)?;
+        ensure!(
+            state.editing && repo.state() == RepositoryState::Clean,
+            "Rebase is not paused for editing / splitting"
+        );
+        let mut index = repo.index()?;
+        index.read(true)?;
+        ensure!(!index.has_conflicts(), "Resolve conflicts first");
+        let tree = repo.find_tree(index.write_tree()?)?;
+        let parent = repo.find_commit(oid(&state.current)?)?;
+        ensure!(
+            tree.id() != parent.tree_id(),
+            "Stage changes for the replacement commit first"
+        );
+        let picked = repo.find_commit(oid(&state.steps[state.cursor].id)?)?;
+        let id = repo.commit(
+            None,
+            &picked.author(),
+            &author(&repo)?,
+            message,
+            &tree,
+            &[&parent],
+        )?;
+        state.prepared = Some(id.to_string());
+        state.prepared_edit = true;
+        save(&repo, &state)?;
+        settle_prepared(&repo, &mut state)?;
+        Ok(format!(
+            "Created replacement commit {}; stage the next part or Continue rebase",
+            &id.to_string()[..8]
+        ))
+    }
+    /// Rewrite selected commits in the current branch's linear ancestry.
+    /// Unselected descendants are replayed unchanged in the same plan.
+    pub fn history_rewrite_preview(
+        &self,
+        ids: &[String],
+        action: RebaseAction,
+    ) -> Result<(RebasePreview, Vec<RebaseStep>)> {
+        ensure!(!ids.is_empty(), "Select at least one commit");
+        ensure!(
+            matches!(
+                action,
+                RebaseAction::Edit
+                    | RebaseAction::Split
+                    | RebaseAction::Drop
+                    | RebaseAction::Squash
+            ),
+            "Unsupported history action"
+        );
+        let selected: HashSet<_> = ids.iter().collect();
+        ensure!(selected.len() == ids.len(), "Duplicate commit selection");
+        let repo = raw(self)?;
+        clean(&repo)?;
+        let mut remaining = selected.clone();
+        let mut current = repo.head()?.peel_to_commit()?;
+        let mut base = None;
+        for _ in 0..2000 {
+            let id = current.id().to_string();
+            remaining.remove(&id);
+            ensure!(
+                current.parent_count() == 1,
+                "Selected range contains a root or merge commit; editing that range is not supported"
+            );
+            let parent = current.parent(0)?;
+            if remaining.is_empty() {
+                base = Some(parent.id().to_string());
+                break;
+            }
+            current = parent;
+        }
+        let preview = self.rebase_preview(base.as_deref().context("Selected commits must belong to the current branch's first-parent history (maximum 2,000 commits)")?)?;
+        let mut steps = preview.steps.clone();
+        let positions: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| selected.contains(&s.id))
+            .map(|(i, _)| i)
+            .collect();
+        ensure!(
+            positions.len() == selected.len(),
+            "Selection changed; rebuild the plan"
+        );
+        if action == RebaseAction::Squash {
+            ensure!(
+                positions.len() > 1 && positions.windows(2).all(|w| w[1] == w[0] + 1),
+                "Squash requires at least two adjacent commits"
+            );
+        }
+        for (n, i) in positions.into_iter().enumerate() {
+            steps[i].action = if action == RebaseAction::Squash && n == 0 {
+                RebaseAction::Pick
+            } else {
+                action
+            };
+        }
+        Ok((preview, steps))
     }
     pub(super) fn abort_rebase(&self) -> Result<String> {
         let repo = raw(self)?;
@@ -387,6 +546,29 @@ impl Repository {
         Ok("Rebase aborted; original branch and tracked files restored".into())
     }
 }
+fn settle_prepared(repo: &Raw, state: &mut State) -> Result<()> {
+    if let Some(prepared) = state.prepared.clone() {
+        let head = head_state(repo)?.id.context("No rebase HEAD")?;
+        if head != prepared {
+            move_head(repo, &state.current, &prepared)?;
+        }
+        state.current = prepared;
+        if state.prepared_edit {
+            state.replacement_commits += 1;
+        } else {
+            state.cursor += 1;
+            state.pending = false;
+            state.applied = false;
+            if repo.state() != RepositoryState::Clean {
+                repo.cleanup_state()?;
+            }
+        }
+        state.prepared = None;
+        state.prepared_edit = false;
+        save(repo, state)?;
+    }
+    Ok(())
+}
 fn run(repo: &Raw, state: &mut State) -> Result<String> {
     checked_branch(repo, state)?;
     if !state.finishing && head_state(repo)?.reference == state.branch {
@@ -410,20 +592,9 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
     }
     loop {
         checked_branch(repo, state)?;
-        if let Some(prepared) = state.prepared.clone() {
-            let head = head_state(repo)?.id.context("No rebase HEAD")?;
-            if head != prepared {
-                move_head(repo, &state.current, &prepared)?;
-            }
-            state.current = prepared;
-            state.cursor += 1;
-            state.pending = false;
-            state.applied = false;
-            state.prepared = None;
-            if repo.state() != RepositoryState::Clean {
-                repo.cleanup_state()?;
-            }
-            save(repo, state)?;
+        settle_prepared(repo, state)?;
+        if state.editing {
+            return Ok("Rebase paused: edit files, stage and create replacement commits, then Continue rebase".into());
         }
         let Some(step) = state.steps.get(state.cursor).cloned() else {
             break;
@@ -484,6 +655,20 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
         );
         let tree = repo.find_tree(index.write_tree()?)?;
         let previous = repo.find_commit(oid(&state.current)?)?;
+        if matches!(step.action, RebaseAction::Edit | RebaseAction::Split) {
+            if step.action == RebaseAction::Split {
+                index.read_tree(&previous.tree()?)?;
+                index.write()?;
+            }
+            repo.cleanup_state()?;
+            state.editing = true;
+            save(repo, state)?;
+            return Ok(format!(
+                "Rebase paused to {} {}: stage changes and create replacement commits, then Continue rebase",
+                step.action.label().to_lowercase(),
+                &step.id[..8]
+            ));
+        }
         let combine = matches!(step.action, RebaseAction::Squash | RebaseAction::Fixup);
         let message = match step.action {
             RebaseAction::Squash => format!(
@@ -693,6 +878,9 @@ mod tests {
             pending: false,
             applied: false,
             backup: "refs/gitbuddy/fixture".into(),
+            editing: false,
+            replacement_commits: 0,
+            prepared_edit: false,
             prepared: None,
             finishing: false,
         };
@@ -706,5 +894,59 @@ mod tests {
         assert!(raw.head_detached().unwrap());
         repo.execute(Operation::AbortRebase).unwrap();
         assert_eq!(repo.snapshot(10).unwrap().head_id, Some(state.original));
+    }
+    #[test]
+    fn replacement_journal_recovers_once_on_either_side_of_ref_update() {
+        for moved in [false, true] {
+            let (_dir, repo, mut preview) = fixture();
+            // Use the original parent instead of main, so the edit has no conflict.
+            preview.onto = preview.base.clone();
+            let mut steps = preview.steps.clone();
+            steps[0].action = RebaseAction::Edit;
+            repo.execute(Operation::Rebase {
+                context: Arc::new(preview),
+                steps,
+            })
+            .unwrap();
+            let r = raw(&repo).unwrap();
+            let mut s = load(&r).unwrap();
+            let replacement = prepared(&r, &s);
+            s.prepared = Some(replacement.clone());
+            s.prepared_edit = true;
+            save(&r, &s).unwrap();
+            if moved {
+                move_head(&r, &s.current, &replacement).unwrap();
+            }
+            // Resume through the public owning operation, never ordinary Commit.
+            repo.execute(Operation::ContinueRebase).unwrap();
+            assert!(repo.rebase_status().unwrap().is_none());
+            let h = r.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(h.id().to_string(), replacement);
+            assert_eq!(h.parent_count(), 1);
+            assert_eq!(h.message(), Ok("prepared"));
+        }
+    }
+    #[test]
+    fn interrupted_split_pause_preserves_worktree_and_requires_abort() {
+        let (_dir, repo, mut preview) = fixture();
+        preview.onto = preview.base.clone();
+        let mut steps = preview.steps.clone();
+        steps[0].action = RebaseAction::Split;
+        repo.execute(Operation::Rebase {
+            context: Arc::new(preview),
+            steps,
+        })
+        .unwrap();
+        let r = raw(&repo).unwrap();
+        let mut s = load(&r).unwrap();
+        // Simulate process death after cleanup/index reset but before the pause is saved.
+        s.editing = false;
+        save(&r, &s).unwrap();
+        let bytes = fs::read(repo.root.join("file")).unwrap();
+        assert!(repo.execute(Operation::ContinueRebase).is_err());
+        assert_eq!(fs::read(repo.root.join("file")).unwrap(), bytes);
+        assert_eq!(head_state(&r).unwrap().id, Some(s.current));
+        repo.execute(Operation::AbortRebase).unwrap();
+        assert_eq!(repo.snapshot(1).unwrap().head_id, Some(s.original));
     }
 }

@@ -77,11 +77,20 @@ pub struct Snapshot {
     pub remotes: Vec<String>,
     pub merging: bool,
     pub conflict_operation: ConflictOperation,
+    /// The sequencer is paused for user-created replacement commits.
+    pub rebase_editing: bool,
 }
 impl Snapshot {
     /// Shared eligibility for the button, keyboard action and backend entry.
     pub fn can_commit(&self) -> bool {
-        Self::commit_allowed(&self.files, self.conflict_operation)
+        Self::commit_allowed(
+            &self.files,
+            if self.rebase_editing {
+                ConflictOperation::None
+            } else {
+                self.conflict_operation
+            },
+        )
     }
     pub(crate) fn commit_allowed(files: &[FileChange], operation: ConflictOperation) -> bool {
         matches!(
@@ -98,6 +107,7 @@ pub enum Operation {
         steps: Vec<RebaseStep>,
     },
     ContinueRebase,
+    CommitRebase(String),
     AbortRebase,
     CreateWorktree {
         name: String,
@@ -154,6 +164,14 @@ pub enum Operation {
         name: String,
     },
     CreateBranch(String),
+    CreateBranchAt {
+        name: String,
+        target: String,
+    },
+    Reset {
+        context: std::sync::Arc<ResetContext>,
+        mode: ResetMode,
+    },
     Checkout(String),
     DeleteBranch(String),
     Merge(String),
@@ -235,6 +253,9 @@ pub use partial::{FilePatch, PartialPatch, PatchSelection};
 #[path = "git/recovery.rs"]
 mod recovery;
 pub use recovery::{CommitEdit, HeadState, ReflogEntry, ReflogPage, ReflogTarget};
+#[path = "git/history.rs"]
+mod history;
+pub use history::{ResetContext, ResetMode};
 #[path = "git/inspect.rs"]
 mod inspect;
 pub use inspect::{

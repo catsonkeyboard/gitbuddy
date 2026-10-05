@@ -31,6 +31,10 @@ cargo run --locked -- ./target/advanced-ui-20261004/project
 cargo run --locked --example demo_remotes
 cargo run --locked -- ./target/remote-ui-20261005/project
 
+# 创建多选 / Reset / 旧提交编辑与拆分的独立演示仓库
+cargo run --locked --example demo_history
+cargo run --locked -- ./target/history-ui-20261005/project
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -45,11 +49,11 @@ open dist/GitBuddy.app
 | 冲突处理 | 按文件查看 Ours / Base / Theirs、编辑合并结果、选择完整版本或删除、保存并标记解决、继续 / 中止 merge、cherry-pick、revert 和 GitBuddy Rebase |
 | 差异 | 工作区、暂存区、历史提交按文件折叠；点击文件才加载该文件的统一 diff；红绿增删行、双侧行号、虚拟滚动；二进制和大文件提示 |
 | 提交 | 多行提交说明、提交已暂存文件、Amend、撤销最近一次提交、复制提交 ID、revert、cherry-pick 及继续 / 中止 |
-| 历史 | 所有分支的提交、作者、相对时间、哈希、引用标记；按父提交绘制分支与合并线；在已加载历史中搜索；分页加载 |
+| 历史 | 所有分支的提交与分支图、搜索 / 分页；多选提交、批量改写计划、任意提交创建分支、Soft / Mixed / Hard Reset |
 | 文件追踪 | 指定版本的文件列表、跟随重命名的文件历史、按提交展开文件 diff、逐行 Blame 与提交详情跳转 |
 | 比较 | 两个提交 / 分支 / 标签的文件树比较、增删统计、按文件折叠、反向比较、设置比较基准 |
 | 恢复 | HEAD Reflog 分页查看、选择操作前 / 后的提交、创建恢复分支、恢复当前分支位置 |
-| Rebase / Squash | 编辑线性提交计划、调整顺序、Pick / Reword / Squash / Fixup / Drop、批量 Squash、冲突继续 / 中止、持久化进度和原历史备份 |
+| Rebase / Squash | 编辑线性提交计划、调整顺序、Pick / Reword / Squash / Fixup / Drop / Edit / Split、旧提交内容编辑与分批拆分、冲突继续 / 中止、持久化进度和原历史备份 |
 | Worktree | 列出关联工作树、新建分支及工作树、独立标签打开、锁定 / 解锁、移除干净工作树、清理失效登记 |
 | 子模块 | 添加、初始化 / 更新、递归更新、同步 URL、暂存当前 gitlink、独立标签打开、脏工作区保护及网络取消 |
 | Git LFS | Track / Untrack、原生 SHA-256 对象缓存及指针暂存、本地对象展开、缺失对象提示、按 remote Fetch / Push、普通 Push 前上传 LFS 对象 |
@@ -119,6 +123,20 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 改写前会再次校验 HEAD；Amend 还校验暂存快照，打开对话框后发生变化则拒绝执行。未完成的合并、rebase、cherry-pick、revert 或索引冲突会阻止改写历史，但仍可从 Reflog 创建独立恢复分支。历史改写会保留 HEAD Reflog 记录，不自动推送；已被 Git 清理的提交对象无法恢复。
 
+### 历史选择、建分支与 Reset
+
+提交列表支持普通点击单选、`Shift` 按当前可见顺序连选、`⌘ / Ctrl` 点击增减选择，也可用行尾勾选按钮。列表上方 **N selected…** 可复制 IDs、比较两个提交（列表中较后者作为 base）、建立 Squash / Drop / Edit / Split 批量计划。多选集合与范围锚点按仓库标签保存并随重启恢复；搜索隐藏的选择仍保留，已加载历史中缺少所选提交时禁用批量操作，可 Load more 或清空重选。
+
+选中提交后，详情的 **Actions… → Create branch from this commit…** 在该确切提交创建新分支，不切换当前分支或改动文件。**Reset current branch to this commit…** 展示固定目标和三种模式：Soft 仅移动 HEAD；Mixed 同时重置暂存区但保留工作文件；Hard 同时重置暂存区及 tracked 文件。Hard 可能覆盖阻挡 checkout 的未跟踪文件，其余未跟踪文件保留。确认前后的 HEAD、引用、暂存区或工作文件变化会拒绝过期操作。原提交保留于备份引用、ORIG_HEAD 和 Reflog；备份不包含被丢弃的未提交编辑。Reset 支持本地分支或 detached HEAD，进行中的仓库操作会阻止 Reset。
+
+### 编辑／拆分旧提交
+
+从提交的 **Actions… → Edit this commit… / Split this commit…** 建立包含该提交及后续提交的计划；多选菜单可设置多个暂停点。批量 Squash 要求当前分支里相邻的至少两条提交，其余操作允许间隔选择；未选中的后续提交仍以 Pick 重放。计划展示后再确认执行。只改消息可使用计划的 Message… / Reword。
+
+**Edit** 应用旧提交后保留已暂存内容并暂停。可用外部编辑器修改工作文件，重新暂存并在正常提交框填写替代说明；**Split** 则把旧提交的修改全部退回未暂存状态，保留工作文件。逐次按文件、hunk 或选中行暂存并 Commit，生成一个或多个替代提交；每条保留原作者并更新提交者。进度页提供 **Use original message**，也可填写新说明。普通提交按钮在这个暂停点调用专用 sequencer 操作，外部 Rebase 仍不能接管。
+
+至少创建一条含暂存变更的替代提交，并提交完所有 staged / unstaged / untracked 修改后，点击工作区 **Rebase progress… → Continue rebase…** 重放后续提交或进入下一个暂停点。重启后暂停状态、替代提交数及普通草稿保留；Abort 恢复原分支与 tracked 文件，保留未跟踪文件。根提交、合并范围、其他分支的非祖先提交暂不支持编辑／拆分；空提交使用 Reword / Drop。这类计划明确报错，任意提交创建分支不受此限制。若在切换到编辑暂停点的 index / 状态保存期间意外中断，不能验证现场时会拒绝 Continue，应保存编辑后 Abort 并重建计划。
+
 ### 交互式 Rebase 与 Squash
 
 打开 **Repository → Interactive rebase / Squash…**，输入基准版本（例如 `HEAD~3` 编辑最近三次提交，或输入上游分支将当前分支的独有提交重放到该版本）。计划从旧到新列出提交，可调整顺序、编辑说明，并选择 **Pick / Reword / Squash / Fixup / Drop**。**Squash all into one** 将第一条保留，其余合并；Squash 拼接说明，Fixup 保留前一组的说明。第一条保留的提交不能选 Squash / Fixup。开始前要求工作区及暂存区干净，再次校验分支、HEAD 和计划。
@@ -184,6 +202,7 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `src/git/network.rs`：线程安全取消令牌、取消／最终写入阶段互斥、进度节流与取消结果。
 - `src/git/partial.rs`：结构化 hunk / 行选择、过期校验与暂存区内容重建，保留原始字节及换行。
 - `src/git/recovery.rs`：Amend、保留暂存区的提交撤销、HEAD Reflog 与恢复；使用引用锁和快照校验防止操作落到已切换的分支。
+- `src/git/history.rs`、`src/ui/history_actions.rs`：明确 Reset 模式、任意提交建分支、多选历史和旧提交改写入口。
 - `src/git/inspect.rs`：固定版本的文件浏览、跨父提交跟随重命名的历史、Blame、两棵树比较与精确文件 patch。
 - `src/git/conflicts.rs`：索引三方内容、结果保存、引用 / 索引锁和过期校验、继续冲突操作。
 - `src/git/rebase.rs`：基于 libgit2 的可编辑提交序列、引用事务、持久化进度、冲突继续与中止。
@@ -207,6 +226,7 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `tests/p1_regressions.rs`、`tests/p2_regressions.rs`：审查问题的隔离仓库回归，P2 含本地 Basic-auth HTTP 服务验证凭据助手、Push 和子模块克隆；HTTP 夹具通过系统 Git 提供协议，客户端仍使用 libgit2。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。
 - `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。
+- `tests/history_operations.rs`、`examples/demo_history.rs`：Reset 模式与过期保护、编辑 / hunk 拆分 / 重启继续、LFS 和冲突恢复回归及演示仓库。
 - `tests/repository_inspection.rs`：文件历史 / Blame / 比较的隔离仓库测试，包含合并、重命名后旧名复用、删除后重建、特殊路径和版本固定。
 - `tests/conflict_resolution.rs`：三方版本、删除 / 二进制 / 可执行文件、过期请求、索引锁、多文件独立解决和继续操作的 libgit2 隔离仓库测试。
 - `tests/advanced_git.rs`：提交重写、跨工作树保护、子模块及 LFS 指针 / 缓存 / Stash 的隔离仓库回归测试。
