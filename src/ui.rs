@@ -7,6 +7,7 @@ mod management;
 mod modals;
 mod patches;
 mod recovery;
+mod remotes;
 mod session;
 mod sidebar;
 mod tasks;
@@ -54,6 +55,8 @@ gpui_kit::actions!(
         OpenWorktrees,
         OpenSubmodules,
         OpenLfs,
+        OpenRemotes,
+        OpenPushOptions,
         Quit,
         CloseModal
     ]
@@ -151,6 +154,11 @@ enum Modal {
     Branch,
     Tag,
     Remote,
+    Remotes,
+    EditRemote(git::RemoteInfo),
+    RenameRemote(git::RemoteInfo),
+    Upstream(String),
+    PushSettings,
     Stash,
     Identity,
     BranchActions(String, bool),
@@ -334,6 +342,11 @@ pub struct GitBuddy {
     tool_generation: u64,
     management_data: management::Data,
     management_generation: u64,
+    remote_data: remotes::Data,
+    remote_generation: u64,
+    push_choice: git::PushSelection,
+    restore_push_target: Option<String>,
+    push_preparing: bool,
     conflict_generation: u64,
     conflict_editor: Entity<EditorState>,
     restore_conflict: Option<String>,
@@ -464,6 +477,11 @@ impl GitBuddy {
             tool_generation: 0,
             management_data: management::Data::Loading,
             management_generation: 0,
+            remote_data: remotes::Data::Loading,
+            remote_generation: 0,
+            push_choice: git::PushSelection::default(),
+            restore_push_target: None,
+            push_preparing: false,
             conflict_generation: 0,
             conflict_editor,
             restore_conflict: None,
@@ -913,6 +931,12 @@ impl GitBuddy {
 impl Render for GitBuddy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.restore_scroll_on_next_frame(window, cx);
+        if let Some(value) = self.restore_push_target.take()
+            && matches!(self.modal, Some(Modal::PushSettings))
+        {
+            self.form_a
+                .update(cx, |s, cx| s.set_value(value, window, cx));
+        }
         if let Some(value) = self.restore_search.take() {
             self.search
                 .update(cx, |state, cx| state.set_value(value, window, cx));
@@ -1000,6 +1024,12 @@ impl Render for GitBuddy {
             .on_action(
                 cx.listener(|this, _: &OpenLfs, w, cx| this.open_management(Modal::Lfs, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &OpenRemotes, w, cx| {
+                this.open_remote_page(Modal::Remotes, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenPushOptions, w, cx| {
+                this.open_remote_page(Modal::PushSettings, w, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &CompareRevisions, w, cx| {
                     this.open_compare(None, None, w, cx)

@@ -362,6 +362,9 @@ fn http_network_operations_read_repository_credential_helper_and_http_path() {
                 }
                 Err(e) => panic!("{e}"),
             };
+            // macOS can inherit the listener's nonblocking flag on accept.
+            // Header/body reads below deliberately use a blocking test stream.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
@@ -579,5 +582,64 @@ fn http_network_operations_read_repository_credential_helper_and_http_path() {
                 .target(),
             Some(pushed)
         );
+        // Exercise the smart HTTP lease callback, not the local-path adapter.
+        r.reference("refs/heads/main", target, true, "test rewind")
+            .unwrap();
+        let selection = gitbuddy::git::PushSelection {
+            remote: "origin".into(),
+            branch: Some("main".into()),
+            target: "main".into(),
+            force_with_lease: true,
+            ..Default::default()
+        };
+        let plan = repo.prepare_push(selection.clone()).unwrap();
+        repo.execute(Operation::PushTo(Arc::new(plan))).unwrap();
+        let server = git2::Repository::open_bare(&bare).unwrap();
+        assert_eq!(server.head().unwrap().target(), Some(target));
+        write(&repo, "lease-change", "local leased change");
+        commit(&repo, "local leased change");
+        let plan = repo.prepare_push(selection.clone()).unwrap();
+        let external_commit = |server: &git2::Repository| {
+            let parent = server.head().unwrap().peel_to_commit().unwrap();
+            let sig = git2::Signature::now("Other", "other@example.invalid").unwrap();
+            server
+                .commit(
+                    Some("refs/heads/main"),
+                    &sig,
+                    &sig,
+                    "external",
+                    &parent.tree().unwrap(),
+                    &[&parent],
+                )
+                .unwrap()
+        };
+        let external = external_commit(&server);
+        let error = repo.execute(Operation::PushTo(Arc::new(plan))).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Force-with-lease rejected"),
+            "{error:#}"
+        );
+        assert_eq!(server.head().unwrap().target(), Some(external));
+        repo.execute(Operation::Fetch).unwrap();
+        let plan = repo.prepare_push(selection).unwrap();
+        let remote_path = bare.clone();
+        let raced = Arc::new(std::sync::Mutex::new(None));
+        let slot = raced.clone();
+        let sink: gitbuddy::git::ProgressSink =
+            Arc::new(std::sync::Mutex::new(move |text: &str| {
+                if text == "Push: preparing upload…" {
+                    let server = git2::Repository::open_bare(&remote_path).unwrap();
+                    *slot.lock().unwrap() = Some(external_commit(&server));
+                }
+            }));
+        let error = repo
+            .execute_with_control(
+                Operation::PushTo(Arc::new(plan)),
+                gitbuddy::git::NetworkControl::new(Some(sink), Default::default()),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Push rejected"), "{error:#}");
+        assert!(raced.lock().unwrap().is_some());
+        assert_eq!(server.head().unwrap().target(), *raced.lock().unwrap());
     }
 }

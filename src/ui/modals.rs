@@ -49,6 +49,17 @@ impl GitBuddy {
             Modal::Branch => self.perform(Operation::CreateBranch(a), cx),
             Modal::Tag => self.perform(Operation::Tag(a), cx),
             Modal::Remote => self.perform(Operation::AddRemote(a, b), cx),
+            Modal::EditRemote(expected) => self.perform(
+                Operation::EditRemote {
+                    expected,
+                    url: a,
+                    push_url: if b.is_empty() { None } else { Some(b) },
+                },
+                cx,
+            ),
+            Modal::RenameRemote(expected) => {
+                self.perform(Operation::RenameRemote { expected, name: a }, cx)
+            }
             Modal::Stash => self.perform(Operation::Stash(a), cx),
             Modal::Identity => self.perform(Operation::SetIdentity(a, b), cx),
             Modal::Confirm(_, operation) => self.perform(operation, cx),
@@ -61,6 +72,12 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(
+            modal,
+            Modal::Remotes | Modal::PushSettings | Modal::Upstream(_)
+        ) {
+            return self.remote_modal(modal, cx);
+        }
         if matches!(
             modal,
             Modal::RebasePlan
@@ -138,6 +155,14 @@ impl GitBuddy {
                 Some("Remote URL"),
                 "Add remote",
             ),
+            Modal::EditRemote(_) => (
+                "Edit remote",
+                "Fetch URL",
+                Some("Push URL (blank uses fetch URL)"),
+                "Save",
+            ),
+            Modal::RenameRemote(_) => ("Rename remote", "New remote name", None, "Rename"),
+            Modal::Remotes | Modal::PushSettings | Modal::Upstream(_) => unreachable!(),
             Modal::Stash => (
                 "Stash changes",
                 "Description (optional; includes untracked files)",
@@ -230,7 +255,14 @@ impl GitBuddy {
         let is_compare = matches!(modal, Modal::Compare);
         match modal {
             Modal::Confirm(ref message, _) => {
-                card = card.child(div().text_sm().child(message.clone()));
+                card = card.child(
+                    div()
+                        .id("confirmation-message")
+                        .max_h(px(340.))
+                        .overflow_y_scroll()
+                        .text_sm()
+                        .child(message.clone()),
+                );
             }
             Modal::BranchActions(name, remote) => {
                 let compare = format!("refs/{}/{}", if remote { "remotes" } else { "heads" }, name);
@@ -243,8 +275,19 @@ impl GitBuddy {
                 let checkout = name.clone();
                 let merge = format!("refs/{}/{}", if remote { "remotes" } else { "heads" }, name);
                 let delete = name.clone();
-                card = card.child(div().text_color(rgb(ACCENT)).child(name));
+                card = card.child(div().text_color(rgb(ACCENT)).child(name.clone()));
                 if !remote {
+                    let upstream_branch = name.clone();
+                    card = card.child(
+                        self.button("branch-upstream", "Set / clear upstream…")
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.open_remote_page(
+                                    Modal::Upstream(upstream_branch.clone()),
+                                    w,
+                                    cx,
+                                )
+                            })),
+                    );
                     card = card.child(self.button("branch-switch", "Switch to branch").on_click(
                         cx.listener(move |this, _, _, cx| {
                             this.perform(Operation::Checkout(checkout.clone()), cx)
@@ -419,6 +462,15 @@ impl GitBuddy {
                         );
             }
             Modal::TagActions(name) => {
+                let push_tag = name.clone();
+                card = card.child(
+                    self.button("push-tag", "Push this tag…")
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.open_remote_page(Modal::PushSettings, w, cx);
+                            this.push_choice.tags = vec![push_tag.clone()];
+                            this.push_choice.branch = None;
+                        })),
+                );
                 let delete = name.clone();
                 card = card.child(name).child(
                     self.button("delete-tag", "Delete local tag…")

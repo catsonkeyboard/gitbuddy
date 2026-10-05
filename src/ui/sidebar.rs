@@ -74,6 +74,14 @@ impl GitBuddy {
                 .justify_between()
                 .child(section("REMOTES"))
                 .child(
+                    self.button("remote-manage", "…")
+                        .ghost()
+                        .tooltip("Manage remotes")
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.open_remote_page(Modal::Remotes, w, cx)
+                        })),
+                )
+                .child(
                     self.button("remote-add", "+")
                         .ghost()
                         .justify_start()
@@ -82,6 +90,19 @@ impl GitBuddy {
                         ),
                 ),
         );
+        for (i, remote) in self.snapshot.remotes.iter().enumerate() {
+            let name = remote.clone();
+            sidebar = sidebar.child(
+                self.sidebar_button(("remote-config", i), format!("▸  {name}"))
+                    .ghost()
+                    .text_color(rgb(ACCENT))
+                    .tooltip("Edit / rename / delete remote")
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        this.open_remote_page(Modal::Remotes, w, cx);
+                        this.active.notice = format!("Remote: {name}");
+                    })),
+            );
+        }
         for (i, branch) in self
             .snapshot
             .branches

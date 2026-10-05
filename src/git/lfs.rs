@@ -520,7 +520,7 @@ pub(super) fn upload_before_push(
     // Check reachable trees as well as HEAD: older commits can reference LFS
     // objects even after their files were removed from the current index.
     let mut walk = repo.revwalk()?;
-    walk.push_ref(source)?;
+    walk.push(repo.revparse_single(source)?.peel_to_commit()?.id())?;
     let mut found = false;
     let odb = repo.odb()?;
     let mut inspected = std::collections::HashSet::new();

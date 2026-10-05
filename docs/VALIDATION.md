@@ -2,6 +2,17 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-05 远程管理与推送选项
+
+- 通过 git2 / libgit2 添加远程 URL 编辑（Fetch / Push）、重命名 / 删除、设置 / 取消 upstream、选择推送 remote / 源分支 / 目标分支、force-with-lease、选定 / 全部标签推送。管理页和 Push 旁的 ▾ 提供入口；标签菜单直接打开只推该标签的选项。所有写入沿用按仓库独立任务队列。
+- Review 固定源对象 ID、remote 地址、Fetch refspec 和 lease 期望 ID；执行前检查源 / 配置是否变化，不隐式 Fetch 更新 lease。本地和远程同名 upstream 使用完整引用；目标名与 remote 名可含斜杠，特殊 Fetch refspec 按映射解析。
+- libgit2 local transport 缺少引用更新的旧 ID 校验：带 lease 的本地 bare 推送使用目标引用事务锁，在传输期间持锁并最终更新。普通本地 Push URL 单独配置时，使用明确的目标 URL 避免 local transport 写到 Fetch URL。标签在协商阶段显式拒绝替换，保留附注标签对象；多引用推送不宣称服务端原子提交。
+- 新增 `tests/remote_management.rs` 中 16 项集成回归，覆盖 URL 修改 / 清空 / 过期配置、重命名同步 upstream / 删除保护、本地及远程 upstream、同名引用、不同目标名、普通推送拒绝回退、匹配 / 过期 / 不存在 lease、并发写锁、取消释放锁、源 / endpoint / refspec 变化、Push URL、轻量 / 附注 / blob 标签及未选标签、已存在标签保护、重复推送、file URL 和无效选择。
+- 扩展现有本地 Basic-auth smart HTTP 回归（仓库级及 URL 级 fake helper）：通过协商回调成功执行 lease 回退，拒绝协商前已移动的远端；在协商后、上传前模拟另一客户端提交，确认 receive-pack 拒绝旧 ID 更新。客户端全部使用 libgit2，仅测试服务端启动系统 `git http-backend`。
+- 修复测试 HTTP 服务在 macOS 上接受连接后继承非阻塞模式导致的偶发 WouldBlock / EOF，明确对测试连接使用阻塞读取。全量 **178 项通过（147 集成 + 31 单元）**；格式检查、Clippy `-D warnings`、`git diff --check` 均通过，macOS 开发包重新构建成功。依赖 block 0.1.6 的既有未来兼容性提示仍存在。
+- 原生 GPUI 使用独立测试 bundle / 配置目录和 `examples/demo_remotes.rs` 创建的 `target/remote-ui-20261005`。通过界面把 main 推送到 backup 的 release/ui，设置 upstream 并推送两个标签；从磁盘核对 bare refs 和 branch.main 配置一致。远程重命名为 team/backup 后跟踪引用和 upstream 更新；upstream 管理页随后改为 origin/main。最新开发包的 lease 确认页显示源提交 6b1308a6、期望远端 00bfabcb；确认后 origin/main 更新为源提交，磁盘核对一致，正常退出。未操作用户的真实工作仓库或外部服务器。
+- 验证边界：真实外部 SSH / HTTPS 认证、真实 LFS 服务、Windows / Linux 原生界面未验收。lease 当前要求 Fetch / Push URL 一致，本地路径目标必须为 bare；特殊 refspec 要求唯一分支映射。选项对话框为临时状态，多引用推送可能部分成功；后续需要手工 Fetch 核对服务端结果。
+
 ## 2026-10-04 Rebase、Squash、Worktree、子模块与 LFS
 
 - 增加可编辑的线性 Rebase 计划：重排、Pick / Reword / Squash / Fixup / Drop、批量 Squash、独立说明编辑。通过 libgit2 重放提交，保留原作者；原分支完成后才移动，使用引用事务、原始 HEAD 校验和内部备份引用保护原历史。备份不显示为普通提交引用。

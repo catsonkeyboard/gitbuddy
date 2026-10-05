@@ -169,12 +169,27 @@ pub enum Operation {
     Fetch,
     Pull,
     Push,
+    PushTo(std::sync::Arc<PushPlan>),
     Stash(String),
     ApplyStash(String),
     DropStash(String),
     Tag(String),
     DeleteTag(String),
     AddRemote(String, String),
+    EditRemote {
+        expected: RemoteInfo,
+        url: String,
+        push_url: Option<String>,
+    },
+    RenameRemote {
+        expected: RemoteInfo,
+        name: String,
+    },
+    DeleteRemote(RemoteInfo),
+    SetUpstream {
+        branch: String,
+        upstream: Option<String>,
+    },
 }
 
 fn path_from_bytes(b: &[u8]) -> PathBuf {
@@ -240,6 +255,10 @@ pub type ProgressSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(&str) + Send>>
 mod network;
 pub use network::{CancellationToken, Cancelled, NetworkControl, is_cancelled};
 
+#[path = "git/remotes.rs"]
+mod remotes;
+pub use remotes::{PushPlan, PushSelection, RemoteInfo, RemoteState};
+
 #[path = "git/rebase.rs"]
 mod rebase;
 pub use rebase::{RebaseAction, RebasePreview, RebaseStatus, RebaseStep};
@@ -257,6 +276,7 @@ impl Operation {
             Self::Fetch
                 | Self::Pull
                 | Self::Push
+                | Self::PushTo(_)
                 | Self::AddSubmodule { .. }
                 | Self::UpdateSubmodules { .. }
                 | Self::LfsFetch(_)
@@ -268,6 +288,7 @@ impl Operation {
             Self::Fetch => "Fetch",
             Self::Pull => "Pull",
             Self::Push => "Push",
+            Self::PushTo(_) => "Push",
             Self::Rebase { .. } => "Rebase",
             Self::ContinueRebase => "Continue rebase",
             Self::AbortRebase => "Abort rebase",

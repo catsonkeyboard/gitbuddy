@@ -27,6 +27,10 @@ cargo run --locked -- ./target/demo-conflicts
 cargo run --locked --example demo_advanced
 cargo run --locked -- ./target/advanced-ui-20261004/project
 
+# 创建远程管理 / 推送选项演示仓库（两个独立本地 bare 远程）
+cargo run --locked --example demo_remotes
+cargo run --locked -- ./target/remote-ui-20261005/project
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -50,9 +54,9 @@ open dist/GitBuddy.app
 | 子模块 | 添加、初始化 / 更新、递归更新、同步 URL、暂存当前 gitlink、独立标签打开、脏工作区保护及网络取消 |
 | Git LFS | Track / Untrack、原生 SHA-256 对象缓存及指针暂存、本地对象展开、缺失对象提示、按 remote Fetch / Push、普通 Push 前上传 LFS 对象 |
 | 分支 | 创建并切换、本地切换、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
-| 远程 | 添加 remote、fetch/prune、pull --ff-only、按配置的上游分支 push（支持不同名分支）、首次推送到 origin 并设置 upstream、传输进度及取消、领先 / 落后计数 |
+| 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、pull --ff-only、快捷 push、传输进度及取消、领先 / 落后计数 |
 | Stash | 保存（包含未跟踪文件）、应用并保留、确认后删除 |
-| 标签 | 创建 HEAD 标签、删除本地标签 |
+| 标签 | 创建 HEAD 标签、删除本地标签、推送选定标签 / 全部标签（支持已有轻量与附注标签） |
 | 配置 | 设置仓库级作者姓名 / 邮箱，读取 Git 配置，并通过 SSH agent 或凭据助手认证 |
 
 快捷键：`⌘O` 打开仓库，`⌘R` 刷新，`⌘Enter` 提交，`⌘Q` 退出。其他平台使用对应的 Ctrl 修饰键。
@@ -65,6 +69,16 @@ open dist/GitBuddy.app
 
 ## 操作约定
 
+### 远程管理、upstream 与推送选项
+
+- **远程管理**：点击侧栏 REMOTES 的 **…** / 远程名称，或 **Repository → Manage remotes…**。可添加远程、编辑 Fetch URL 和单独的 Push URL、重命名、确认后删除。Push URL 留空表示使用 Fetch URL；删除移除本地配置和远程跟踪引用，保留本地分支及远程服务器内容。重命名同步标准跟踪引用和分支配置，特殊 refspec 无法自动重写时显示提示。
+- **Upstream**：点击本地分支，选择 **Set / clear upstream…**。支持已经 Fetch 的远程分支及本地分支，也可清除上游；本地与远程同名时按完整引用区分。修改上游不会切换分支或更新工作文件。
+- **选择推送目标**：工具栏 **Push** 保留当前分支的快捷推送；旁边 **▾** 或 **Repository → Push options / Tags…** 打开选项。选择 remote、任一本地源分支，填写远程目标分支名；可以推送到不同名或尚不存在的分支，并选择成功后设置 upstream。点击 **Review push…** 核对引用、提交 ID 和目标，确认后执行。
+- **Force-with-lease**：只对选定分支生效。以本地已获取的目标 tracking ref 为期望值，按该 remote 的 Fetch refspec 映射，不隐式 Fetch；Review 后固定期望 ID。目标在远端变化则拒绝覆盖；本地尚无 tracking ref 时仅允许创建远端不存在的目标。SSH / HTTP(S) 在 libgit2 推送协商阶段校验，再由服务端校验更新；本地 bare 远程锁定引用直到最终更新。为了避免拿错服务器的 tracking ID，Push URL 与 Fetch URL 不同时拒绝 lease。操作不修改本地源分支。
+- **标签推送**：标签菜单的 **Push this tag…** 直接进入只推标签模式；也可在推送选项选择多个标签 / Select all，单独推送或与分支一起推送。保留附注标签对象，已有不同目标的远端标签拒绝替换，即使分支勾选了 force-with-lease。多引用推送可能部分成功，错误会报告被拒绝引用，不能假定整批回滚。
+
+推送选项沿用各仓库独立后台任务和取消机制。确认前固定源对象、远程地址及 Fetch refspec；执行前若源引用或远程配置已改变，需重新打开操作。设置 upstream 的目标必须匹配唯一 Fetch refspec；特殊映射需先整理 Git 配置。选项对话框本身不作为会话草稿保存。
+
 ### 网络取消与仓库任务
 
 每个仓库一次执行一个后台 Git 任务，不同仓库可同时执行。操作期间可切换标签、打开／克隆其他仓库和关闭没有运行任务的标签；标签显示运行中及后台完成／错误标记，悬停可查看该仓库的状态。进度、结果、提交草稿和错误都归属发起操作的仓库，后台完成不会切换当前标签。运行任务的标签需等任务结束后才能关闭。
@@ -74,7 +88,7 @@ open dist/GitBuddy.app
 Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Cancelling…**，等 libgit2 确认停止后才解除该仓库的操作锁；网络连接、DNS 或凭据助手阻塞时，可能需要等当前调用返回或超时。取消是协作式停止，不会回滚已接收的对象或已经更新的远程跟踪引用。
 
 - **Fetch / Pull**：传输阶段可取消；Pull 按分支配置解析完整 remote 名（支持 `team/origin`）和上游引用，支持本地上游 `.`；远程跟踪引用缺失时先 Fetch。开始更新 HEAD、暂存区和工作区前进入 **Finishing…**，此后禁用取消并报告最终结果。
-- **Push**：可在连接／协商阶段取消；开始打包上传前进入 **Finishing…**，此后等待远端确认，不承诺撤销已发送的推送。
+- **Push**：可在连接／协商阶段取消；SSH / HTTP(S) 开始打包上传前进入 **Finishing…**，此后等待远端确认。本地带 lease 推送可取消对象传输，在更新锁定的目标引用前进入 **Finishing…**。不承诺撤销已经完成的推送。
 - **Clone**：先克隆到目标父目录内的临时目录，传输和临时工作区 checkout 可取消；最终安装前禁用取消。失败／取消清理本次创建的临时内容，不递归删除目标目录中的文件；目标必须不存在或为空，原有空目录在取消后保留。失败／取消标签提供 **Retry**，也可关闭后重新选择地址。
 
 ### 冲突处理
@@ -188,6 +202,8 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `src/session.rs`：带版本的会话格式、路径编码、原子保存与旧快照保护。
 - `src/ui/session.rs`：按仓库捕获 / 恢复界面状态、独立滚动句柄及退出保存。
 - `tests/git_workflows.rs`：真实 Git 仓库的集成测试。
+- `src/git/remotes.rs`、`src/ui/remotes.rs`：远程配置、完整引用 upstream、固定推送计划及管理面板。
+- `tests/remote_management.rs`：远程配置、推送目标、lease 并发保护与标签推送的 libgit2 隔离回归；`examples/demo_remotes.rs` 提供本地演示仓库。
 - `tests/p1_regressions.rs`、`tests/p2_regressions.rs`：审查问题的隔离仓库回归，P2 含本地 Basic-auth HTTP 服务验证凭据助手、Push 和子模块克隆；HTTP 夹具通过系统 Git 提供协议，客户端仍使用 libgit2。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。
 - `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。

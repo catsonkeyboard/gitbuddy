@@ -129,6 +129,18 @@ impl GitBuddy {
                             )
                             .separator()
                             .menu_with_icon_and_disabled(
+                                "Manage remotes…",
+                                IconName::Network,
+                                Box::new(OpenRemotes),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Push options / Tags…",
+                                IconName::ArrowUp,
+                                Box::new(OpenPushOptions),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
                                 "Commit identity…",
                                 IconName::User,
                                 Box::new(EditIdentity),
@@ -213,6 +225,14 @@ impl GitBuddy {
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.perform(Operation::Push, cx)),
                                 ),
+                        )
+                        .child(
+                            self.button("push-options", "▾")
+                                .ghost()
+                                .tooltip("Select push target / Force-with-lease / Tags")
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.open_remote_page(Modal::PushSettings, w, cx)
+                                })),
                         ),
                 )
                 .child(

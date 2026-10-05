@@ -3,8 +3,8 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{Local, TimeZone, Utc};
 use git2::{
     BranchType, Cred, CredentialType, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode,
-    FetchOptions, Oid, Patch, PushOptions, RemoteCallbacks, Repository as RawRepo, RepositoryState,
-    ResetType, Sort, StashFlags, Status, StatusOptions,
+    FetchOptions, Oid, Patch, RemoteCallbacks, Repository as RawRepo, RepositoryState, ResetType,
+    Sort, StashFlags, Status, StatusOptions,
     build::{CheckoutBuilder, RepoBuilder},
 };
 use std::{
@@ -1048,65 +1048,8 @@ impl Repository {
                     control.phase("Pull: applying fast-forward…");
                     merge_target(&repo, target, &upstream_name, true)
                 }
-                Operation::Push => {
-                    let head = repo.head()?;
-                    ensure!(head.is_branch(), "请先切换到本地分支再推送");
-                    let source = head.name()?.to_string();
-                    let name = head.shorthand().context("当前不在分支上")?.to_string();
-                    // Read configuration directly: a tracking ref may be absent,
-                    // and neither the remote nor its branch can be inferred by splitting '/'.
-                    let (remote_name, target, set_upstream) = match (
-                        repo.branch_upstream_remote(&source),
-                        repo.branch_upstream_merge(&source),
-                    ) {
-                        (Ok(remote), Ok(target)) => (
-                            remote.as_str().context("远程名称编码无效")?.to_string(),
-                            target.as_str().context("上游分支编码无效")?.to_string(),
-                            false,
-                        ),
-                        (Err(remote), Err(target))
-                            if remote.code() == ErrorCode::NotFound
-                                && target.code() == ErrorCode::NotFound =>
-                        {
-                            ("origin".into(), source.clone(), true)
-                        }
-                        (Err(error), _) | (_, Err(error)) => {
-                            return Err(error).context(
-                                "上游配置不完整或无法读取，请检查分支的 remote 和 merge 配置",
-                            );
-                        }
-                    };
-                    ensure!(
-                        target.starts_with("refs/heads/")
-                            && git2::Reference::is_valid_name(&target),
-                        "上游目标不是有效的分支引用"
-                    );
-                    let mut remote = repo.find_remote(&remote_name)?;
-                    super::lfs::upload_before_push(&repo, &remote_name, &source, &control)?;
-                    let mut callbacks =
-                        network_callbacks(control.clone(), repo.config()?.snapshot()?);
-                    let push_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-                    let error_slot = push_error.clone();
-                    callbacks.push_update_reference(move |_, status| {
-                        if let Some(status) = status {
-                            *error_slot.lock().unwrap() = Some(status.to_string());
-                        }
-                        Ok(())
-                    });
-                    let mut options = PushOptions::new();
-                    options.remote_callbacks(callbacks);
-                    remote.push(&[format!("{source}:{target}")], Some(&mut options))?;
-                    // Up-to-date pushes may skip negotiation entirely.
-                    control.cancellation.finish()?;
-                    if let Some(error) = push_error.lock().unwrap().take() {
-                        bail!("Push rejected: {error}");
-                    }
-                    if set_upstream {
-                        let mut local = repo.find_branch(&name, BranchType::Local)?;
-                        local.set_upstream(Some(&format!("{remote_name}/{name}")))?;
-                    }
-                    Ok("Push completed".into())
-                }
+                Operation::Push => self.default_push(control.clone()),
+                Operation::PushTo(plan) => self.push_plan(&plan, control.clone()),
                 Operation::Stash(message) => {
                     for file in file_changes(&repo)? {
                         ensure!(
@@ -1155,6 +1098,16 @@ impl Repository {
                     );
                     repo.remote(&name, &url)?;
                     Ok(format!("Added remote {name}"))
+                }
+                Operation::EditRemote {
+                    expected,
+                    url,
+                    push_url,
+                } => self.edit_remote(&expected, &url, push_url.as_deref()),
+                Operation::RenameRemote { expected, name } => self.rename_remote(&expected, &name),
+                Operation::DeleteRemote(expected) => self.delete_remote(&expected),
+                Operation::SetUpstream { branch, upstream } => {
+                    self.set_upstream(&branch, upstream.as_deref())
                 }
             }
         })();
