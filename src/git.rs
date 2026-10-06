@@ -250,6 +250,9 @@ mod libgit;
 #[path = "git/partial.rs"]
 mod partial;
 pub use partial::{FilePatch, PartialPatch, PatchSelection};
+#[path = "git/diff_view.rs"]
+mod diff_view;
+pub use diff_view::{DiffDisplay, DiffPreferences, SplitRow, word_changes};
 #[path = "git/recovery.rs"]
 mod recovery;
 pub use recovery::{CommitEdit, HeadState, ReflogEntry, ReflogPage, ReflogTarget};
@@ -261,12 +264,18 @@ mod inspect;
 pub use inspect::{
     BlameLine, BlameView, Comparison, FileHistory, FileHistoryEntry, Revision, TreeFiles,
 };
+#[path = "git/conflict_blocks.rs"]
+mod conflict_blocks;
 #[path = "git/conflicts.rs"]
 mod conflicts;
+pub use conflict_blocks::{BlockChoice, ConflictBlock, choose_conflict_block, conflict_blocks};
+#[path = "git/merge_tool.rs"]
+mod merge_tool;
 pub use conflicts::{
     ConflictContext, ConflictFile, ConflictOperation, ConflictResolution, ConflictSession,
     ConflictSide, has_conflict_markers,
 };
+pub use merge_tool::MergeTool;
 
 /// Shared progress sink shown in the status bar during network operations.
 /// `Arc<Mutex<...>>` because libgit2 callbacks fire from worker threads.
@@ -330,11 +339,14 @@ pub struct DiffLine {
     pub kind: char,
 }
 pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
+    diff_lines_with_limit(diff, DIFF_LIMIT_LINES)
+}
+pub(super) fn diff_lines_with_limit(diff: &str, limit: usize) -> Vec<DiffLine> {
     let mut old = 0usize;
     let mut new = 0usize;
     let mut in_hunk = false;
     diff.lines()
-        .take(20_000)
+        .take(limit)
         .map(|line| {
             let mut a = String::new();
             let mut b = String::new();

@@ -225,6 +225,69 @@ impl GitBuddy {
             cx,
         );
     }
+    pub(super) fn dispatch_merge_tool(&mut self, tool: git::MergeTool, cx: &mut Context<Self>) {
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        let Some(path) = self.active.conflicts.selected.clone() else {
+            return;
+        };
+        let Some(draft) = self.active.conflicts.drafts.get(&path) else {
+            return;
+        };
+        let context = draft.context.clone();
+        let revision = draft.revision;
+        let text = draft.text.clone();
+        let Some(ticket) = self
+            .tasks
+            .start(self.active.id, "External merge tool", true)
+        else {
+            return;
+        };
+        let running = self.tasks.get(ticket.tab).unwrap();
+        let cancellation = running.cancellation.clone().unwrap();
+        let completion = CompletionGuard(running.completion.clone());
+        self.active.notice =
+            "External merge tool running · finish and close the tool to review its result".into();
+        self.active.error = false;
+        let expected = context.clone();
+        let task = cx.background_executor().spawn(async move {
+            let _completion = completion;
+            repo.run_merge_tool(
+                &context,
+                &text,
+                &tool,
+                git::NetworkControl::new(None, cancellation),
+            )
+        });
+        cx.spawn(async move|this,cx| {
+            let result=task.await;
+            let _=this.update(cx,|this,cx| {
+                let cancelled=this.tasks.get(ticket.tab).and_then(|t|t.cancellation.as_ref()).is_some_and(|c|c.is_requested());
+                if !this.tasks.finish(ticket) {return;}
+                let active=this.active.id==ticket.tab;
+                let mut imported=false;
+                if let Some(tab)=this.tab_mut(ticket.tab) {
+                    tab.task_finished = !active;
+                    match result {
+                        _ if cancelled=>{tab.error=false;tab.notice="External merge tool cancelled; draft and repository unchanged".into();},
+                        Ok(text)=>{
+                            imported=tab.conflicts.drafts.get_mut(&path).is_some_and(|draft|draft.import_tool_result(&expected,revision,text));
+                            tab.error = !imported;
+                            tab.notice=if imported {"External result imported into draft. Review it, then Save & mark resolved."}else{"Conflict draft changed while the tool was open; its result was not imported."}.into();
+                        },
+                        Err(error)=>{tab.error = !git::is_cancelled(&error);tab.notice=format!("{error:#}");},
+                    }
+                }
+                if active && imported && this.active.conflicts.selected.as_ref()==Some(&path) {
+                    this.restore_conflict_editor();
+                }
+                if this.tasks.closing && this.tasks.running.is_empty() {this.flush_session(cx);cx.quit();}
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
     pub(super) fn dispatch(
         &mut self,
         label: &str,

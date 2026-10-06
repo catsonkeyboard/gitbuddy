@@ -121,12 +121,24 @@ pub(super) fn head_tree(repo: &RawRepo) -> Result<Option<git2::Tree<'_>>> {
     }
 }
 
-pub(super) fn diff_for(repo: &RawRepo, staged: bool) -> Result<Diff<'_>> {
+pub(super) fn diff_for_context<'a>(
+    repo: &'a RawRepo,
+    staged: bool,
+    full: bool,
+    paths: &[&Path],
+) -> Result<Diff<'a>> {
     let mut opts = DiffOptions::new();
+    opts.context_lines(if full { u32::MAX } else { 3 });
     opts.include_typechange(true)
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
+    if full {
+        opts.disable_pathspec_match(true);
+        for path in paths {
+            opts.pathspec(*path);
+        }
+    }
     let index = repo.index()?;
     if staged {
         Ok(repo.diff_tree_to_index(head_tree(repo)?.as_ref(), Some(&index), Some(&mut opts))?)
@@ -643,6 +655,9 @@ impl Repository {
         })
     }
     pub fn diff(&self, file: &FileChange, staged: bool) -> Result<String> {
+        self.diff_context(file, staged, false)
+    }
+    pub fn diff_context(&self, file: &FileChange, staged: bool, full: bool) -> Result<String> {
         if file.index == '?' && !staged {
             let path = self.root.join(&file.path);
             let meta = fs::symlink_metadata(&path)?;
@@ -666,12 +681,40 @@ impl Repository {
             ));
         }
         let repo = raw(self)?;
-        let mut diff = diff_for(&repo, staged)?;
-        diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
         let mut paths = vec![file.path.clone()];
         if let Some(old) = &file.original {
             paths.push(old.clone());
         }
+        if full {
+            let index = repo.index()?;
+            for path in &paths {
+                if let Some(entry) = index.get_path(path, 0)
+                    && entry.mode != 0o160000
+                {
+                    super::diff_view::check_full_blob(&repo, entry.id)?;
+                }
+                if !staged && let Ok(meta) = fs::symlink_metadata(self.root.join(path)) {
+                    ensure!(
+                        meta.len() <= super::diff_view::FULL_DIFF_BYTES as u64,
+                        "Full context exceeds the safety limit (16 MB per file). Use compact context or an external editor."
+                    );
+                }
+            }
+            if staged {
+                super::diff_view::check_full_tree(
+                    &repo,
+                    head_tree(&repo)?.as_ref(),
+                    &paths.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+                )?;
+            }
+        }
+        let mut diff = diff_for_context(
+            &repo,
+            staged,
+            full,
+            &paths.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+        )?;
+        diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
         patch_text(&diff, Some(&paths))
     }
     pub fn show(&self, id: &str) -> Result<String> {
@@ -743,6 +786,14 @@ impl Repository {
         })
     }
     pub fn commit_file_diff(&self, id: &str, file: &CommitFile) -> Result<String> {
+        self.commit_file_diff_context(id, file, false)
+    }
+    pub fn commit_file_diff_context(
+        &self,
+        id: &str,
+        file: &CommitFile,
+        full: bool,
+    ) -> Result<String> {
         let repo = raw(self)?;
         let commit = repo.find_commit(oid(id)?)?;
         let old = if commit.parent_count() > 0 {
@@ -751,7 +802,18 @@ impl Repository {
             None
         };
         let new = commit.tree()?;
-        let diff = super::inspect::tree_diff(&repo, old.as_ref(), &new)?;
+        if full {
+            let mut paths = vec![file.path.as_path()];
+            if let Some(old) = &file.original {
+                paths.push(old);
+            }
+            super::diff_view::check_full_tree(&repo, old.as_ref(), &paths)?;
+            super::diff_view::check_full_tree(&repo, Some(&new), &paths)?;
+        }
+        let paths = std::iter::once(file.path.as_path())
+            .chain(file.original.as_deref())
+            .collect::<Vec<_>>();
+        let diff = super::inspect::tree_diff_context(&repo, old.as_ref(), &new, full, &paths)?;
         super::inspect::single_file_patch(&diff, file)
     }
 

@@ -154,6 +154,7 @@ impl RepoTab {
             history_limit: self.limit,
             show_commit_body: self.show_commit_body,
             expanded,
+            diff_preferences: self.diff_preferences,
             lines,
             scroll: self.scroll.capture(),
             conflict_file: self.conflicts.selected.clone(),
@@ -192,6 +193,7 @@ impl RepoTab {
         self.history_tab = saved.history_tab.min(1);
         self.limit = saved.history_limit.max(HISTORY_PAGE_SIZE);
         self.show_commit_body = saved.show_commit_body;
+        self.diff_preferences = saved.diff_preferences;
         self.expanded.extend(saved.expanded);
         self.restored_lines = saved
             .lines

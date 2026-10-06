@@ -2,6 +2,19 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-06 并排 Diff、词级高亮、完整上下文与冲突块 / 外部工具
+
+本节使用 Rust 1.98.1；其余环境同上，较早记录的 Rust 版本保持原验收值。
+
+- 工作区、暂存区、提交 / 文件历史和两版本比较共用统一 / 并排 Diff、词级高亮、3 行 / 完整上下文。并排列使用相同虚拟列表滚动句柄，左右行映射保留原始补丁索引，继续支持 hunk / 行暂存及取消暂存。词级比较在后台计算，限制单行及整份补丁的计算量；窗口布局只绘制可见行。完整上下文仅生成所选文件的字面路径（含重命名前后路径），超过 100,000 补丁行 / 16 MB 明确报错，不静默截断。各仓库的显示选项、行选择和滚动随会话恢复。
+- 冲突结果新增逐块 Ours / Theirs / Both，Both 按 ours、theirs 顺序拼接；替换保留其余冲突、无冲突编辑和原始换行。支持 diff3 / CRLF / 不同标记长度；不完整、嵌套或过期草稿拒绝块操作。块选择只更新草稿，所有标记清除后才允许 Save & mark resolved。
+- 外部工具配置为可执行路径 + JSON 参数数组，提供 VS Code / KDiff3 预设；BASE / LOCAL / REMOTE / MERGED 均为临时副本，MERGED 初始化为当前草稿。直接启动进程，不执行 Bash 或 Git 的 mergetool.cmd。退出后校验仓库身份、HEAD / 操作状态、冲突 index 和工作文件，再导入发起标签的草稿；草稿版本变化拒绝覆盖。可取消 Unix 子进程组，不直接暂存或提交；失败 / 仓库变化保留输出路径用于恢复。拒绝二进制、非 UTF-8、超过 2 MB 或符号链接输出。
+- 新增 `tests/diff_conflict_tools.rs` **15 项**隔离回归：Unicode 词级范围 / 长行降级、并排 canonical 行映射、25,000 行 CRLF 的按行暂存 / 取消暂存、历史 / 比较完整上下文及超限、包含 glob 字符的重命名路径、超大输入提前拒绝、diff3 / 多块 / 换行保留、错误标记 / 同长过期文本、外部工具四方参数及仅返回草稿、失败恢复 / 无效执行程序、运行期间外部文件变化、取消进程组、跨仓库 / 不可读版本保护、无效 / 超大 / 符号链接输出。新增 2 项单元测试覆盖工具配置不被最近仓库保存覆盖、工具结果不覆盖重新加载的冲突上下文或更新后的草稿；扩展会话存储重启测试覆盖 Diff 选项。
+- 全量 `cargo test --locked --no-fail-fast --quiet` **212 项通过（176 集成 + 36 单元）**；Clippy `--all-targets -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。`python3 scripts/bundle_macos.py --debug` 重建 `dist/GitBuddy.app` 成功。既有 block 0.1.6 未来兼容性提示仍存在。
+- 原生 GPUI 使用 `examples/demo_diff.rs` 创建的 `target/diff-ui-20261006`，独立测试 bundle ID 与配置目录。验收统一 / 并排、词级增删 token 高亮、完整文件上下文、左右垂直滚动和可拖动的同步横向滚动；在右列选择新增行并 Stage selected，磁盘核对只暂存 1 行新增、工作文件保持。正常退出 / 重启后并排 / Full context 保留，随后横纵偏移 `x=-107`、`y=-491.4286` 恢复，左右列内容一致。
+- 原生冲突夹具含两块及干净的传入编辑：第一块 Both 后正常退出 / 重启，未保存的双方内容恢复、第二块仍可选择。模拟外部工具追加草稿内容，运行期间切到另一个仓库查看 Diff，完成后结果归属原冲突标签；第二块选择 Theirs，再 Save & mark resolved。磁盘核对 `setting_5=local` / `remote` 均保留、`setting_35=remote`、`setting_48=remote-clean-edit`、工具追加内容保留，索引已无未解决项。未向真实远程推送或修改真实仓库历史。
+- 验证边界：真实 VS Code / KDiff3 应用交互未验收，预设参数按官方 CLI 文档核对；工具必须等待编辑完成后退出。集成入口限常规 UTF-8 文本，二进制 / rename / symlink / submodule 冲突仍需在客户端外处理。Windows / Linux 原生界面、真实大仓库压力和断电未验收；普通 Git 操作仍使用 git2 / libgit2。
+
 ## 2026-10-05 历史操作、多选、旧提交编辑与拆分
 
 - 新增任意提交创建分支（不切换 checkout）、固定提交与 HEAD / 指纹校验的 Soft / Mixed / Hard Reset。按已选模式明确展示 index / worktree 影响，再确认；原提交留在 `refs/gitbuddy/rewrites/reset-*`、ORIG_HEAD 与 Reflog，未提交的编辑不进入备份。Reset 期间持有 HEAD / 分支引用锁，拒绝跨仓库、过期 HEAD / 内容以及进行中的仓库操作。

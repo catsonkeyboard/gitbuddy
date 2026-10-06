@@ -11,10 +11,12 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config/gitbuddy")
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default, with = "crate::session::paths_encoding")]
     pub recent: Vec<PathBuf>,
+    #[serde(default)]
+    pub merge_tool: crate::git::MergeTool,
 }
 impl Settings {
     fn path() -> PathBuf {
@@ -53,15 +55,26 @@ impl Settings {
     pub fn remember(&mut self, path: PathBuf) -> anyhow::Result<()> {
         self.remember_at(path, &Self::path())
     }
+    pub fn set_merge_tool(&mut self, tool: crate::git::MergeTool) -> anyhow::Result<()> {
+        tool.validate()?;
+        let mut next = self.clone();
+        next.merge_tool = tool;
+        next.save_at(&Self::path())?;
+        *self = next;
+        Ok(())
+    }
     fn remember_at(&mut self, path: PathBuf, file: &std::path::Path) -> anyhow::Result<()> {
-        use std::io::Write;
-        let mut next = Self {
-            recent: self.recent.clone(),
-        };
+        let mut next = self.clone();
         next.recent.retain(|p| p != &path);
         next.recent.insert(0, path);
         next.recent.truncate(12);
-        let bytes = serde_json::to_vec_pretty(&next)?;
+        next.save_at(file)?;
+        *self = next;
+        Ok(())
+    }
+    fn save_at(&self, file: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let bytes = serde_json::to_vec_pretty(self)?;
         let parent = file
             .parent()
             .ok_or_else(|| anyhow::anyhow!("Missing settings parent"))?;
@@ -70,7 +83,6 @@ impl Settings {
         temp.write_all(&bytes)?;
         temp.as_file().sync_all()?;
         temp.persist(file)?;
-        *self = next;
         Ok(())
     }
 }
@@ -78,6 +90,28 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn merge_tool_survives_recent_repository_updates_and_old_settings_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let tool = crate::git::MergeTool {
+            program: "/tmp/tool with spaces".into(),
+            args: vec!["$LOCAL".into(), "$MERGED".into()],
+        };
+        let mut settings = Settings {
+            merge_tool: tool.clone(),
+            ..Settings::default()
+        };
+        settings.remember_at("/repo".into(), &path).unwrap();
+        let restored: Settings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(restored.merge_tool, tool);
+        assert_eq!(
+            serde_json::from_str::<Settings>(r#"{"recent":[]}"#)
+                .unwrap()
+                .merge_tool,
+            crate::git::MergeTool::default()
+        );
+    }
     #[test]
     fn legacy_recent_strings_remain_readable_and_order_is_preserved() {
         let mut settings: Settings =

@@ -27,6 +27,11 @@ fn state() -> Session {
                 query: "author".into(),
                 expanded: vec![PatchKey::Commit("abc123".into(), "src/main.rs".into())],
                 show_commit_body: true,
+                diff_preferences: gitbuddy::git::DiffPreferences {
+                    side_by_side: true,
+                    word_highlight: false,
+                    full_context: true,
+                },
                 history_limit: 900,
                 scroll: BTreeMap::from([
                     ("commit-list".into(), Offset { x: 0., y: -825. }),

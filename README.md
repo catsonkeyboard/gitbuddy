@@ -35,6 +35,10 @@ cargo run --locked -- ./target/remote-ui-20261005/project
 cargo run --locked --example demo_history
 cargo run --locked -- ./target/history-ui-20261005/project
 
+# 创建并排 Diff / 多冲突块夹具及独立会话配置（全部使用 libgit2）
+cargo run --locked --example demo_diff
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-diff/config" cargo run --locked
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -46,8 +50,8 @@ open dist/GitBuddy.app
 | --- | --- |
 | 仓库 | 打开、初始化、克隆、多仓库标签、完整会话恢复、按仓库独立后台任务、最近仓库、每 10 秒刷新、手动刷新 |
 | 工作区 | 已暂存 / 未暂存状态、按文件 / hunk / 选中行暂存与取消暂存、全部暂存 / 取消暂存、重命名、删除、冲突识别 |
-| 冲突处理 | 按文件查看 Ours / Base / Theirs、编辑合并结果、选择完整版本或删除、保存并标记解决、继续 / 中止 merge、cherry-pick、revert 和 GitBuddy Rebase |
-| 差异 | 工作区、暂存区、历史提交按文件折叠；点击文件才加载该文件的统一 diff；红绿增删行、双侧行号、虚拟滚动；二进制和大文件提示 |
+| 冲突处理 | 按文件查看 Ours / Base / Theirs、逐块选择 Ours / Theirs / Both、编辑结果、外部合并工具及取消、选择完整版本或删除、保存并标记解决、继续 / 中止 merge、cherry-pick、revert 和 GitBuddy Rebase |
+| 差异 | 工作区、暂存区、历史和比较按文件折叠 / 延迟加载；统一 / 并排 Diff、词级高亮、3 行 / 完整上下文、行号、同步滚动与虚拟列表；二进制和大文件提示 |
 | 提交 | 多行提交说明、提交已暂存文件、Amend、撤销最近一次提交、复制提交 ID、revert、cherry-pick 及继续 / 中止 |
 | 历史 | 所有分支的提交与分支图、搜索 / 分页；多选提交、批量改写计划、任意提交创建分支、Soft / Mixed / Hard Reset |
 | 文件追踪 | 指定版本的文件列表、跟随重命名的文件历史、按提交展开文件 diff、逐行 Blame 与提交详情跳转 |
@@ -72,6 +76,12 @@ open dist/GitBuddy.app
 新增行与删除行独立选择：若要暂存一次完整替换，请同时选中对应的红、绿行。部分操作只更新暂存区，不改写工作区，保留其他文件与未选中行；操作完成后刷新 diff。外部编辑、HEAD 或暂存区变化导致 diff 过期时会拒绝执行，需重新选择。普通的新建、删除文件也支持部分操作；文件权限变化、重命名、二进制、符号链接、子模块、冲突及截断预览应使用整文件操作。
 
 ## 操作约定
+
+### Diff 显示
+
+展开文件后，点击 **Unified / Side by side** 切换统一 / 并排视图，**Word highlight** 切换词级高亮，**Context: 3 lines / Full context** 切换上下文。并排视图左侧为旧版本 / index 基准，右侧为新版本；两侧同步滚动，长行可通过底部滚动条浏览。工作区、暂存区、提交历史和两版本比较使用相同显示选项，各仓库独立保存并在重启后恢复。
+
+并排显示仍支持 hunk / 行暂存和取消暂存，左右变更行分别对应原始补丁中的删除 / 新增行。切换布局或词级高亮保留选择；切换上下文会重新加载补丁并清空行选择。完整上下文显示整个文件，超过 100,000 补丁行或 16 MB 时明确提示，需切回紧凑上下文。词级比较在后台预计算；长行和计算量过大的补丁退回整行高亮。
 
 ### 远程管理、upstream 与推送选项
 
@@ -101,11 +111,17 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 **Save & mark resolved** 同时写入工作文件和暂存区，并移除该文件的索引冲突；删除需要确认，其他文件的已暂存内容保留。残留的冲突标记会阻止手工结果和工作文件保存，冲突未全部解决时禁用批量暂存 / 取消暂存。文本草稿随文件和仓库标签保存到会话，重启后继续编辑。若冲突内容或操作状态已变化，保留草稿文本供复核，完整版本选择需重新确认。
 
+结果编辑区上方列出剩余冲突块。每个块可独立选择 **Ours / Theirs / Both**；Both 按 ours、theirs 顺序保留两侧内容，仅替换该块，保留其他块和无冲突编辑。支持标准 / diff3 标记、不同标记长度和 CRLF。选择后仍为未保存草稿；处理完所有块后复核结果，再保存并标记解决。手工编辑产生不完整或嵌套标记时，先修正文本或重新加载文件。
+
+**External tool…** 配置可执行文件和 JSON 参数数组，提供 VS Code / KDiff3 预设。参数中独立的 `$BASE`、`$LOCAL`、`$REMOTE`、`$MERGED` 分别替换为临时祖先、ours、theirs 和当前结果草稿文件，必须包含 `$MERGED`；可指定已安装工具的绝对路径。工具应等待编辑完成后才退出（VS Code 预设包含 `--wait`）。参数规则参见 [VS Code CLI](https://code.visualstudio.com/docs/configure/command-line) 和 [KDiff3 文档](https://docs.kde.org/trunk_kf6/en/kdiff3/kdiff3/documentation.html)。
+
+外部工具通过进程参数直接启动，不执行 shell 或仓库中的 `mergetool.cmd`。它编辑临时副本，退出后仅导入 UTF-8 文本草稿；不会自动写工作文件、暂存或提交。运行时可切换仓库，状态栏 **Cancel** 停止工具及 Unix 子进程组。失败或工作文件 / index / HEAD / 操作状态发生变化时拒绝导入，并显示保留结果的恢复路径；草稿在工具运行期间变化时也拒绝覆盖。结果仍需单独审查和保存。
+
 外部修改工作文件、冲突索引、HEAD 或操作状态后，过期的保存请求会拒绝执行。**Refresh list** 刷新文件列表，**Reload file** 重新读取三方内容和工作文件；重新加载保留手工文本草稿供复核，完整版本选择则需要重新选择。也可以使用外部编辑器修改文件，再重新加载并选 **Use working file**。
 
 全部解决后可先 **Review working tree** 查看暂存内容，再 **Continue Merge / Cherry-pick / Revert…**。继续操作使用全部已暂存内容和操作原有提交说明，merge 保留两个父提交，cherry-pick 保留原作者；确认后再次校验暂存区和 HEAD。**Abort…** 会恢复 tracked 文件到 HEAD，丢弃操作期间保存的解决结果及其他 tracked 编辑。
 
-内置结果编辑仅支持不超过 2 MB 的 UTF-8 常规文本，三方预览最多显示 20,000 行。二进制、非 UTF-8 和大文件可选择完整版本或使用外部编辑后的工作文件，按原始字节保存。重命名、符号链接和子模块冲突需使用外部工具。GitBuddy 发起的 Rebase 可在内置界面继续 / 中止；外部工具发起的 Rebase 仍需由原工具继续 / 中止。暂不提供按冲突块自动合并或同步三方滚动。
+内置结果编辑和集成外部工具仅支持不超过 2 MB 的 UTF-8 常规文本；外部工具要求每个存在的三方版本都可读取为文本，三方预览最多显示 20,000 行。二进制、非 UTF-8 和大文件可选择完整版本或使用独立外部编辑器修改后的工作文件，按原始字节保存。重命名、符号链接和子模块冲突需在客户端外处理。GitBuddy 发起的 Rebase 可在内置界面继续 / 中止；外部工具发起的 Rebase 仍需由原工具继续 / 中止。暂不提供三方同步滚动。
 
 ### 文件历史、Blame 与版本比较
 
@@ -193,7 +209,7 @@ cargo test --locked
 
 Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根提交重写或保留合并提交。LFS 当前支持默认对象目录和标准 SHA-256 指针，不支持扩展指针、自定义 `lfs.storage` 或历史迁移。提交图依据已加载提交的父子关系绘制；图宽按所有 lane 及连线端点计算，多分支时保留文字区域并支持横向滚动。搜索过滤或分页边界外的提交不会显示连线，内部历史备份引用不作为普通分支显示。`libgit2` 创建提交时不会执行用户的 Git hooks 或自动进行 GPG 签名。
 
-差异预览最多 20,000 行，未跟踪文件超过 2 MB 不加载正文。网络传输进度每 100ms 节流，阶段切换即时显示；取消边界见上文。真实外部服务器认证尚未验收。当前在 macOS 验证，Windows/Linux 尚未验收。生成的 .app 用于本地运行，未做发行签名或公证。
+紧凑差异预览最多 20,000 行，完整上下文最多 100,000 补丁行 / 16 MB；未跟踪文件超过 2 MB 不加载正文。网络传输进度每 100ms 节流，阶段切换即时显示；取消边界见上文。真实外部服务器认证尚未验收。当前在 macOS 验证，Windows/Linux 尚未验收。生成的 .app 用于本地运行，未做发行签名或公证。
 
 ## 代码结构
 
@@ -201,10 +217,12 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `src/git/libgit.rs`：基于 `git2` / `libgit2` 的仓库快照（含变化指纹）、差异、Git 操作与网络进度回调。
 - `src/git/network.rs`：线程安全取消令牌、取消／最终写入阶段互斥、进度节流与取消结果。
 - `src/git/partial.rs`：结构化 hunk / 行选择、过期校验与暂存区内容重建，保留原始字节及换行。
+- `src/git/diff_view.rs`：并排行映射、词级高亮预计算与完整上下文限制。
 - `src/git/recovery.rs`：Amend、保留暂存区的提交撤销、HEAD Reflog 与恢复；使用引用锁和快照校验防止操作落到已切换的分支。
 - `src/git/history.rs`、`src/ui/history_actions.rs`：明确 Reset 模式、任意提交建分支、多选历史和旧提交改写入口。
 - `src/git/inspect.rs`：固定版本的文件浏览、跨父提交跟随重命名的历史、Blame、两棵树比较与精确文件 patch。
 - `src/git/conflicts.rs`：索引三方内容、结果保存、引用 / 索引锁和过期校验、继续冲突操作。
+- `src/git/conflict_blocks.rs`、`src/git/merge_tool.rs`：逐块选择、直接参数启动外部工具、临时结果与取消 / 过期保护。
 - `src/git/rebase.rs`：基于 libgit2 的可编辑提交序列、引用事务、持久化进度、冲突继续与中止。
 - `src/git/workspaces.rs`：Worktree 与子模块管理、跨工作树分支占用检查。
 - `src/git/lfs.rs`：原生指针暂存 / 本地展开、对象校验，以及可取消的官方 git-lfs 传输进程。
@@ -217,7 +235,7 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `src/ui/inspect.rs`：文件选择器、文件历史、Blame 虚拟列表和版本比较页面，后台加载及过期结果隔离。
 - `src/ui/conflicts.rs`：三方预览、独立文件草稿、结果编辑、删除确认与继续 / 中止入口。
 - `src/ui/management.rs`：Rebase 计划编辑与进度、Worktree / 子模块 / LFS 管理对话框。
-- `src/settings.rs`：最近仓库记录（损坏时备份为 `.json.broken` 并重建）。
+- `src/settings.rs`：最近仓库和外部合并工具配置（损坏时备份为 `.json.broken` 并重建）。
 - `src/session.rs`：带版本的会话格式、路径编码、原子保存与旧快照保护。
 - `src/ui/session.rs`：按仓库捕获 / 恢复界面状态、独立滚动句柄及退出保存。
 - `tests/git_workflows.rs`：真实 Git 仓库的集成测试。
@@ -229,6 +247,7 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `tests/history_operations.rs`、`examples/demo_history.rs`：Reset 模式与过期保护、编辑 / hunk 拆分 / 重启继续、LFS 和冲突恢复回归及演示仓库。
 - `tests/repository_inspection.rs`：文件历史 / Blame / 比较的隔离仓库测试，包含合并、重命名后旧名复用、删除后重建、特殊路径和版本固定。
 - `tests/conflict_resolution.rs`：三方版本、删除 / 二进制 / 可执行文件、过期请求、索引锁、多文件独立解决和继续操作的 libgit2 隔离仓库测试。
+- `tests/diff_conflict_tools.rs`、`examples/demo_diff.rs`：完整上下文 / 部分暂存、词级高亮、块选择、外部工具保护的隔离回归与多仓库演示。
 - `tests/advanced_git.rs`：提交重写、跨工作树保护、子模块及 LFS 指针 / 缓存 / Stash 的隔离仓库回归测试。
 - `examples/demo_repo.rs`：可重复生成的隔离演示仓库。
 - `examples/demo_conflicts.rs`：包含文本、二进制、修改 / 删除冲突的隔离演示仓库。

@@ -112,8 +112,24 @@ pub(super) fn tree_diff<'a>(
     old: Option<&Tree<'a>>,
     new: &Tree<'a>,
 ) -> Result<Diff<'a>> {
+    tree_diff_context(repo, old, new, false, &[])
+}
+pub(super) fn tree_diff_context<'a>(
+    repo: &'a git2::Repository,
+    old: Option<&Tree<'a>>,
+    new: &Tree<'a>,
+    full: bool,
+    paths: &[&Path],
+) -> Result<Diff<'a>> {
     let mut options = DiffOptions::new();
+    options.context_lines(if full { u32::MAX } else { 3 });
     options.include_typechange(true);
+    if full {
+        options.disable_pathspec_match(true);
+        for path in paths {
+            options.pathspec(*path);
+        }
+    }
     let mut diff = repo.diff_tree_to_tree(old, Some(new), Some(&mut options))?;
     diff.find_similar(Some(
         DiffFindOptions::new()
@@ -224,10 +240,32 @@ impl Repository {
         comparison: &Comparison,
         file: &CommitFile,
     ) -> Result<String> {
+        self.comparison_file_diff_context(comparison, file, false)
+    }
+    pub fn comparison_file_diff_context(
+        &self,
+        comparison: &Comparison,
+        file: &CommitFile,
+        full: bool,
+    ) -> Result<String> {
         let repo = raw(self)?;
         let old = repo.find_commit(oid(&comparison.base.id)?)?.tree()?;
         let new = repo.find_commit(oid(&comparison.target.id)?)?.tree()?;
-        single_file_patch(&tree_diff(&repo, Some(&old), &new)?, file)
+        if full {
+            let mut paths = vec![file.path.as_path()];
+            if let Some(old) = &file.original {
+                paths.push(old);
+            }
+            super::diff_view::check_full_tree(&repo, Some(&old), &paths)?;
+            super::diff_view::check_full_tree(&repo, Some(&new), &paths)?;
+        }
+        let paths = std::iter::once(file.path.as_path())
+            .chain(file.original.as_deref())
+            .collect::<Vec<_>>();
+        single_file_patch(
+            &tree_diff_context(&repo, Some(&old), &new, full, &paths)?,
+            file,
+        )
     }
 
     pub fn file_history(&self, path: &Path, spec: &str, limit: usize) -> Result<FileHistory> {

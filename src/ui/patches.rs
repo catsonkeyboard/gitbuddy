@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 
 impl GitBuddy {
     pub(super) fn toggle_patch(&mut self, source: PatchSource, cx: &mut Context<Self>) {
@@ -18,19 +19,20 @@ impl GitBuddy {
         };
         let key = source.key();
         let generation = self.patch_generation;
+        let full = self.active.diff_preferences.full_context;
         self.active
             .patches
             .entry(key.clone())
             .or_insert(PatchState::Loading);
         let task = cx.background_executor().spawn(async move {
             let patch = match source {
-                PatchSource::Work(file, staged) => repo.worktree_patch(&file, staged),
+                PatchSource::Work(file, staged) => repo.worktree_patch_context(&file, staged, full),
                 PatchSource::Commit(id, file) => repo
-                    .commit_file_diff(&id, &file)
-                    .map(|raw| git::FilePatch::read_only(&raw)),
+                    .commit_file_diff_context(&id, &file, full)
+                    .and_then(|raw| git::FilePatch::read_only_context(&raw, full)),
                 PatchSource::Compare(comparison, file) => repo
-                    .comparison_file_diff(&comparison, &file)
-                    .map(|raw| git::FilePatch::read_only(&raw)),
+                    .comparison_file_diff_context(&comparison, &file, full)
+                    .and_then(|raw| git::FilePatch::read_only_context(&raw, full)),
             }?;
             anyhow::Ok(Arc::new(patch))
         });
@@ -78,109 +80,77 @@ impl GitBuddy {
         let id = id.into();
         match self.active.patches.get(key) {
             Some(PatchState::Ready(patch, selection)) if !patch.lines.is_empty() => {
-                let height = (patch.lines.len() as f32 * 20.).min(420.);
+                let split = self.active.diff_preferences.side_by_side;
+                let count = if split {
+                    patch.display.rows.len()
+                } else {
+                    patch.lines.len()
+                };
+                let height = (count as f32 * 20.).min(420.);
                 let key = key.clone();
                 let scroll = self.active.scroll.list(&key.scroll_id());
                 let action_key = key.clone();
                 let clear_key = key.clone();
                 let staged = matches!(key, PatchKey::Work(_, true));
                 let selected = selection.rows.len();
-                // Independent horizontal/vertical scrolling keeps other file headers reachable.
-                let list = uniform_list(
-                    "patch-lines",
-                    patch.lines.len(),
-                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                        let Some(PatchState::Ready(patch, selection)) =
-                            this.active.patches.get(&key)
-                        else {
-                            return Vec::new();
-                        };
-                        range
-                            .filter(|&i| i < patch.lines.len())
-                            .map(|i| {
-                                let line = &patch.lines[i];
-                                if let Some(partial) = &patch.partial {
-                                    if line.kind == '@' {
-                                        let partial = partial.clone();
-                                        return h_flex()
-                                            .h(px(20.))
-                                            .bg(rgb(0x2d3b4d))
-                                            .gap_2()
-                                            .child(
-                                                this.button(
-                                                    ("partial-hunk", i),
-                                                    if staged {
-                                                        "Unstage hunk"
-                                                    } else {
-                                                        "Stage hunk"
-                                                    },
-                                                )
-                                                .h(px(18.))
-                                                .ghost()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.perform(
-                                                        Operation::ApplyPartial {
-                                                            patch: partial.clone(),
-                                                            selection: git::PatchSelection::Hunk(i),
-                                                        },
-                                                        cx,
-                                                    );
-                                                })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .font_family("Menlo")
-                                                    .text_size(px(11.))
-                                                    .text_color(rgb(0x9fbfe9))
-                                                    .whitespace_nowrap()
-                                                    .child(line.text.clone()),
-                                            )
-                                            .into_any_element();
-                                    }
-                                    if matches!(line.kind, '+' | '-') {
-                                        let key = key.clone();
-                                        let expected = patch.clone();
-                                        return patch_line(line, selection.rows.contains(&i))
-                                            .id(("partial-line", i))
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(
-                                                move |this, event: &ClickEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                    if this.busy() {
-                                                        return;
-                                                    }
-                                                    if let Some(PatchState::Ready(
-                                                        current,
-                                                        selection,
-                                                    )) = this.active.patches.get_mut(&key)
-                                                        && Arc::ptr_eq(current, &expected)
-                                                    {
-                                                        let modifiers = event.modifiers();
-                                                        selection.select(
-                                                            &current.lines,
-                                                            i,
-                                                            modifiers.shift,
-                                                            modifiers.platform || modifiers.control,
-                                                        );
-                                                        cx.notify();
-                                                    }
-                                                },
-                                            ))
-                                            .into_any_element();
-                                    }
-                                }
-                                patch_line(line, false).into_any_element()
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                .track_scroll(&scroll)
-                .h(px(height))
-                .w_full();
+                let list = if split {
+                    h_flex()
+                        .h(px(height))
+                        .w_full()
+                        .min_w_0()
+                        .child(self.split_diff_list(&key, patch, false, height, cx))
+                        .child(self.split_diff_list(&key, patch, true, height, cx))
+                        .into_any_element()
+                } else {
+                    let list = uniform_list(
+                        "patch-lines",
+                        count,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            let Some(PatchState::Ready(patch, _)) = this.active.patches.get(&key)
+                            else {
+                                return Vec::new();
+                            };
+                            let patch = patch.clone();
+                            range
+                                .filter(|&i| i < patch.lines.len())
+                                .map(|i| this.diff_row(&key, &patch, i, None, cx))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .with_width_from_item(Some(patch.display.measure_row))
+                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                    .track_scroll(&scroll)
+                    .h(px(height))
+                    .w_full();
+                    div()
+                        .relative()
+                        .h(px(height))
+                        .w_full()
+                        .child(list)
+                        .child(
+                            div().absolute().inset_0().child(
+                                Scrollbar::new(&scroll)
+                                    .id("diff-scrollbar")
+                                    .viewport_from_layout()
+                                    .mode(ScrollbarMode::Always),
+                            ),
+                        )
+                        .into_any_element()
+                };
                 v_flex()
                     .id(id)
+                    .child(self.diff_controls(cx))
+                    .when(split, |col| {
+                        col.child(
+                            h_flex()
+                                .h(px(24.))
+                                .bg(rgb(PANEL))
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(div().flex_1().px_3().child("Before / index base"))
+                                .child(div().flex_1().px_3().child("After / selected version")),
+                        )
+                    })
                     .when(patch.partial.is_some(), |col| {
                         col.child(
                             h_flex()
@@ -264,15 +234,235 @@ impl GitBuddy {
                     ),
                     _ => ("Loading diff…".into(), MUTED),
                 };
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(rgb(color))
-                    .child(label)
+                v_flex()
+                    .child(self.diff_controls(cx))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(rgb(color))
+                            .child(label),
+                    )
                     .into_any_element()
             }
         }
+    }
+
+    fn split_diff_list(
+        &self,
+        key: &PatchKey,
+        patch: &Arc<git::FilePatch>,
+        right: bool,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scroll = self.active.scroll.list(&key.scroll_id());
+        let key = key.clone();
+        let count = patch.display.rows.len();
+        let width = (patch.display.columns as f32 * 6.7 + 64.).max(320.);
+        // Both virtual lists use the same offset and equal row count / content width.
+        // This synchronizes vertical and horizontal scrolling while keeping the divider fixed.
+        let list = uniform_list(
+            if right { "patch-right" } else { "patch-left" },
+            count,
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let Some(PatchState::Ready(patch, _)) = this.active.patches.get(&key) else {
+                    return Vec::new();
+                };
+                let patch = patch.clone();
+                range
+                    .filter(|&i| i < patch.display.rows.len())
+                    .map(|i| {
+                        let row = &patch.display.rows[i];
+                        let source = if right { row.right } else { row.left };
+                        div()
+                            .h(px(20.))
+                            .min_w(px(width))
+                            .bg(rgb(EDITOR))
+                            .when_some(source, |cell, r| {
+                                cell.child(this.diff_row(&key, &patch, r, Some(right), cx))
+                            })
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .with_width_from_item(Some(patch.display.split_measure_row))
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        .track_scroll(&scroll)
+        .h(px(height))
+        .w_full();
+        div()
+            .relative()
+            .h(px(height))
+            .flex_1()
+            .min_w_0()
+            .when(!right, |col| col.border_r_1().border_color(rgb(BORDER)))
+            .child(list)
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::new(&scroll)
+                        .id(if right {
+                            "right-scrollbar"
+                        } else {
+                            "left-scrollbar"
+                        })
+                        .viewport_from_layout()
+                        .mode(ScrollbarMode::Always),
+                ),
+            )
+            .into_any_element()
+    }
+    fn diff_row(
+        &self,
+        key: &PatchKey,
+        patch: &Arc<git::FilePatch>,
+        i: usize,
+        side: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line = &patch.lines[i];
+        let selected = matches!(self.active.patches.get(key),Some(PatchState::Ready(_,s)) if s.rows.contains(&i));
+        if line.kind == '@'
+            && let Some(partial) = &patch.partial
+        {
+            let partial = partial.clone();
+            let staged = matches!(key, PatchKey::Work(_, true));
+            return h_flex()
+                .h(px(20.))
+                .bg(rgb(0x2d3b4d))
+                .gap_2()
+                .child(
+                    self.button(
+                        ("partial-hunk", i),
+                        if staged { "Unstage hunk" } else { "Stage hunk" },
+                    )
+                    .h(px(18.))
+                    .ghost()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.perform(
+                            Operation::ApplyPartial {
+                                patch: partial.clone(),
+                                selection: git::PatchSelection::Hunk(i),
+                            },
+                            cx,
+                        );
+                    })),
+                )
+                .child(
+                    div()
+                        .font_family("Menlo")
+                        .text_size(px(11.))
+                        .text_color(rgb(0x9fbfe9))
+                        .whitespace_nowrap()
+                        .child(line.text.clone()),
+                )
+                .into_any_element();
+        }
+        let highlights = if self.active.diff_preferences.word_highlight {
+            patch.display.highlights[i].as_slice()
+        } else {
+            &[]
+        };
+        let row = patch_line(line, selected, highlights, side);
+        if patch.partial.is_none() || !matches!(line.kind, '+' | '-') {
+            return row.into_any_element();
+        }
+        let expected = patch.clone();
+        let key = key.clone();
+        row.id((
+            if side == Some(true) {
+                "partial-right"
+            } else {
+                "partial-line"
+            },
+            i,
+        ))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            if this.busy() {
+                return;
+            }
+            if let Some(PatchState::Ready(current, selection)) = this.active.patches.get_mut(&key)
+                && Arc::ptr_eq(current, &expected)
+            {
+                let modifiers = event.modifiers();
+                selection.select(
+                    &current.lines,
+                    i,
+                    modifiers.shift,
+                    modifiers.platform || modifiers.control,
+                );
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+    fn diff_controls(&self, cx: &mut Context<Self>) -> Div {
+        let prefs = self.active.diff_preferences;
+        h_flex()
+            .h(px(28.))
+            .px_3()
+            .gap_2()
+            .bg(rgb(PANEL))
+            .child(
+                self.button(
+                    "diff-layout",
+                    if prefs.side_by_side {
+                        "Side by side"
+                    } else {
+                        "Unified"
+                    },
+                )
+                .ghost()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.active.diff_preferences.side_by_side =
+                        !this.active.diff_preferences.side_by_side;
+                    cx.notify();
+                })),
+            )
+            .child(
+                self.button(
+                    "diff-words",
+                    if prefs.word_highlight {
+                        "Word highlight: on"
+                    } else {
+                        "Word highlight: off"
+                    },
+                )
+                .ghost()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.active.diff_preferences.word_highlight =
+                        !this.active.diff_preferences.word_highlight;
+                    cx.notify();
+                })),
+            )
+            .child(
+                self.button(
+                    "diff-context",
+                    if prefs.full_context {
+                        "Full context"
+                    } else {
+                        "Context: 3 lines"
+                    },
+                )
+                .ghost()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.busy() {
+                        return;
+                    }
+                    this.active.diff_preferences.full_context =
+                        !this.active.diff_preferences.full_context;
+                    this.patch_generation += 1;
+                    this.active.patches.clear();
+                    this.active.restored_lines.clear();
+                    this.resume_expanded(cx);
+                    cx.notify();
+                })),
+            )
     }
 
     pub(super) fn commit_files_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -526,13 +716,19 @@ fn patch_stat(state: Option<&PatchState>) -> impl IntoElement {
     };
     div().text_size(px(10.)).text_color(rgb(MUTED)).child(text)
 }
-fn patch_line(line: &DiffLine, selected: bool) -> Div {
-    let (background, foreground) = match line.kind {
-        '+' => (0x293e38, 0xb8e5c6),
-        '-' => (0x443137, 0xedb5b7),
-        '@' => (0x2d3b4d, 0x9fbfe9),
-        _ => (EDITOR, TEXT),
+fn patch_line(
+    line: &DiffLine,
+    selected: bool,
+    highlights: &[std::ops::Range<usize>],
+    side: Option<bool>,
+) -> Div {
+    let (background, foreground, emphasis) = match line.kind {
+        '+' => (0x293e38, 0xb8e5c6, 0x39654d),
+        '-' => (0x443137, 0xedb5b7, 0x79454d),
+        '@' => (0x2d3b4d, 0x9fbfe9, 0x2d3b4d),
+        _ => (EDITOR, TEXT, EDITOR),
     };
+    let text = highlighted_text(&line.text, highlights, emphasis);
     h_flex()
         .h(px(20.))
         .font_family("Menlo")
@@ -540,34 +736,60 @@ fn patch_line(line: &DiffLine, selected: bool) -> Div {
         .bg(rgb(if selected { 0x375776 } else { background }))
         .child(
             div()
-                .w(px(18.))
+                .w(px(12.))
                 .flex_shrink_0()
                 .text_color(rgb(ACCENT))
                 .child(if selected { "▎" } else { "" }),
         )
-        .child(
+        .when(side != Some(true), |row| {
+            row.child(
+                div()
+                    .w(px(38.))
+                    .flex_shrink_0()
+                    .text_right()
+                    .pr_2()
+                    .text_color(rgb(MUTED))
+                    .child(line.old.clone()),
+            )
+        })
+        .when(side != Some(false), |row| {
+            row.child(
+                div()
+                    .w(px(38.))
+                    .flex_shrink_0()
+                    .text_right()
+                    .pr_2()
+                    .text_color(rgb(MUTED))
+                    .child(line.new.clone()),
+            )
+        })
+        .child(text.text_color(rgb(foreground)))
+}
+fn highlighted_text(text: &str, ranges: &[std::ops::Range<usize>], color: u32) -> Div {
+    let mut row = h_flex().gap_0().whitespace_nowrap().pr_4();
+    let mut start = 0;
+    for range in ranges {
+        if start < range.start {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .child(text[start..range.start].replace('\t', "    ")),
+            );
+        }
+        row = row.child(
             div()
-                .w(px(38.))
                 .flex_shrink_0()
-                .text_right()
-                .pr_2()
-                .text_color(rgb(MUTED))
-                .child(line.old.clone()),
-        )
-        .child(
+                .bg(rgb(color))
+                .child(text[range.clone()].replace('\t', "    ")),
+        );
+        start = range.end;
+    }
+    if start < text.len() {
+        row = row.child(
             div()
-                .w(px(38.))
                 .flex_shrink_0()
-                .text_right()
-                .pr_2()
-                .text_color(rgb(MUTED))
-                .child(line.new.clone()),
-        )
-        .child(
-            div()
-                .whitespace_nowrap()
-                .pr_4()
-                .text_color(rgb(foreground))
-                .child(line.text.replace('\t', "    ")),
-        )
+                .child(text[start..].replace('\t', "    ")),
+        );
+    }
+    row
 }

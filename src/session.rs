@@ -145,6 +145,7 @@ pub struct Tab {
     pub history_limit: usize,
     pub show_commit_body: bool,
     pub expanded: Vec<PatchKey>,
+    pub diff_preferences: crate::git::DiffPreferences,
     pub lines: Vec<LineSelection>,
     pub scroll: BTreeMap<String, Offset>,
     #[serde(with = "optional_path_encoding")]

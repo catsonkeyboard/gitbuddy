@@ -1,6 +1,6 @@
 //! Partial staging uses libgit2's structured diff, never the lossy display text.
 //! Reconstruct just the index blob; the working tree is never written.
-use super::libgit::{diff_for, head_tree, raw};
+use super::libgit::{diff_for_context, head_tree, raw};
 use super::{DIFF_LIMIT_LINES, DiffLine, FileChange, Repository, diff_preview};
 use anyhow::{Context, Result, ensure};
 use git2::{Delta, DiffFindOptions, FileMode, IndexEntry, IndexTime, Oid, Patch};
@@ -9,17 +9,33 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 #[derive(Clone, Debug)]
 pub struct FilePatch {
     pub lines: Vec<DiffLine>,
+    pub display: super::DiffDisplay,
     pub partial: Option<Arc<PartialPatch>>,
     pub unavailable: Option<String>,
 }
 
 impl FilePatch {
     pub fn read_only(text: &str) -> Self {
+        let lines = diff_preview(text);
         Self {
-            lines: diff_preview(text),
+            display: super::DiffDisplay::new(&lines),
+            lines,
             partial: None,
             unavailable: None,
         }
+    }
+    pub fn read_only_context(text: &str, full: bool) -> Result<Self> {
+        if !full {
+            return Ok(Self::read_only(text));
+        }
+        super::diff_view::check_full_diff(text.as_bytes())?;
+        let lines = super::diff_lines_with_limit(text, super::diff_view::FULL_DIFF_LINES);
+        Ok(Self {
+            display: super::DiffDisplay::new(&lines),
+            lines,
+            partial: None,
+            unavailable: None,
+        })
     }
 }
 
@@ -69,6 +85,7 @@ pub struct PartialPatch {
     git_dir: PathBuf,
     file: FileChange,
     staged: bool,
+    full_context: bool,
     index: Option<EntryVersion>,
     head: Option<Oid>,
     diff: Vec<u8>,
@@ -80,6 +97,14 @@ pub struct PartialPatch {
 
 impl Repository {
     pub fn worktree_patch(&self, file: &FileChange, staged: bool) -> Result<FilePatch> {
+        self.worktree_patch_context(file, staged, false)
+    }
+    pub fn worktree_patch_context(
+        &self,
+        file: &FileChange,
+        staged: bool,
+        full_context: bool,
+    ) -> Result<FilePatch> {
         if file.index == '?' && !staged {
             ensure!(
                 std::fs::symlink_metadata(self.root.join(&file.path))?.len() <= 2 * 1024 * 1024,
@@ -97,8 +122,30 @@ impl Repository {
             });
         }
         let version = entry_version(index.get_path(&file.path, 0));
+        if full_context {
+            if let Some(entry) = &version
+                && entry.mode != 0o160000
+            {
+                super::diff_view::check_full_blob(&repo, entry.id)?;
+            }
+            if staged {
+                super::diff_view::check_full_tree(
+                    &repo,
+                    head_tree(&repo)?.as_ref(),
+                    &[&file.path],
+                )?;
+            } else if let Ok(meta) = std::fs::symlink_metadata(self.root.join(&file.path)) {
+                ensure!(
+                    meta.len() <= super::diff_view::FULL_DIFF_BYTES as u64,
+                    "Full context exceeds the safety limit (16 MB per file). Use compact context or an external editor."
+                );
+            }
+        }
         let readonly = |reason: &str| -> Result<FilePatch> {
-            let mut patch = FilePatch::read_only(&self.diff(file, staged)?);
+            let mut patch = FilePatch::read_only_context(
+                &self.diff_context(file, staged, full_context)?,
+                full_context,
+            )?;
             patch.unavailable = Some(reason.into());
             Ok(patch)
         };
@@ -108,7 +155,7 @@ impl Repository {
         if file.original.is_some() {
             return readonly("Renames must be staged or unstaged as a whole file.");
         }
-        let mut diff = diff_for(&repo, staged)?;
+        let mut diff = diff_for_context(&repo, staged, full_context, &[file.path.as_path()])?;
         diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
         let Some((delta_index, delta)) = diff.deltas().enumerate().find(|(_, d)| {
             d.new_file().path() == Some(file.path.as_path())
@@ -139,7 +186,10 @@ impl Repository {
             );
         }
         let bytes = patch.to_buf()?.to_vec();
-        if bytes.iter().filter(|&&b| b == b'\n').count() > DIFF_LIMIT_LINES {
+        if full_context {
+            super::diff_view::check_full_diff(&bytes)?;
+        }
+        if !full_context && bytes.iter().filter(|&&b| b == b'\n').count() > DIFF_LIMIT_LINES {
             return readonly("Partial actions are unavailable for a truncated diff preview.");
         }
         // Keep file headers for orientation, then construct rows directly from
@@ -212,6 +262,7 @@ impl Repository {
             git_dir: repo.path().to_path_buf(),
             file: file.clone(),
             staged,
+            full_context,
             index: version,
             head: if staged {
                 head_tree(&repo)?.map(|tree| tree.id())
@@ -234,6 +285,7 @@ impl Repository {
             hunks,
         };
         Ok(FilePatch {
+            display: super::DiffDisplay::new(&lines),
             lines,
             partial: Some(Arc::new(partial)),
             unavailable: None,
@@ -250,7 +302,7 @@ impl Repository {
             repo.path() == patch.git_dir,
             "This diff belongs to a different repository. Refresh and select again."
         );
-        let current = self.worktree_patch(&patch.file, patch.staged)?;
+        let current = self.worktree_patch_context(&patch.file, patch.staged, patch.full_context)?;
         ensure!(
             current.partial.as_deref() == Some(patch),
             "The diff has changed. Refresh and select the changes again."

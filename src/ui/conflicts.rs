@@ -8,6 +8,33 @@ pub(super) struct ConflictDraft {
     pub choice: ResultChoice,
     pub dirty: bool,
     pub editor: gitbuddy::session::EditorView,
+    blocks: Result<Arc<Vec<git::ConflictBlock>>, String>,
+    pub revision: u64,
+    has_markers: bool,
+}
+impl ConflictDraft {
+    pub(super) fn refresh_blocks(&mut self) {
+        self.revision += 1;
+        self.has_markers = git::has_conflict_markers(&self.text);
+        self.blocks = git::conflict_blocks(&self.text)
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+    }
+    pub(super) fn import_tool_result(
+        &mut self,
+        context: &Arc<git::ConflictContext>,
+        revision: u64,
+        text: String,
+    ) -> bool {
+        if !Arc::ptr_eq(&self.context, context) || self.revision != revision {
+            return false;
+        }
+        self.text = text;
+        self.choice = ResultChoice::Edited;
+        self.dirty = true;
+        self.refresh_blocks();
+        true
+    }
 }
 #[derive(Clone, Default)]
 pub(super) struct ConflictViewState {
@@ -145,6 +172,9 @@ impl GitBuddy {
                             choice: ResultChoice::Edited,
                             dirty: false,
                             editor: gitbuddy::session::EditorView::default(),
+                            blocks: Ok(Arc::new(Vec::new())),
+                            revision: 0,
+                            has_markers: false,
                         };
                         if let Some(saved) = this.active.restored_conflicts.remove(&path) {
                             let unchanged = saved.fingerprint == gitbuddy::session::conflict_fingerprint(&draft.context);
@@ -173,6 +203,7 @@ impl GitBuddy {
                                         .into();
                             }
                         }
+                        draft.refresh_blocks();
                         this.active.conflicts.drafts.insert(path, draft);
                         this.restore_conflict_editor();
                     }
@@ -214,7 +245,83 @@ impl GitBuddy {
         };
         draft.choice = choice;
         draft.dirty = true;
+        draft.refresh_blocks();
         self.restore_conflict_editor();
+        cx.notify();
+    }
+    fn choose_block(
+        &mut self,
+        path: &PathBuf,
+        context: &Arc<git::ConflictContext>,
+        revision: u64,
+        block: &git::ConflictBlock,
+        choice: git::BlockChoice,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() {
+            return;
+        }
+        let Some(draft) = self.active.conflicts.drafts.get_mut(path) else {
+            return;
+        };
+        if !Arc::ptr_eq(&draft.context, context) || draft.revision != revision {
+            return;
+        }
+        match git::choose_conflict_block(&draft.text, block, choice) {
+            Ok(text) => {
+                draft.text = text;
+                draft.choice = ResultChoice::Edited;
+                draft.dirty = true;
+                draft.refresh_blocks();
+                self.restore_conflict_editor();
+            }
+            Err(error) => {
+                self.active.error = true;
+                self.active.notice = error.to_string();
+            }
+        }
+        cx.notify();
+    }
+    fn open_merge_tool(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_modal(Modal::MergeTool, window, cx);
+        let tool = self.settings.merge_tool.clone();
+        self.set_tool_fields(tool, window, cx);
+    }
+    pub(super) fn set_tool_fields(
+        &mut self,
+        tool: git::MergeTool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.form_a
+            .update(cx, |s, cx| s.set_value(tool.program, window, cx));
+        let args = serde_json::to_string(&tool.args).unwrap_or_default();
+        self.form_b
+            .update(cx, |s, cx| s.set_value(args, window, cx));
+    }
+    pub(super) fn submit_merge_tool(
+        &mut self,
+        program: String,
+        args: String,
+        cx: &mut Context<Self>,
+    ) {
+        let tool = (|| -> anyhow::Result<git::MergeTool> {
+            let tool = git::MergeTool {
+                program,
+                args: serde_json::from_str(&args)
+                    .map_err(|e| anyhow::anyhow!("Arguments must be a JSON string array: {e}"))?,
+            };
+            tool.validate()?;
+            self.settings.set_merge_tool(tool.clone())?;
+            Ok(tool)
+        })();
+        match tool {
+            Ok(tool) => {
+                self.modal = None;
+                self.dispatch_merge_tool(tool, cx);
+            }
+            Err(error) => self.modal_error = Some(format!("{error:#}")),
+        }
         cx.notify();
     }
     fn save_conflict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -293,7 +400,7 @@ impl GitBuddy {
             || (draft.choice == ResultChoice::Theirs && context.theirs.is_none())
             || (draft.choice == ResultChoice::Worktree && !context.worktree_exists);
         let has_markers = matches!(draft.choice, ResultChoice::Edited | ResultChoice::Worktree)
-            && git::has_conflict_markers(&draft.text);
+            && draft.has_markers;
         let can_save = context.file.supported
             && (!matches!(draft.choice, ResultChoice::Edited) || context.editable)
             && !has_markers;
@@ -321,6 +428,7 @@ impl GitBuddy {
                 .child(conflict_side("Base · ancestor",context.base.as_ref(),"base-lines",0x303846, &self.active.scroll.list(&format!("conflict:{scroll_path}:base"))))
                 .child(conflict_side("Theirs · incoming side",context.theirs.as_ref(),"theirs-lines",0x44353b, &self.active.scroll.list(&format!("conflict:{scroll_path}:theirs")))))
             .child(h_flex().px_3().py_1().gap_1().bg(rgb(PANEL))
+                .child(self.button("external-merge-tool","External tool…").ghost().disabled(self.busy()||!context.can_external_merge()).on_click(cx.listener(|this,_,w,cx|this.open_merge_tool(w,cx))))
                 .child(self.button("use-ours",if context.ours.is_some(){"Use ours"}else{"Ours: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Ours,cx))))
                 .child(self.button("use-theirs",if context.theirs.is_some(){"Use theirs"}else{"Theirs: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Theirs,cx))))
                 .child(self.button("use-worktree","Use working file").ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Worktree,cx))))
@@ -328,11 +436,158 @@ impl GitBuddy {
             .child(h_flex().px_3().py_1().gap_2()
                 .child(div().flex_1().text_xs().text_color(rgb(if has_markers {0xe9a3a9}else{MUTED})).child(description))
                 .child(self.button("save-conflict","Save & mark resolved").primary().disabled(self.busy()||self.active.conflicts.loading||self.active.conflicts.loading_file||!can_save).on_click(cx.listener(|this,_,w,cx|this.save_conflict(w,cx)))))
+            .when(context.editable && !deletion, |col|col.child(self.conflict_blocks_view(draft,cx)))
             .child(if context.editable && !deletion {
                 Editor::new(&self.conflict_editor).aria_label("Conflict result").appearance(false).bordered(false).readonly(self.busy()).h(relative(1.)).flex_1().min_h_0().into_any_element()
             } else {
                 div().flex_1().p_3().text_xs().text_color(rgb(MUTED)).child(if deletion {"The file will be removed when you save."}else{"The selected complete version will be saved without text conversion. You can also edit externally, reload, and choose Use working file."}).into_any_element()
             })
+            .into_any_element()
+    }
+    fn conflict_blocks_view(&self, draft: &ConflictDraft, cx: &mut Context<Self>) -> AnyElement {
+        let blocks = match &draft.blocks {
+            Ok(blocks) if blocks.is_empty() => return div().into_any_element(),
+            Ok(blocks) => blocks.clone(),
+            Err(error) => {
+                return div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0xe9a3a9))
+                    .child(format!("{error} · resolve manually below"))
+                    .into_any_element();
+            }
+        };
+        let path = draft.context.file.path.clone();
+        let context = draft.context.clone();
+        let revision = draft.revision;
+        let count = blocks.len();
+        v_flex()
+            .flex_shrink_0()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "{count} remaining conflict blocks · Both keeps ours then theirs"
+                    )),
+            )
+            .child(
+                uniform_list(
+                    "conflict-blocks",
+                    count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        let Some(draft) = this.active.conflicts.drafts.get(&path) else {
+                            return Vec::new();
+                        };
+                        range
+                            .filter(|&i| i < blocks.len())
+                            .map(|i| {
+                                let block = &blocks[i];
+                                let preview = |r: std::ops::Range<usize>| {
+                                    draft.text[r]
+                                        .lines()
+                                        .take(2)
+                                        .map(|s| s.chars().take(100).collect::<String>())
+                                        .collect::<Vec<_>>()
+                                        .join(" · ")
+                                };
+                                let mut row = v_flex()
+                                    .h(px(80.))
+                                    .w_full()
+                                    .px_3()
+                                    .py_1()
+                                    .gap_1()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER))
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_2()
+                                            .child(div().flex_1().text_xs().child(format!(
+                                                "Block {} · line {}",
+                                                i + 1,
+                                                block.line
+                                            )))
+                                            .children(
+                                                [
+                                                    git::BlockChoice::Ours,
+                                                    git::BlockChoice::Theirs,
+                                                    git::BlockChoice::Both,
+                                                ]
+                                                .into_iter()
+                                                .map(|choice| {
+                                                    let context = context.clone();
+                                                    let path = path.clone();
+                                                    let block = block.clone();
+                                                    this.button(
+                                                        (
+                                                            match choice {
+                                                                git::BlockChoice::Ours => {
+                                                                    "block-ours"
+                                                                }
+                                                                git::BlockChoice::Theirs => {
+                                                                    "block-theirs"
+                                                                }
+                                                                git::BlockChoice::Both => {
+                                                                    "block-both"
+                                                                }
+                                                            },
+                                                            i,
+                                                        ),
+                                                        match choice {
+                                                            git::BlockChoice::Ours => "Ours",
+                                                            git::BlockChoice::Theirs => "Theirs",
+                                                            git::BlockChoice::Both => "Both",
+                                                        },
+                                                    )
+                                                    .ghost()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.choose_block(
+                                                            &path, &context, revision, &block,
+                                                            choice, cx,
+                                                        )
+                                                    }))
+                                                }),
+                                            ),
+                                    );
+                                row = row
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_family("Menlo")
+                                            .text_size(px(10.))
+                                            .text_color(rgb(0xb8e5c6))
+                                            .child(format!(
+                                                "Ours: {}",
+                                                preview(block.ours.clone())
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_family("Menlo")
+                                            .text_size(px(10.))
+                                            .text_color(rgb(0xedb5b7))
+                                            .child(format!(
+                                                "Theirs: {}",
+                                                preview(block.theirs.clone())
+                                            )),
+                                    );
+                                row.into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&self.active.scroll.list("conflict-blocks"))
+                .h(px((count as f32 * 80.).min(160.)))
+                .w_full(),
+            )
             .into_any_element()
     }
 }
@@ -412,4 +667,55 @@ fn conflict_side(
             .min_h_0(),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arc, ConflictDraft, Operation, ResultChoice, git};
+
+    #[test]
+    fn tool_result_cannot_replace_reloaded_context_or_newer_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git::Repository::init(dir.path()).unwrap();
+        repo.execute(Operation::SetIdentity(
+            "Tester".into(),
+            "test@example.invalid".into(),
+        ))
+        .unwrap();
+        let write_commit = |text: &str| {
+            std::fs::write(repo.root.join("file"), text).unwrap();
+            repo.execute(Operation::StageAll).unwrap();
+            repo.execute(Operation::Commit("snapshot".into())).unwrap();
+        };
+        write_commit("base\n");
+        repo.execute(Operation::CreateBranch("incoming".into()))
+            .unwrap();
+        write_commit("theirs\n");
+        repo.execute(Operation::Checkout("main".into())).unwrap();
+        write_commit("ours\n");
+        assert!(repo.execute(Operation::Merge("incoming".into())).is_err());
+        let context = Arc::new(repo.conflict_context(std::path::Path::new("file")).unwrap());
+        let mut draft = ConflictDraft {
+            context: context.clone(),
+            text: "initial draft\n".into(),
+            choice: ResultChoice::Edited,
+            dirty: false,
+            editor: Default::default(),
+            blocks: Ok(Arc::new(Vec::new())),
+            revision: 0,
+            has_markers: false,
+        };
+        draft.refresh_blocks();
+        let revision = draft.revision;
+        let reloaded = Arc::new(repo.conflict_context(std::path::Path::new("file")).unwrap());
+        assert!(!draft.import_tool_result(&reloaded, revision, "late result".into()));
+        draft.text = "newer edit\n".into();
+        draft.refresh_blocks();
+        assert!(!draft.import_tool_result(&context, revision, "late result".into()));
+        assert_eq!(draft.text, "newer edit\n");
+        assert!(draft.import_tool_result(&context, draft.revision, "accepted result\n".into()));
+        assert_eq!(draft.text, "accepted result\n");
+        assert!(draft.dirty);
+        assert_eq!(draft.revision, revision + 2);
+    }
 }

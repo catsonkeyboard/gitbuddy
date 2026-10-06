@@ -112,6 +112,16 @@ pub struct ConflictContext {
     pub description: String,
     token: Token,
     work: WorkVersion,
+    git_dir: PathBuf,
+}
+impl ConflictContext {
+    pub fn can_external_merge(&self) -> bool {
+        self.file.supported
+            && self.editable
+            && [&self.base, &self.ours, &self.theirs]
+                .iter()
+                .all(|s| s.as_ref().is_none_or(|s| s.text.is_some()))
+    }
 }
 #[derive(Clone, Debug)]
 pub enum ConflictResolution {
@@ -126,7 +136,7 @@ pub fn has_conflict_markers(text: &str) -> bool {
     text.lines().any(|line| {
         line.starts_with("<<<<<<<")
             || line.starts_with("|||||||")
-            || line == "======="
+            || (line.len() >= 7 && line.bytes().all(|b| b == b'='))
             || line.starts_with(">>>>>>>")
     })
 }
@@ -396,7 +406,33 @@ impl Repository {
             description,
             token: token(&repo)?,
             work,
+            git_dir: repo.path().to_path_buf(),
         })
+    }
+    pub(super) fn validate_tool_context(&self, context: &ConflictContext) -> Result<()> {
+        let repo = raw(self)?;
+        ensure!(
+            repo.path() == context.git_dir,
+            "This conflict belongs to a different repository."
+        );
+        ensure!(
+            token(&repo)? == context.token,
+            "The repository operation or HEAD changed. Reopen the conflict."
+        );
+        let mut index = repo.index()?;
+        index.read(true)?;
+        let actual = conflict_files(&index)?
+            .into_iter()
+            .find(|f| f.path == context.file.path);
+        ensure!(
+            actual.as_ref() == Some(&context.file),
+            "The index conflict changed. Reopen the conflict."
+        );
+        ensure!(
+            worktree(&self.root, &context.file.path)?.0 == context.work,
+            "The working file changed outside this view. Reload it before resolving."
+        );
+        Ok(())
     }
     pub(super) fn resolve_conflict(
         &self,
@@ -404,6 +440,10 @@ impl Repository {
         resolution: ConflictResolution,
     ) -> Result<String> {
         let repo = raw(self)?;
+        ensure!(
+            repo.path() == context.git_dir,
+            "This conflict belongs to a different repository."
+        );
         let mut refs = repo.transaction()?;
         refs.lock_ref("HEAD")?;
         if context.token.head.reference != "HEAD" {

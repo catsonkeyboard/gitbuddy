@@ -13,6 +13,7 @@ impl GitBuddy {
             return;
         };
         match modal {
+            Modal::MergeTool => self.submit_merge_tool(a, b, cx),
             Modal::RebaseSetup => self.preview_rebase(a, cx),
             Modal::WorktreeCreate => self.perform(
                 Operation::CreateWorktree {
@@ -102,6 +103,14 @@ impl GitBuddy {
             return self.history_modal(kind, cx);
         }
         let (title, label_a, label_b, submit) = match &modal {
+            Modal::MergeTool => (
+                "External merge tool",
+                "Executable path (e.g. code, kdiff3, meld)",
+                Some(
+                    "Arguments as JSON array; separate $BASE / $LOCAL / $REMOTE / $MERGED placeholders. Tool must wait until you finish.",
+                ),
+                "Save & launch",
+            ),
             Modal::RebaseSetup => (
                 "Interactive rebase",
                 "Upstream / new base: branch, tag or commit",
@@ -259,6 +268,15 @@ impl GitBuddy {
         }
         if matches!(modal, Modal::RebaseSetup) {
             card=card.child(div().text_xs().text_color(rgb(MUTED)).child("The chosen upstream becomes the new base. To edit / squash the last N commits on this branch, use HEAD~N. Start with a clean working tree; merge commits in the range are rejected."));
+        }
+        if matches!(modal, Modal::MergeTool) {
+            card=card.child(div().text_xs().text_color(rgb(MUTED)).child("Uses temporary copies. Close the tool to import its output as an unsaved draft; review and save separately. Git mergetool.cmd shell configuration is not executed."))
+                .child(h_flex().gap_2().children(["VS Code","KDiff3"].into_iter().enumerate().map(|(i,label)| {
+                    self.button(("merge-tool-preset",i),label).ghost().on_click(cx.listener(move|this,_,w,cx| {
+                        let (program,args)=match i {0=>("code",vec!["--wait","--merge","$LOCAL","$REMOTE","$BASE","$MERGED"]),_=>("kdiff3",vec!["$BASE","$LOCAL","$REMOTE","-o","$MERGED"])};
+                        this.set_tool_fields(git::MergeTool {program:program.into(),args:args.into_iter().map(str::to_owned).collect()},w,cx);
+                    }))
+                })));
         }
         if let Some(error) = &self.modal_error {
             card = card.child(

@@ -174,6 +174,7 @@ enum Modal {
     RecoveryBranch(git::ReflogTarget),
     FileTools,
     Compare,
+    MergeTool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistoryKind {
@@ -262,6 +263,7 @@ pub struct RepoTab {
     commit_selection: history_actions::CommitSelection,
     expanded: HashSet<PatchKey>,
     patches: HashMap<PatchKey, PatchState>,
+    diff_preferences: git::DiffPreferences,
     show_commit_body: bool,
     inspection: inspect::InspectState,
     comparison_base: Option<String>,
@@ -302,6 +304,7 @@ impl Default for RepoTab {
             commit_selection: history_actions::CommitSelection::default(),
             expanded: HashSet::new(),
             patches: HashMap::new(),
+            diff_preferences: git::DiffPreferences::default(),
             show_commit_body: false,
             inspection: inspect::InspectState::default(),
             comparison_base: None,
@@ -416,6 +419,7 @@ impl GitBuddy {
                             draft.text = text;
                             draft.choice = conflicts::ResultChoice::Edited;
                             draft.dirty = true;
+                            draft.refresh_blocks();
                         }
                         cx.notify();
                     }
