@@ -2,6 +2,20 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-07 Rebase 恢复、Worktree / 递归子模块与 LFS 锁 / 维护
+
+本节使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。普通 Git 和本地 LFS 维护使用原生后端，远程 LFS 锁命令直接启动 `git-lfs`，不经过 Bash。
+
+- Rebase 增加独立 `--onto` 范围 / 目标、按唯一旧提交说明或 ID 的 Autosquash、提交重放后的 Break 暂停、当前冲突 / 未确认应用步骤的 Retry / Skip。默认 Continue 仍拒绝未确认的应用，不猜测索引。恢复前同步保存工作区（不跟随符号链接）、索引和 sequencer 日志；持有 HEAD / 原分支引用锁完成重置，崩溃中再次重试仍保留现场。Skip 将紧邻 Squash / Fixup 提升为 Pick，防止改写基准或其他组；历史备份、已准备提交的恰好一次恢复及旧日志保护保持。
+- Worktree 创建后展开共享 LFS 缓存，Prepare 递归初始化子模块；关联 Worktree 的新模块使用独立嵌入式检出，已有 metadata 指向其他工作区时拒绝写入。子模块递归列出、同步 URL，嵌套行按实际直接父索引暂存；已存在的整个更新范围先检查后代修改（包括 ignore=all）。添加 / 更新展开子模块缓存，缺失对象提示进入相应标签 Fetch。失败 / 取消不声称跨多个模块原子回滚。
+- GitBuddy 共同仓库写锁保护关联 Worktree refs / LFS 缓存，显式释放锁以处理其他测试线程 fork 继承文件描述符的窗口。UI 任务范围还覆盖 Prepare / Remove 的目标 Worktree，阻止其子模块标签与父任务并发写入；独立仓库仍能并行。锁不覆盖外部 Git 客户端。
+- LFS 锁列表使用先非 JSON 服务器核验、再读取已验证缓存 JSON 的两步流程，避免 git-lfs JSON 路径在查询失败时出现部分 / 空成功。归属、稳定 ID、路径及创建时间复核后解锁；他人锁要求显式 force。双管道持续读取，2 MiB 超限和解析失败拒绝部分结果，取消清理进程组。服务器写入后收到取消可能已经完成，需刷新核对。
+- 原生维护扫描所有 refs、遗留 Reflog、索引 / 冲突阶段及所有关联 Worktree 的可达对象，缓存 SHA-256 校验可取消；损坏对象保留。执行时重新检查保护集合和缓存指纹，拒绝过期预览、未完成操作、脏 / 失效 Worktree、自定义存储和符号链接目录。先隔离未引用对象，支持校验后恢复；永久删除单独确认且重新检查新引用。隔离不释放空间，永久删除才释放正文占用；最终写入阶段不接受取消，部分失败说明剩余目录。
+- 新增 `tests/advanced_recovery.rs` **15 项**、`tests/lfs_maintenance.rs` **10 项**集成回归，以及 **7 项**单元回归。全量从 233 增至 **265 项（222 集成 + 43 单元）**；覆盖目标 Worktree / 子模块任务范围以及外部扩展 LFS 指针阻止清理。Clippy `--locked --all-targets -- -D warnings`、格式检查、`git diff --check` 通过，macOS 开发包重建成功；既有 block 0.1.6 未来兼容性提示保持。
+- `examples/demo_advanced_recovery.rs` 创建两标签会话、未确认应用的 Rebase、嵌套模块、Worktree 和未引用 LFS 缓存，目标存在时拒绝覆盖。本轮演示目录为 `target/advanced-recovery-ui-20261007`；独立配置在其中的 `config/`。原生工具报告 Mac 锁屏且自动解锁失败，**新按钮、布局和实际 GUI 重启流程未验收**。本机未安装 `git-lfs`，锁查询 / 归属与进程捕获由模拟回归验证，**真实锁服务器和认证未验收**；未向真实服务器创建 / 删除锁，未修改真实仓库历史或执行其缓存清理。
+
+演示启动：`GITBUDDY_CONFIG_DIR="$PWD/target/advanced-recovery-ui-20261007/config" dist/GitBuddy.app/Contents/MacOS/gitbuddy`。恢复副本在相应工作树 Git 管理目录的 `gitbuddy-rebase-recovery/`，LFS 隔离对象在共同 LFS 目录的 `gitbuddy-quarantine/`；这些恢复数据不会自动清理。
+
 ## 2026-10-06 Stash 预览、Pop、索引恢复、选定文件与建分支
 
 本节使用 Rust 1.98.1。全部新增 Git 操作和隔离测试由 git2 / libgit2 完成。

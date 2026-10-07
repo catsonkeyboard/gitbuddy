@@ -107,6 +107,10 @@ pub enum Operation {
         steps: Vec<RebaseStep>,
     },
     ContinueRebase,
+    RecoverRebaseStep {
+        expected: String,
+        skip: bool,
+    },
     CommitRebase(String),
     AbortRebase,
     CreateWorktree {
@@ -118,6 +122,7 @@ pub enum Operation {
         locked: bool,
     },
     RemoveWorktree(WorktreeInfo),
+    PrepareWorktree(WorktreeInfo),
     AddSubmodule {
         url: String,
         path: PathBuf,
@@ -128,6 +133,8 @@ pub enum Operation {
     },
     SyncSubmodules,
     StageSubmodule(String),
+    UpdateSubmoduleAt(SubmoduleInfo),
+    StageSubmoduleAt(SubmoduleInfo),
     LfsTrack {
         pattern: String,
         track: bool,
@@ -135,6 +142,18 @@ pub enum Operation {
     LfsCheckout,
     LfsFetch(String),
     LfsPush(String),
+    LfsLock {
+        remote: String,
+        path: PathBuf,
+    },
+    LfsUnlock {
+        remote: String,
+        lock: LfsLock,
+        force: bool,
+    },
+    LfsQuarantine(std::sync::Arc<LfsMaintenance>),
+    LfsRestoreQuarantine,
+    LfsPurgeQuarantine(std::sync::Arc<LfsMaintenance>),
     Stage(Vec<PathBuf>),
     Unstage(Vec<PathBuf>),
     ApplyPartial {
@@ -305,13 +324,16 @@ pub use remotes::{PushPlan, PushSelection, RemoteInfo, RemoteState};
 
 #[path = "git/rebase.rs"]
 mod rebase;
-pub use rebase::{RebaseAction, RebasePreview, RebaseStatus, RebaseStep};
+pub use rebase::{RebaseAction, RebasePreview, RebaseStatus, RebaseStep, autosquash};
 #[path = "git/workspaces.rs"]
 mod workspaces;
 pub use workspaces::{SubmoduleInfo, WorktreeInfo};
 #[path = "git/lfs.rs"]
 mod lfs;
 pub use lfs::{LfsFile, LfsStatus};
+#[path = "git/lfs_maintenance.rs"]
+mod lfs_maintenance;
+pub use lfs_maintenance::{LfsLock, LfsLockOwner, LfsLocks, LfsMaintenance};
 
 impl Operation {
     pub fn is_network(&self) -> bool {
@@ -325,6 +347,13 @@ impl Operation {
                 | Self::UpdateSubmodules { .. }
                 | Self::LfsFetch(_)
                 | Self::LfsPush(_)
+                | Self::PrepareWorktree(_)
+                | Self::UpdateSubmoduleAt(_)
+                | Self::LfsLock { .. }
+                | Self::LfsUnlock { .. }
+                | Self::LfsQuarantine(_)
+                | Self::LfsRestoreQuarantine
+                | Self::LfsPurgeQuarantine(_)
         )
     }
     pub fn label(&self) -> &'static str {
@@ -336,10 +365,18 @@ impl Operation {
             Self::Rebase { .. } => "Rebase",
             Self::ContinueRebase => "Continue rebase",
             Self::AbortRebase => "Abort rebase",
+            Self::RecoverRebaseStep { .. } => "Recover rebase step",
             Self::CreateWorktree { .. } => "Create worktree",
             Self::AddSubmodule { .. } | Self::UpdateSubmodules { .. } => "Update submodules",
             Self::LfsFetch(_) => "LFS fetch",
             Self::LfsPush(_) => "LFS push",
+            Self::PrepareWorktree(_) => "Prepare worktree",
+            Self::UpdateSubmoduleAt(_) => "Update nested submodule",
+            Self::LfsLock { .. } => "LFS lock",
+            Self::LfsUnlock { .. } => "LFS unlock",
+            Self::LfsQuarantine(_) => "Prune LFS cache",
+            Self::LfsRestoreQuarantine => "Restore LFS cache",
+            Self::LfsPurgeQuarantine(_) => "Delete LFS quarantine",
             _ => "Git operation",
         }
     }

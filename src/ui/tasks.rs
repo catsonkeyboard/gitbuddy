@@ -45,6 +45,7 @@ pub(super) struct RunningTask {
     pub cancellation: Option<git::CancellationToken>,
     ticket: Ticket,
     completion: Arc<Completion>,
+    scopes: Vec<PathBuf>,
 }
 #[derive(Default)]
 pub(super) struct RepositoryTasks {
@@ -89,6 +90,7 @@ impl RepositoryTasks {
                 ticket,
                 completion: Arc::new(Completion::default()),
                 cancellation: cancellable.then(git::CancellationToken::default),
+                scopes: Vec::new(),
             },
         );
         Some(ticket)
@@ -295,9 +297,56 @@ impl GitBuddy {
         work: impl FnOnce(git::NetworkControl) -> anyhow::Result<Loaded> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.dispatch_scoped(label, cancellable, Vec::new(), work, cx);
+    }
+    pub(super) fn dispatch_scoped(
+        &mut self,
+        label: &str,
+        cancellable: bool,
+        mut scopes: Vec<PathBuf>,
+        work: impl FnOnce(git::NetworkControl) -> anyhow::Result<Loaded> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(root) = self
+            .active
+            .repo
+            .as_ref()
+            .map(|repo| repo.root.clone())
+            .or_else(|| self.active.preparing.clone())
+        {
+            scopes.push(root);
+        }
+        let scopes = scopes
+            .into_iter()
+            .map(|path| {
+                path.canonicalize().unwrap_or_else(|_| {
+                    if let Some(parent) = path.parent().and_then(|p| p.canonicalize().ok())
+                        && let Some(name) = path.file_name()
+                    {
+                        parent.join(name)
+                    } else {
+                        std::path::absolute(&path).unwrap_or(path)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        // A recursive parent task writes child repositories too. Allow unrelated
+        // repositories to run, but prevent parent/child tabs racing each other.
+        if self
+            .tasks
+            .running
+            .values()
+            .any(|task| scopes_overlap(&scopes, &task.scopes))
+        {
+            self.active.notice =
+                "A parent or child repository has a running task; wait for it to finish".into();
+            cx.notify();
+            return;
+        }
         let Some(ticket) = self.tasks.start(self.active.id, label, cancellable) else {
             return;
         };
+        self.tasks.running.get_mut(&ticket.tab).unwrap().scopes = scopes;
         let cancellation = self
             .tasks
             .get(ticket.tab)
@@ -393,12 +442,20 @@ impl GitBuddy {
                         loaded.clear_message &= current_message == requested_message;
                         let clear_message = loaded.clear_message;
                         let retry = loaded.retry_modal.take();
+                        let management = loaded.management_result.take();
                         if let Some(tab) = this.tab_mut(ticket.tab) {
                             tab.apply_loaded(loaded, &requested_selection);
                             tab.history_retry =
                                 retry.map(|modal| (modal, retry_history, retry_message));
+                            tab.management_result = management;
                         }
                         if active {
+                            if this.modal.is_none()
+                                && let Some(data) = this.active.management_result.take()
+                            {
+                                this.management_data = data;
+                                this.modal = Some(Modal::LfsReport);
+                            }
                             this.clear_message = clear_message;
                             if this.modal.is_none()
                                 && let Some((modal, history, message)) =
@@ -523,6 +580,10 @@ impl GitBuddy {
             .into_any_element()
     }
 }
+fn scopes_overlap(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    left.iter()
+        .any(|a| right.iter().any(|b| a.starts_with(b) || b.starts_with(a)))
+}
 
 fn tab_mut_by_id<'a>(
     active: &'a mut RepoTab,
@@ -596,9 +657,30 @@ fn canonical_target(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepositoryTasks, TabId, tab_mut_by_id};
+    use super::{RepositoryTasks, TabId, scopes_overlap, tab_mut_by_id};
     use crate::ui::{Loaded, PatchKey, PatchLineSelection, PatchState, RepoTab, Selection};
     use gitbuddy::git::{Repository, Snapshot};
+    use std::path::PathBuf;
+    #[test]
+    fn prepared_worktree_scope_protects_children_without_blocking_unrelated_repos() {
+        let scopes = vec![PathBuf::from("/repos/main"), PathBuf::from("/repos/linked")];
+        assert!(scopes_overlap(
+            &scopes,
+            &[PathBuf::from("/repos/linked/modules/nested")]
+        ));
+        assert!(scopes_overlap(
+            &[PathBuf::from("/repos/linked/modules")],
+            &scopes
+        ));
+        assert!(!scopes_overlap(
+            &scopes,
+            &[PathBuf::from("/repos/unrelated")]
+        ));
+        assert!(!scopes_overlap(
+            &scopes,
+            &[PathBuf::from("/repos/linked-other")]
+        ));
+    }
     #[test]
     fn shutdown_cancels_all_tabs_and_waits_for_final_writes() {
         use std::sync::{
@@ -734,6 +816,7 @@ mod tests {
             clear_message: false,
             open_as_tab: false,
             retry_modal: None,
+            management_result: None,
         };
         tab.apply_loaded(loaded, &Selection::Work);
         assert_eq!(tab.selection, Selection::Commit("selected-later".into()));
@@ -774,6 +857,7 @@ mod tests {
             clear_message: false,
             open_as_tab: false,
             retry_modal: None,
+            management_result: None,
         };
         tab.apply_loaded(loaded, &Selection::Work);
         let Some(PatchState::Ready(retained, selection)) = tab.patches.get(&key) else {

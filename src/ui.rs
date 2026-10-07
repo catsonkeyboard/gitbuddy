@@ -155,6 +155,8 @@ enum Modal {
     Submodules,
     SubmoduleAdd,
     Lfs,
+    LfsReport,
+    LfsLock(String),
     LfsPattern(bool),
     Open,
     Init,
@@ -209,6 +211,7 @@ struct Loaded {
     clear_message: bool,
     open_as_tab: bool,
     retry_modal: Option<Modal>,
+    management_result: Option<management::Data>,
 }
 impl Loaded {
     fn read(
@@ -249,6 +252,7 @@ impl Loaded {
             clear_message,
             open_as_tab,
             retry_modal: None,
+            management_result: None,
         })
     }
 }
@@ -262,6 +266,7 @@ pub struct RepoTab {
     refresh_views: bool,
     task_finished: bool,
     history_retry: Option<(Modal, HistoryData, String)>,
+    management_result: Option<management::Data>,
     repo: Option<Repository>,
     snapshot: Snapshot,
     selection: Selection,
@@ -303,6 +308,7 @@ impl Default for RepoTab {
             refresh_views: false,
             task_finished: false,
             history_retry: None,
+            management_result: None,
             repo: None,
             snapshot: Snapshot::default(),
             selection: Selection::default(),
@@ -596,6 +602,10 @@ impl GitBuddy {
             self.history_data = history;
             self.restore_amend_message = Some(message);
         }
+        if let Some(data) = self.active.management_result.take() {
+            self.management_data = data;
+            self.modal = Some(Modal::LfsReport);
+        }
         cx.notify();
     }
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -836,6 +846,7 @@ impl GitBuddy {
                 | Operation::Rebase { .. }
                 | Operation::ContinueRebase
                 | Operation::AbortRebase
+                | Operation::RecoverRebaseStep { .. }
                 | Operation::Reset { .. }
                 | Operation::SaveStash { .. }
                 | Operation::RestoreStash { .. }
@@ -851,10 +862,18 @@ impl GitBuddy {
             self.active.selection.clone()
         };
         let limit = self.active.limit;
+        let scopes = match &operation {
+            Operation::PrepareWorktree(tree) | Operation::RemoveWorktree(tree) => {
+                vec![tree.path.clone()]
+            }
+            Operation::CreateWorktree { path, .. } => vec![path.clone()],
+            _ => Vec::new(),
+        };
         self.modal = None;
-        self.dispatch(
+        self.dispatch_scoped(
             operation.label(),
             operation.is_network(),
+            scopes,
             move |control| {
                 let (notice, error) = match repo.execute_with_control(operation, control) {
                     Ok(out) => (

@@ -27,12 +27,12 @@ pub struct LfsStatus {
     pub files: Vec<LfsFile>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Pointer {
-    oid: String,
-    size: u64,
+pub(super) struct Pointer {
+    pub(super) oid: String,
+    pub(super) size: u64,
 }
 impl Pointer {
-    fn parse(bytes: &[u8]) -> Option<Self> {
+    pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
         if bytes.len() > 1024 {
             return None;
         }
@@ -62,12 +62,19 @@ impl Pointer {
         format!("{VERSION}\noid sha256:{}\nsize {}\n", self.oid, self.size)
     }
 }
-fn hash(path: &Path) -> Result<Pointer> {
+pub(super) fn hash(path: &Path) -> Result<Pointer> {
+    hash_with_control(path, None)
+}
+pub(super) fn hash_with_control(path: &Path, control: Option<&NetworkControl>) -> Result<Pointer> {
     let mut file = fs::File::open(path)?;
+    let before = file.metadata()?;
     let mut digest = Sha256::new();
     let mut size = 0;
     let mut buffer = [0u8; 65536];
     loop {
+        if let Some(control) = control {
+            control.check()?;
+        }
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -75,25 +82,57 @@ fn hash(path: &Path) -> Result<Pointer> {
         digest.update(&buffer[..count]);
         size += count as u64;
     }
+    let after = file.metadata()?;
+    ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "LFS content changed while hashing; retry inspection"
+    );
     Ok(Pointer {
         oid: format!("{:x}", digest.finalize()),
         size,
     })
 }
-fn storage(repo: &git2::Repository) -> Result<PathBuf> {
-    ensure!(
-        repo.config()?.get_string("lfs.storage").is_err(),
-        "Custom lfs.storage is not supported by native LFS; use the default LFS object directory"
-    );
+pub(super) fn storage(repo: &git2::Repository) -> Result<PathBuf> {
+    match repo.config()?.get_entry("lfs.storage") {
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => anyhow::bail!(
+            "Custom lfs.storage is not supported by native LFS; use the default LFS object directory"
+        ),
+    }
+    for path in [
+        repo.commondir().join("lfs"),
+        repo.commondir().join("lfs/objects"),
+    ] {
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "LFS cache must not traverse a symlink"
+            );
+        }
+    }
     Ok(repo.commondir().join("lfs/objects"))
 }
-fn object(repo: &git2::Repository, pointer: &Pointer) -> Result<PathBuf> {
-    Ok(storage(repo)?
+pub(super) fn object(repo: &git2::Repository, pointer: &Pointer) -> Result<PathBuf> {
+    let path = storage(repo)?
         .join(&pointer.oid[..2])
         .join(&pointer.oid[2..4])
-        .join(&pointer.oid))
+        .join(&pointer.oid);
+    for part in [
+        path.parent().unwrap().parent().unwrap(),
+        path.parent().unwrap(),
+        path.as_path(),
+    ] {
+        if let Ok(metadata) = fs::symlink_metadata(part) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "LFS object path must not traverse a symlink"
+            );
+        }
+    }
+    Ok(path)
 }
-fn safe_path(repo: &git2::Repository, path: &Path) -> Result<PathBuf> {
+pub(super) fn safe_path(repo: &git2::Repository, path: &Path) -> Result<PathBuf> {
     ensure!(
         !path.as_os_str().is_empty()
             && path.components().all(|c| matches!(c, Component::Normal(_))),
@@ -619,15 +658,49 @@ fn run_lfs_program(
     control: &NetworkControl,
     program: &std::ffi::OsStr,
 ) -> Result<()> {
+    capture_lfs_program(root, args, control, program).map(|_| ())
+}
+
+pub(super) fn capture_lfs(root: &Path, args: &[&str], control: &NetworkControl) -> Result<String> {
+    capture_lfs_program(root, args, control, std::ffi::OsStr::new("git-lfs"))
+}
+fn drain(mut pipe: impl Read) -> Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut overflow = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = pipe.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        let remaining = (2 * 1024 * 1024usize).saturating_sub(kept.len());
+        overflow |= n > remaining;
+        kept.extend_from_slice(&buffer[..n.min(remaining)]);
+    }
+    ensure!(
+        !overflow,
+        "LFS output exceeds 2 MiB; no partial result was accepted"
+    );
+    Ok(kept)
+}
+fn capture_lfs_program(
+    root: &Path,
+    args: &[&str],
+    control: &NetworkControl,
+    program: &std::ffi::OsStr,
+) -> Result<String> {
     control.check()?;
-    control.phase("Transferring LFS objects…");
+    control.phase(&format!(
+        "Running git-lfs {}…",
+        args.first().copied().unwrap_or("operation")
+    ));
     let mut command = Command::new(program);
     command
         .args(args)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -640,25 +713,15 @@ fn run_lfs_program(
         )?,
         cleaned: false,
     };
-    let mut stderr = child.stderr.take().context("Missing LFS error pipe")?;
-    let reader = std::thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let remaining = 16384usize.saturating_sub(kept.len());
-                    kept.extend_from_slice(&buffer[..n.min(remaining)]);
-                }
-            }
-        }
-        kept
-    });
+    let stderr = child.stderr.take().context("Missing LFS error pipe")?;
+    let stdout = child.stdout.take().context("Missing LFS output pipe")?;
+    let reader = std::thread::spawn(move || drain(stderr));
+    let output = std::thread::spawn(move || drain(stdout));
     loop {
         if let Err(cancel) = control.check() {
             child.cleanup();
             let _ = reader.join();
+            let _ = output.join();
             return Err(cancel);
         }
         let status = match child.try_wait() {
@@ -666,28 +729,53 @@ fn run_lfs_program(
             Err(error) => {
                 child.cleanup();
                 let _ = reader.join();
+                let _ = output.join();
                 return Err(error.into());
             }
         };
         if let Some(status) = status {
             // A descendant may still hold stderr after its parent has exited.
             child.cleanup();
-            let error = reader.join().unwrap_or_default();
+            let error = reader.join();
+            let output = output.join();
+            let error = error.map_err(|_| anyhow::anyhow!("LFS error reader failed"))??;
+            let output = output.map_err(|_| anyhow::anyhow!("LFS output reader failed"))??;
             ensure!(
                 status.success(),
                 "git-lfs failed: {}",
                 String::from_utf8_lossy(&error)
             );
-            break;
+            return String::from_utf8(output).context("LFS output is not UTF-8");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn output_capture_rejects_oversize_data_instead_of_accepting_partial_json() {
+        let bytes = vec![b'x'; 2 * 1024 * 1024 + 1];
+        assert!(drain(std::io::Cursor::new(bytes)).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn capture_drains_stdout_and_stderr_and_returns_only_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = script(
+            dir.path(),
+            "printf '{\"ours\":[],\"theirs\":[]}'\nprintf 'diagnostic' >&2",
+        );
+        let result = capture_lfs_program(
+            dir.path(),
+            &["locks", "--verify", "--json"],
+            &NetworkControl::default(),
+            program.as_os_str(),
+        )
+        .unwrap();
+        assert_eq!(result, "{\"ours\":[],\"theirs\":[]}");
+    }
     #[test]
     fn pointer_parser_rejects_invalid_hashes_and_extensions() {
         let p = Pointer {

@@ -6,6 +6,7 @@ impl GitBuddy {
             return;
         }
         let a = self.form_a.read(cx).value().to_string();
+        let literal_a = a.clone();
         let b = self.form_b.read(cx).value().to_string();
         let a = a.trim().to_owned();
         let b = b.trim().to_owned();
@@ -14,7 +15,7 @@ impl GitBuddy {
         };
         match modal {
             Modal::MergeTool => self.submit_merge_tool(a, b, cx),
-            Modal::RebaseSetup => self.preview_rebase(a, cx),
+            Modal::RebaseSetup => self.preview_rebase(a, b, cx),
             Modal::WorktreeCreate => self.perform(
                 Operation::CreateWorktree {
                     name: a,
@@ -30,6 +31,13 @@ impl GitBuddy {
                 cx,
             ),
             Modal::LfsPattern(track) => self.perform(Operation::LfsTrack { pattern: a, track }, cx),
+            Modal::LfsLock(remote) => self.perform(
+                Operation::LfsLock {
+                    remote,
+                    path: literal_a.into(),
+                },
+                cx,
+            ),
             Modal::Open | Modal::Init | Modal::Clone => {
                 if a.is_empty() || (matches!(modal, Modal::Clone) && b.is_empty()) {
                     self.modal_error = Some("请填写完整的仓库地址 / 路径".into());
@@ -103,6 +111,7 @@ impl GitBuddy {
                 | Modal::Worktrees
                 | Modal::Submodules
                 | Modal::Lfs
+                | Modal::LfsReport
                 | Modal::RebaseMessage(_)
         ) {
             return self.management_modal(modal, cx);
@@ -125,8 +134,8 @@ impl GitBuddy {
             ),
             Modal::RebaseSetup => (
                 "Interactive rebase",
-                "Upstream / new base: branch, tag or commit",
-                None,
+                "Upstream / exclusive range boundary: branch, tag or commit",
+                Some("Optional --onto target (blank uses the upstream common ancestor)"),
                 "Build plan",
             ),
             Modal::WorktreeCreate => (
@@ -140,6 +149,12 @@ impl GitBuddy {
                 "Repository URL",
                 Some("Relative destination path"),
                 "Add",
+            ),
+            Modal::LfsLock(_) => (
+                "Lock LFS file",
+                "Repository-relative LFS file path",
+                None,
+                "Lock",
             ),
             Modal::LfsPattern(track) => (
                 if *track {
@@ -155,6 +170,7 @@ impl GitBuddy {
             | Modal::Worktrees
             | Modal::Submodules
             | Modal::Lfs
+            | Modal::LfsReport
             | Modal::RebaseMessage(_) => unreachable!(),
             Modal::Open => ("Open repository", "Local repository path", None, "Open"),
             Modal::Init => (

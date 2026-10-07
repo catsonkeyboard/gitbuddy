@@ -4,7 +4,7 @@
 
 ## 运行
 
-构建需要 Rust 1.95+。macOS 需要 Xcode Command Line Tools 和支持 Metal 的设备。普通 Git 操作通过 `git2` / `libgit2` 完成，不依赖系统 `git` 可执行文件；LFS 远程传输单独依赖官方 `git-lfs` 及其 Git 运行环境，通过进程参数直接调用，不经过 Bash。本项目使用 `gpui-kit = 0.6.6`，并提交 Cargo.lock 固定依赖。部分集成测试和演示仓库生成器使用系统 Git 准备测试数据。
+构建需要 Rust 1.95+。macOS 需要 Xcode Command Line Tools 和支持 Metal 的设备。普通 Git 操作通过 `git2` / `libgit2` 完成，不依赖系统 `git` 可执行文件；LFS 远程传输与锁管理单独依赖官方 `git-lfs` 及其 Git 运行环境，通过进程参数直接调用，不经过 Bash。本项目使用 `gpui-kit = 0.6.6`，并提交 Cargo.lock 固定依赖。部分集成测试和演示仓库生成器使用系统 Git 准备测试数据。
 
 ```sh
 cargo run --locked
@@ -43,6 +43,10 @@ GITBUDDY_CONFIG_DIR="$PWD/target/demo-diff/config" cargo run --locked
 cargo run --locked --example demo_stash
 GITBUDDY_CONFIG_DIR="$PWD/target/demo-stash/config" cargo run --locked
 
+# 创建 Rebase 恢复、递归子模块、Worktree 与 LFS 维护的独立演示仓库
+cargo run --locked --example demo_advanced_recovery
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-advanced-recovery/config" cargo run --locked
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -61,10 +65,10 @@ open dist/GitBuddy.app
 | 文件追踪 | 指定版本的文件列表、跟随重命名的文件历史、按提交展开文件 diff、逐行 Blame 与提交详情跳转 |
 | 比较 | 两个提交 / 分支 / 标签的文件树比较、增删统计、按文件折叠、反向比较、设置比较基准 |
 | 恢复 | HEAD Reflog 分页查看、选择操作前 / 后的提交、创建恢复分支、恢复当前分支位置 |
-| Rebase / Squash | 编辑线性提交计划、调整顺序、Pick / Reword / Squash / Fixup / Drop / Edit / Split、旧提交内容编辑与分批拆分、冲突继续 / 中止、持久化进度和原历史备份 |
-| Worktree | 列出关联工作树、新建分支及工作树、独立标签打开、锁定 / 解锁、移除干净工作树、清理失效登记 |
-| 子模块 | 添加、初始化 / 更新、递归更新、同步 URL、暂存当前 gitlink、独立标签打开、脏工作区保护及网络取消 |
-| Git LFS | Track / Untrack、原生 SHA-256 对象缓存及指针暂存、本地对象展开、缺失对象提示、按 remote Fetch / Push、普通 Push 前上传 LFS 对象 |
+| Rebase / Squash | 编辑线性提交计划、调整顺序、Pick / Reword / Squash / Fixup / Drop / Edit / Split / Break、--onto、Autosquash、旧提交编辑与拆分、冲突继续 / 中止、带现场备份的重试 / 跳过、持久化进度和原历史备份 |
+| Worktree | 列出关联工作树、新建分支及工作树、独立标签打开、锁定 / 解锁、移除干净工作树、清理失效登记、创建后展开共享 LFS 缓存、准备递归子模块 |
+| 子模块 | 添加、递归列出 / 初始化 / 更新 / 同步 URL、嵌套 gitlink 暂存、独立标签打开、Worktree 独立检出、脏工作区保护及网络取消 |
+| Git LFS | Track / Untrack、原生 SHA-256 缓存及指针暂存、本地对象展开、remote Fetch / Push、普通 Push 前上传、锁列表 / 创建 / 解锁 / 强制解锁、缓存校验 / 隔离清理 / 恢复 / 确认后永久删除 |
 | 分支 | 创建并切换、本地切换、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
 | 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、pull --ff-only、快捷 push、传输进度及取消、领先 / 落后计数 |
 | Stash | 按选定文件保存、工作区 / 索引 / 未跟踪文件分组预览、Apply / Pop、恢复索引、从 Stash 建分支、确认后删除 |
@@ -173,15 +177,21 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 发生冲突时转到工作区，进入已有冲突处理页；解决并暂存所有文件后，选择 **Continue rebase…**。也可再次打开管理页查看进度并继续或中止。进度保存在该工作树的 Git 管理目录，正常冲突暂停可在重启后继续；原分支直到计划完成才更新，原历史保留在 `refs/gitbuddy/rewrites/` 和 Reflog 中。中止恢复原分支及 tracked 文件，保留未跟踪文件。未提交的计划编辑属于临时对话框内容，不随会话保存。
 
-如果进程在补丁应用期间中断，尚未持久化“应用完成”的确认，Continue 会保留现场并拒绝创建提交；需先另存冲突解决结果，再中止并重建计划。升级前已暂停的旧格式 Rebase 若缺少此确认，也使用这一保护。存在 `index.lock` 时不会自动删除锁，需先确认没有其他 Git 进程。外部工具发起的 Rebase 中，普通 Commit 按钮、快捷键和后端入口均拒绝提交，由原工具继续 / 中止。
+第二个输入框可指定 **--onto** 目标；此时第一个版本是重放范围的排他边界，必须是当前分支祖先。例如边界 `old-base`、目标 `new-base` 只重放 `old-base..HEAD` 的线性提交。留空保留原共同祖先模式。**Autosquash** 将 `fixup! <subject / ID>` / `squash! <subject / ID>` 放在唯一匹配的较早提交之后，目标缺失或有歧义时拒绝修改计划。**Break** 重放该提交后暂停，可重启后在干净工作区继续。
 
-这是 GitBuddy 通过 libgit2 实现的提交序列，必须使用 GitBuddy 继续 / 中止，不能用外部 `git rebase --continue` 接管。当前最多 2,000 条，只支持本地分支、有共同祖先、无合并提交的线性区间；不自动 force push，也不自动签名。
+补丁应用期间中断且尚未持久化“应用完成”确认时，Continue 保留现场并拒绝创建提交。进度页的 **Retry current step… / Skip current step…** 在确认后，先将工作文件（含未跟踪内容及符号链接本身）、索引和恢复日志同步保存到该工作树 Git 管理目录的 `gitbuddy-rebase-recovery/<步骤-时间>/`，再重置到前一个重放提交并重试或跳过；不复制 `.git` 行政目录或跟随符号链接。备份失败不执行重置，恢复中再次中断仍需显式重试，不自动信任索引。跳过后紧邻的 Squash / Fixup 转为 Pick，避免误改写基准或其他提交组。现场副本不会自动清理，可手动取回文件后重新暂存。升级前缺少应用确认的日志使用相同保护。存在 `index.lock` 时不会自动删除锁，需先确认没有其他 Git 进程。外部工具发起的 Rebase 由原工具继续 / 中止。
+
+这是 GitBuddy 通过 libgit2 实现的提交序列，必须使用 GitBuddy 继续 / 中止，不能用外部 `git rebase --continue` 接管。当前最多 2,000 条，只支持本地分支的线性区间，不支持根提交重写或保留合并；显式 --onto 目标可独立于范围边界。不自动 force push，也不自动签名。
 
 ### Worktree 与子模块
 
 **Repository → Worktrees…** 列出关联工作树（主工作区不在列表中），可创建、打开为独立标签、锁定 / 解锁或移除。创建时从当前 HEAD 新建简单名称的分支，目标使用尚不存在的绝对路径；暂不支持复用已有分支。移除前再次确认名称、路径、HEAD、锁定状态和干净状态，并递归检查子模块；子模块的 `ignore=all` 等显示策略不会掩盖未提交编辑、未跟踪文件或 gitlink 变化。拒绝移除当前工作树，移除后保留分支。目录已缺失时可清理登记。切换、删除和改写分支时检查其他工作树是否占用该分支。
 
 **Repository → Submodules…** 支持添加 URL 与相对路径、初始化 / 更新、递归更新、同步 `.gitmodules` URL、暂存当前子仓库提交，以及打开为独立标签。更新到父仓库暂存区记录的 gitlink，不自动追踪远程最新分支；拒绝覆盖子仓库的未提交编辑。新增子模块要求父工作区干净，成功后 `.gitmodules` 与 gitlink 进入暂存区；克隆失败可能保留登记，可通过更新重试。递归更新最多 32 层，网络阶段支持取消，已完成的子模块不会回滚。
+
+子模块列表递归展示已初始化模块及其直接子模块；未初始化的更深层级在更新后出现。嵌套行的 Stage 写入实际直接父仓库的索引，需逐层提交 / 暂存。Sync URLs 递归同步已初始化模块。更新前先检查所选范围内已存在的后代，即使 `ignore=all` 也拒绝覆盖编辑；拒绝路径穿越、符号链接路径和指向其他检出位置的 Git 元数据。
+
+创建 Worktree 后展开共享缓存中已有的 LFS 对象，管理页 **Prepare submodules / LFS** 递归初始化其子模块。新 Worktree 的子模块使用独立嵌入式 `.git` 检出，避免共享子模块 HEAD / index；已有指向其他工作区的元数据会拒绝操作。子模块添加 / 更新后也展开自身缓存，缺失对象明确提示，需进入该子模块标签 Fetch LFS，不自动下载所有正文。父子仓库的后台任务不能同时写入，关联 Worktree 的 GitBuddy 写操作使用共同锁；无关联仓库仍独立运行。锁只约束 GitBuddy，不能代替与外部 Git 工具的协调。
 
 ### Git LFS
 
@@ -191,9 +201,13 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 本地 Track、暂存和 **Checkout local objects** 不需要 `git-lfs`。远程 Fetch / Push 需要安装官方 `git-lfs` 及其 Git 运行环境；选择 remote 后下载 / 上传 HEAD 所需的 LFS 对象，Fetch 成功后展开本地文件。普通 Push 先上传待推送历史涉及的 LFS 对象，上传失败则不更新远程 Git 引用。普通 Clone / Fetch 不自动下载 LFS 对象。LFS 传输提供取消，停止进程及其 Unix 子进程组，但已上传 / 下载的对象不会回滚。
 
+**Locks <remote>…** 查询服务器核验过的 yours / others 列表，可为现有 LFS 文件创建锁、按稳定 ID 解锁，强制解锁他人的锁需要单独确认。执行前重新核验路径、创建时间和归属；服务器不支持锁、认证失败、返回不完整或重复 ID 时拒绝操作。已配置的 `lfs.url` 会覆盖 remote 的端点选择，详见[官方锁命令说明](https://github.com/git-lfs/git-lfs/blob/main/docs/man/git-lfs-locks.adoc)。锁查询 / 写入沿用可取消任务；取消可能发生在服务器写入之后，需刷新核对，客户端不声称回滚远端锁。
+
+**Verify / Prune preview…** 不依赖 `git-lfs`，后台计算默认缓存中标准对象的 SHA-256；损坏对象保留并报告。保护所有引用、Reflog（含遗留日志）、GitBuddy 历史备份、索引及冲突阶段和所有关联 Worktree 的对象；历史不可读、失效 Worktree 或自定义存储时拒绝清理。预览固定保护集合和缓存内容指纹，执行时重新计算，拒绝过期结果。**Quarantine unreferenced objects…** 将未引用对象移到共享 LFS 目录的 `gitbuddy-quarantine/<时间>/`，不释放空间；**Restore quarantine** 校验后移回缓存。刷新预览后，**Delete quarantine…** 再次确认并永久删除仍未被引用的隔离对象，释放正文文件占用的空间；损坏或重新被引用的对象不会删除。清理 / 永久删除要求所有 Worktree 无修改且没有未完成操作，失败可能只完成部分对象，并提示剩余目录。对象校验可取消，最终移动 / 删除开始后等待完成。
+
 ### 通用约定
 
-- 普通仓库操作由 Rust `git2` 在后台调用 `libgit2` 完成；LFS 远程传输直接启动官方 `git-lfs`（它自身依赖 Git），不经过 Bash。单文件操作按字面路径匹配，支持空格、换行、通配字符及 Unix 非 UTF-8 文件名；LFS 路径与规则的限制见上文。
+- 普通仓库操作由 Rust `git2` 在后台调用 `libgit2` 完成；LFS 远程传输与锁管理直接启动官方 `git-lfs`（它自身依赖 Git），不经过 Bash。单文件操作按字面路径匹配，支持空格、换行、通配字符及 Unix 非 UTF-8 文件名；LFS 路径与规则的限制见上文。
 - 丢弃操作只恢复工作区到暂存区版本，不清除已暂存内容；不提供批量删除未跟踪文件的快捷操作。
 - 删除 stash、丢弃修改、合并、revert 等操作需要在应用内确认。Stash 应用及删除按对象 ID 定位，在引用锁内读取当前位置；外部新增 Stash 不会改变已选目标，目标已消失或不唯一时拒绝操作。分支合并菜单使用完整本地 / 远程引用，同名简写有歧义时拒绝合并。删除分支前检查分支是否已合入当前 HEAD，推送不使用 force。
 - 远程操作通过 `libgit2` 使用 SSH agent / Git credential helper。现有仓库的 Fetch、Pull、Push 和子模块操作使用有效仓库配置（包含全局、仓库及 include 配置）；URL 级凭据助手、用户名及 `useHttpPath` 由 git2 解析。首次 Clone 使用全局默认配置。GUI 不提供终端密码输入，首次 SSH 信任及凭据准备应先完成；错误可在状态栏复制。
@@ -221,7 +235,7 @@ cargo test --locked
 
 ## 当前边界
 
-Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根提交重写或保留合并提交。LFS 当前支持默认对象目录和标准 SHA-256 指针，不支持扩展指针、自定义 `lfs.storage` 或历史迁移。提交图依据已加载提交的父子关系绘制；图宽按所有 lane 及连线端点计算，多分支时保留文字区域并支持横向滚动。搜索过滤或分页边界外的提交不会显示连线，内部历史备份引用不作为普通分支显示。`libgit2` 创建提交时不会执行用户的 Git hooks 或自动进行 GPG 签名。
+Rebase 当前只支持本地分支线性历史，不支持根提交重写或保留合并提交。LFS 当前支持默认对象目录和标准 SHA-256 指针，不支持扩展指针、自定义 `lfs.storage` 或历史迁移。提交图依据已加载提交的父子关系绘制；图宽按所有 lane 及连线端点计算，多分支时保留文字区域并支持横向滚动。搜索过滤或分页边界外的提交不会显示连线，内部历史备份引用不作为普通分支显示。`libgit2` 创建提交时不会执行用户的 Git hooks 或自动进行 GPG 签名。
 
 紧凑差异预览最多 20,000 行，完整上下文最多 100,000 补丁行 / 16 MB；未跟踪文件超过 2 MB 不加载正文。网络传输进度每 100ms 节流，阶段切换即时显示；取消边界见上文。真实外部服务器认证尚未验收。当前在 macOS 验证，Windows/Linux 尚未验收。生成的 .app 用于本地运行，未做发行签名或公证。
 
@@ -238,6 +252,7 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `src/git/conflicts.rs`：索引三方内容、结果保存、引用 / 索引锁和过期校验、继续冲突操作。
 - `src/git/conflict_blocks.rs`、`src/git/merge_tool.rs`：逐块选择、直接参数启动外部工具、临时结果与取消 / 过期保护。
 - `src/git/rebase.rs`：基于 libgit2 的可编辑提交序列、引用事务、持久化进度、冲突继续与中止。
+- `src/git/lfs_maintenance.rs`：LFS 锁核验、全历史 / Worktree 对象保护、缓存校验与隔离清理。
 - `src/git/workspaces.rs`：Worktree 与子模块管理、跨工作树分支占用检查。
 - `src/git/lfs.rs`：原生指针暂存 / 本地展开、对象校验，以及可取消的官方 git-lfs 传输进程。
 - `src/ui.rs`：状态机核心——多仓库标签（`tabs` + `active` 两段式）与异步代际控制。

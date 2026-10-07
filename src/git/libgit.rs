@@ -13,6 +13,26 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+pub(super) struct WriterLock(std::fs::File);
+impl WriterLock {
+    pub(super) fn acquire(repo: &RawRepo) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(repo.commondir().join("gitbuddy-writer.lock"))?;
+        file.try_lock()
+            .context("Another GitBuddy task is writing this repository or a linked worktree")?;
+        Ok(Self(file))
+    }
+}
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly inherit this descriptor before exec.
+        let _ = self.0.unlock();
+    }
+}
 pub(super) fn raw(repo: &Repository) -> Result<RawRepo> {
     RawRepo::open(&repo.root).context("无法打开 Git 仓库")
 }
@@ -863,11 +883,15 @@ impl Repository {
                 }
         );
         let initial = raw(self)?;
+        // Linked worktrees share refs and the LFS object store. This advisory
+        // lock serializes GitBuddy writers without blocking unrelated repos.
+        let _writer = WriterLock::acquire(&initial)?;
         if super::rebase::active(&initial) {
             ensure!(
                 matches!(
                     &operation,
                     Operation::ContinueRebase
+                        | Operation::RecoverRebaseStep { .. }
                         | Operation::CommitRebase(_)
                         | Operation::AbortRebase
                         | Operation::Stage(_)
@@ -897,11 +921,17 @@ impl Repository {
             match operation {
                 Operation::Rebase { context, steps } => self.start_rebase(&context, steps),
                 Operation::ContinueRebase => self.continue_rebase(),
+                Operation::RecoverRebaseStep { expected, skip } => {
+                    self.recover_rebase_step(skip, &expected)
+                }
                 Operation::CommitRebase(message) => self.commit_rebase(&message),
                 Operation::AbortRebase => self.abort_rebase(),
                 Operation::CreateWorktree { name, path } => self.create_worktree(&name, &path),
                 Operation::LockWorktree { name, locked } => self.lock_worktree(&name, locked),
                 Operation::RemoveWorktree(expected) => self.remove_worktree(&expected),
+                Operation::PrepareWorktree(expected) => {
+                    self.prepare_worktree(&expected, control.clone())
+                }
                 Operation::AddSubmodule { url, path } => {
                     self.add_submodule(&url, &path, control.clone())
                 }
@@ -910,10 +940,29 @@ impl Repository {
                 }
                 Operation::SyncSubmodules => self.sync_submodules(),
                 Operation::StageSubmodule(name) => self.stage_submodule(&name),
+                Operation::UpdateSubmoduleAt(expected) => {
+                    self.update_submodule_at(&expected, control.clone())
+                }
+                Operation::StageSubmoduleAt(expected) => self.stage_submodule_at(&expected),
                 Operation::LfsTrack { pattern, track } => self.lfs_track(&pattern, track),
                 Operation::LfsCheckout => self.lfs_checkout(),
                 Operation::LfsFetch(remote) => self.lfs_transfer(false, &remote, control.clone()),
                 Operation::LfsPush(remote) => self.lfs_transfer(true, &remote, control.clone()),
+                Operation::LfsLock { remote, path } => {
+                    self.lfs_lock(&remote, &path, control.clone())
+                }
+                Operation::LfsUnlock {
+                    remote,
+                    lock,
+                    force,
+                } => self.lfs_unlock(&remote, &lock, force, control.clone()),
+                Operation::LfsQuarantine(expected) => {
+                    self.lfs_quarantine(&expected, control.clone())
+                }
+                Operation::LfsRestoreQuarantine => self.lfs_restore_quarantine(control.clone()),
+                Operation::LfsPurgeQuarantine(expected) => {
+                    self.lfs_purge_quarantine(&expected, control.clone())
+                }
                 Operation::Amend { context, message } => self.amend(&context, &message),
                 Operation::UndoLast(expected) => self.undo_last(&expected),
                 Operation::RestoreReflog { expected, target } => {

@@ -27,6 +27,8 @@ pub struct SubmoduleInfo {
     pub workdir: Option<String>,
     pub initialized: bool,
     pub dirty: bool,
+    pub parent: PathBuf,
+    pub depth: usize,
 }
 fn relative(path: &Path) -> Result<()> {
     ensure!(
@@ -170,8 +172,14 @@ impl Repository {
         let mut options = WorktreeAddOptions::new();
         options.checkout_existing(false);
         repo.worktree(name, path, Some(&options))?;
+        let missing = super::lfs::hydrate(&git2::Repository::open(path)?).with_context(|| {
+            format!(
+                "Worktree was created at {}; retry LFS checkout there",
+                path.display()
+            )
+        })?;
         Ok(format!(
-            "Created worktree {} on new branch {name}",
+            "Created worktree {} on new branch {name}; {missing} LFS objects need fetching",
             path.display()
         ))
     }
@@ -224,31 +232,131 @@ impl Repository {
     }
     pub fn submodules(&self) -> Result<Vec<SubmoduleInfo>> {
         let repo = raw(self)?;
-        repo.submodules()?
-            .into_iter()
-            .map(|module| {
-                let name = module.name()?.to_string();
-                let child = module.open().ok();
-                Ok(SubmoduleInfo {
-                    name: name.clone(),
-                    path: module.path().into(),
-                    url: module.url()?.unwrap_or_default().into(),
-                    head: module.head_id().map(|id| id.to_string()),
-                    index: module.index_id().map(|id| id.to_string()),
-                    workdir: module.workdir_id().map(|id| id.to_string()),
-                    initialized: child.is_some(),
-                    dirty: child.as_ref().is_some_and(|r| clean(r).is_err())
-                        || repo
-                            .submodule_status(&name, SubmoduleIgnore::None)?
-                            .intersects(
-                                git2::SubmoduleStatus::WD_INDEX_MODIFIED
-                                    | git2::SubmoduleStatus::WD_WD_MODIFIED
-                                    | git2::SubmoduleStatus::WD_UNTRACKED,
-                            ),
-                })
-            })
-            .collect()
+        list(&repo, Path::new(""), 0, false)
     }
+    pub fn submodules_recursive(&self) -> Result<Vec<SubmoduleInfo>> {
+        list(&raw(self)?, Path::new(""), 0, true)
+    }
+    pub(super) fn prepare_worktree(
+        &self,
+        expected: &WorktreeInfo,
+        control: NetworkControl,
+    ) -> Result<String> {
+        let current = self
+            .worktrees()?
+            .into_iter()
+            .find(|t| t.name == expected.name)
+            .context("Worktree no longer exists")?;
+        ensure!(
+            current.path == expected.path && current.head == expected.head && current.valid,
+            "Worktree changed; refresh before preparing it"
+        );
+        let child = Repository::open(&current.path)?;
+        let modules = child.update_submodules(&[], true, control)?;
+        let message = child.lfs_checkout()?;
+        Ok(format!("Worktree prepared; {modules}; {message}"))
+    }
+    pub(super) fn update_submodule_at(
+        &self,
+        expected: &SubmoduleInfo,
+        control: NetworkControl,
+    ) -> Result<String> {
+        let parent = self.checked_submodule_parent(expected)?;
+        parent.update_submodules(std::slice::from_ref(&expected.name), true, control)
+    }
+    pub(super) fn stage_submodule_at(&self, expected: &SubmoduleInfo) -> Result<String> {
+        self.checked_submodule_parent(expected)?
+            .stage_submodule(&expected.name)
+    }
+    fn checked_submodule_parent(&self, expected: &SubmoduleInfo) -> Result<Repository> {
+        let current = self
+            .submodules_recursive()?
+            .into_iter()
+            .find(|m| m.path == expected.path && m.name == expected.name)
+            .context("Submodule no longer exists")?;
+        ensure!(
+            current.parent == expected.parent && current.index == expected.index,
+            "Submodule changed; refresh before operating on it"
+        );
+        Repository::open(&current.parent)
+    }
+}
+
+fn module_path(repo: &git2::Repository, module: &git2::Submodule<'_>) -> Result<PathBuf> {
+    relative(module.path())?;
+    let root = repo
+        .workdir()
+        .context("Submodules require a working tree")?;
+    let mut path = root.to_path_buf();
+    for component in module.path().components() {
+        path.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "Submodule path traverses a symlink: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(path)
+}
+fn checked_child(
+    repo: &git2::Repository,
+    module: &git2::Submodule<'_>,
+) -> Result<Option<git2::Repository>> {
+    let path = module_path(repo, module)?;
+    if !path.join(".git").exists() {
+        return Ok(None);
+    }
+    let child = git2::Repository::open(&path)?;
+    ensure!(
+        child.workdir().and_then(|p| p.canonicalize().ok()) == path.canonicalize().ok(),
+        "Submodule Git metadata points at another worktree; refusing shared checkout"
+    );
+    Ok(Some(child))
+}
+fn list(
+    repo: &git2::Repository,
+    prefix: &Path,
+    depth: usize,
+    recursive: bool,
+) -> Result<Vec<SubmoduleInfo>> {
+    ensure!(depth < 32, "Submodule recursion exceeds 32 levels");
+    let mut result = Vec::new();
+    for module in repo.submodules()? {
+        let name = module.name()?.to_string();
+        let child = checked_child(repo, &module)?;
+        let path = prefix.join(module.path());
+        result.push(SubmoduleInfo {
+            name: name.clone(),
+            path: path.clone(),
+            parent: repo.workdir().context("No parent worktree")?.into(),
+            depth,
+            url: module.url()?.unwrap_or_default().into(),
+            head: module.head_id().map(|id| id.to_string()),
+            index: module.index_id().map(|id| id.to_string()),
+            workdir: child
+                .as_ref()
+                .and_then(|r| r.head().ok()?.target())
+                .map(|id| id.to_string()),
+            initialized: child.is_some(),
+            dirty: child.as_ref().is_some_and(|r| clean(r).is_err())
+                || repo
+                    .submodule_status(&name, SubmoduleIgnore::None)?
+                    .intersects(
+                        git2::SubmoduleStatus::WD_INDEX_MODIFIED
+                            | git2::SubmoduleStatus::WD_WD_MODIFIED
+                            | git2::SubmoduleStatus::WD_UNTRACKED,
+                    ),
+        });
+        if recursive && let Some(child) = child {
+            result.extend(list(&child, &path, depth + 1, true)?);
+        }
+    }
+    Ok(result)
+}
+
+impl Repository {
     pub(super) fn add_submodule(
         &self,
         url: &str,
@@ -276,7 +384,7 @@ impl Repository {
             !self.root.join(path).exists(),
             "Submodule destination must not exist"
         );
-        let mut module = repo.submodule(url, path, true)?;
+        let mut module = repo.submodule(url, path, !repo.is_worktree())?;
         let mut fetch = FetchOptions::new();
         fetch.remote_callbacks(network_callbacks(
             control.clone(),
@@ -289,7 +397,12 @@ impl Repository {
         )?;
         control.cancellation.finish()?;
         module.add_finalize()?;
-        Ok("Submodule added; review and commit .gitmodules and its gitlink".into())
+        let missing = super::lfs::hydrate(
+            &checked_child(&repo, &module)?.context("Missing submodule checkout")?,
+        )?;
+        Ok(format!(
+            "Submodule added; review and commit .gitmodules and its gitlink; {missing} LFS objects need fetching in its tab"
+        ))
     }
     pub(super) fn update_submodules(
         &self,
@@ -302,21 +415,24 @@ impl Repository {
             repo.state() == RepositoryState::Clean && !super::rebase::active(&repo),
             "Finish the current operation first"
         );
-        update(&repo, names, recursive, &control, 0)?;
+        preflight(&repo, names, recursive, 0)?;
+        let missing = update(&repo, names, recursive, &control, 0)?;
         control.cancellation.finish()?;
-        Ok("Submodules updated to the commits recorded in the index".into())
+        Ok(format!(
+            "Submodules updated to the commits recorded in the index; {missing} LFS objects need fetching in their submodule tabs"
+        ))
     }
     pub(super) fn sync_submodules(&self) -> Result<String> {
         let repo = raw(self)?;
-        for mut module in repo.submodules()? {
-            module.sync()?;
-        }
-        Ok("Submodule URLs synchronized from .gitmodules".into())
+        sync_recursive(&repo, 0)?;
+        Ok("Submodule URLs synchronized recursively from .gitmodules".into())
     }
     pub(super) fn stage_submodule(&self, name: &str) -> Result<String> {
         let repo = raw(self)?;
         ensure!(!repo.index()?.has_conflicts(), "Resolve conflicts first");
-        repo.find_submodule(name)?.add_to_index(true)?;
+        let mut module = repo.find_submodule(name)?;
+        checked_child(&repo, &module)?.context("Initialize the submodule first")?;
+        module.add_to_index(true)?;
         Ok("Submodule commit staged in parent repository".into())
     }
 }
@@ -326,8 +442,9 @@ fn update(
     recursive: bool,
     control: &NetworkControl,
     depth: usize,
-) -> Result<()> {
+) -> Result<usize> {
     ensure!(depth < 32, "Submodule recursion exceeds 32 levels");
+    let mut missing = 0;
     let names = if names.is_empty() {
         repo.submodules()?
             .iter()
@@ -339,28 +456,103 @@ fn update(
     for name in names {
         control.check()?;
         let mut module = repo.find_submodule(&name)?;
-        if let Ok(child) = module.open() {
-            clean(&child).with_context(|| format!("Submodule {name} has changes"))?;
-            super::lfs::dehydrate(&child)?;
-        }
         module.init(false)?;
-        let mut fetch = FetchOptions::new();
-        fetch.remote_callbacks(network_callbacks(
-            control.clone(),
-            repo.config()?.snapshot()?,
-        ));
-        let mut checkout = CheckoutBuilder::new();
-        checkout.safe();
-        let mut options = SubmoduleUpdateOptions::new();
-        options.fetch(fetch).checkout(checkout).allow_fetch(true);
-        control.phase(&format!("Updating submodule {name}…"));
-        let result = module.update(true, Some(&mut options));
-        if let Ok(child) = module.open() {
-            super::lfs::hydrate(&child)?;
+        // libgit2's module store is shared between linked worktrees. A fresh
+        // embedded clone gives this worktree an independent submodule HEAD/index.
+        if repo.is_worktree() && checked_child(repo, &module)?.is_none() {
+            let url = repo
+                .config()?
+                .get_string(&format!("submodule.{name}.url"))?;
+            let mut fetch = FetchOptions::new();
+            fetch.remote_callbacks(network_callbacks(
+                control.clone(),
+                repo.config()?.snapshot()?,
+            ));
+            let mut builder = git2::build::RepoBuilder::new();
+            builder.fetch_options(fetch);
+            builder
+                .clone(&url, &module_path(repo, &module)?)
+                .with_context(|| {
+                    format!("Independent submodule clone {name} failed; retry Update")
+                })?;
         }
+        if let Some(child) = checked_child(repo, &module)? {
+            clean(&child).with_context(|| format!("Submodule {name} has changes"))?;
+            if let Err(error) = super::lfs::dehydrate(&child) {
+                let _ = super::lfs::hydrate(&child);
+                return Err(error);
+            }
+        }
+        let result = (|| -> Result<()> {
+            let mut fetch = FetchOptions::new();
+            fetch.remote_callbacks(network_callbacks(
+                control.clone(),
+                repo.config()?.snapshot()?,
+            ));
+            let mut checkout = CheckoutBuilder::new();
+            checkout.safe();
+            let mut options = SubmoduleUpdateOptions::new();
+            options.fetch(fetch).checkout(checkout).allow_fetch(true);
+            control.phase(&format!("Updating submodule {name}…"));
+            module.update(true, Some(&mut options))?;
+            Ok(())
+        })();
+        let hydration = checked_child(repo, &module)?
+            .map(|child| super::lfs::hydrate(&child))
+            .transpose();
         result?;
+        missing += hydration?.unwrap_or_default();
         if recursive {
-            update(&module.open()?, &[], true, control, depth + 1)?;
+            missing += update(
+                &checked_child(repo, &module)?.context("Submodule checkout is missing")?,
+                &[],
+                true,
+                control,
+                depth + 1,
+            )?;
+        }
+    }
+    Ok(missing)
+}
+
+fn preflight(
+    repo: &git2::Repository,
+    names: &[String],
+    recursive: bool,
+    depth: usize,
+) -> Result<()> {
+    ensure!(depth < 32, "Submodule recursion exceeds 32 levels");
+    for module in repo.submodules()? {
+        if !names.is_empty()
+            && !names
+                .iter()
+                .any(|name| module.name().ok() == Some(name.as_str()))
+        {
+            continue;
+        }
+        let path = module_path(repo, &module)?;
+        if let Some(child) = checked_child(repo, &module)? {
+            clean(&child).with_context(|| format!("Submodule {} has changes", path.display()))?;
+            if recursive {
+                preflight(&child, &[], true, depth + 1)?;
+            }
+        } else if path.exists() {
+            ensure!(
+                path.is_dir() && std::fs::read_dir(&path)?.next().is_none(),
+                "Uninitialized submodule {} contains files; preserve them first",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+fn sync_recursive(repo: &git2::Repository, depth: usize) -> Result<()> {
+    ensure!(depth < 32, "Submodule recursion exceeds 32 levels");
+    for mut module in repo.submodules()? {
+        let child = checked_child(repo, &module)?;
+        module.sync()?;
+        if let Some(child) = child {
+            sync_recursive(&child, depth + 1)?;
         }
     }
     Ok(())

@@ -8,6 +8,79 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs, io::Write};
 
 const STATE: &str = "gitbuddy-rebase.json";
+// Do not follow symlinks or descend into Git administrative directories.
+fn copy_recovery_tree(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_recovery_tree(&entry.path(), &target)?;
+        } else if kind.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, &target)?;
+            #[cfg(not(unix))]
+            bail!(
+                "Preserve symlink {} manually before recovery",
+                entry.path().display()
+            );
+        } else {
+            ensure!(
+                kind.is_file(),
+                "Cannot back up special file {}",
+                entry.path().display()
+            );
+            fs::copy(entry.path(), &target)?;
+            fs::File::open(target)?.sync_all()?;
+        }
+    }
+    fs::File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+/// Reorder fixup! / squash! commits after a unique earlier subject or object prefix.
+/// Ambiguous and unmatched targets are rejected so the UI can show the problem.
+pub fn autosquash(steps: &[RebaseStep]) -> Result<Vec<RebaseStep>> {
+    let mut groups: Vec<Vec<RebaseStep>> = Vec::new();
+    for step in steps {
+        let subject = step.message.lines().next().unwrap_or_default();
+        let special = subject
+            .strip_prefix("fixup! ")
+            .map(|s| (s, RebaseAction::Fixup))
+            .or_else(|| {
+                subject
+                    .strip_prefix("squash! ")
+                    .map(|s| (s, RebaseAction::Squash))
+            });
+        if let Some((target, action)) = special {
+            let matches = groups
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| {
+                    let first = &group[0];
+                    first.action != RebaseAction::Drop
+                        && (first.message.lines().next() == Some(target)
+                            || (target.len() >= 4 && first.id.starts_with(target)))
+                })
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            ensure!(
+                matches.len() == 1,
+                "Autosquash target is missing or ambiguous: {target}"
+            );
+            let mut step = step.clone();
+            step.action = action;
+            groups[matches[0]].push(step);
+        } else {
+            groups.push(vec![step.clone()]);
+        }
+    }
+    Ok(groups.into_iter().flatten().collect())
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RebaseAction {
     Pick,
@@ -17,6 +90,8 @@ pub enum RebaseAction {
     Drop,
     Edit,
     Split,
+    /// Replay this commit, then pause before the next step.
+    Break,
 }
 impl RebaseAction {
     pub fn label(self) -> &'static str {
@@ -28,6 +103,7 @@ impl RebaseAction {
             Self::Drop => "Drop",
             Self::Edit => "Edit",
             Self::Split => "Split",
+            Self::Break => "Break",
         }
     }
 }
@@ -55,6 +131,9 @@ pub struct RebaseStatus {
     pub backup: String,
     pub editing: bool,
     pub replacement_commits: usize,
+    pub paused: bool,
+    pub interrupted: bool,
+    pub recoverable: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -82,6 +161,10 @@ struct State {
     replacement_commits: usize,
     #[serde(default)]
     prepared_edit: bool,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    restarting: bool,
 }
 pub(super) fn active(repo: &Raw) -> bool {
     repo.path().join(STATE).exists()
@@ -124,6 +207,7 @@ fn save(repo: &Raw, state: &State) -> Result<()> {
     temp.write_all(&serde_json::to_vec_pretty(state)?)?;
     temp.as_file().sync_all()?;
     temp.persist(repo.path().join(STATE))?;
+    fs::File::open(repo.path())?.sync_all()?;
     Ok(())
 }
 struct Lock(fs::File);
@@ -211,7 +295,104 @@ fn move_head(repo: &Raw, expected: &str, target: &str) -> Result<()> {
     Ok(())
 }
 impl Repository {
+    /// Restart only an uncommitted replay step. Keep a durable copy before any reset.
+    pub(super) fn recover_rebase_step(&self, skip: bool, expected: &str) -> Result<String> {
+        let repo = raw(self)?;
+        let _lock = Lock::acquire(&repo)?;
+        let mut state = load(&repo)?;
+        checked_branch(&repo, &state)?;
+        ensure!(
+            state.pending
+                && !state.editing
+                && !state.finishing
+                && state.prepared.is_none()
+                && state
+                    .steps
+                    .get(state.cursor)
+                    .is_some_and(|s| s.id == expected),
+            "The pending step changed; reopen Rebase recovery"
+        );
+        ensure!(
+            !repo.path().join("index.lock").exists(),
+            "An index lock exists; verify no Git process is running before recovering. The lock was not removed"
+        );
+        let backup = repo.path().join("gitbuddy-rebase-recovery").join(format!(
+            "{}-{}",
+            state.cursor,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&backup)?;
+        copy_recovery_tree(
+            repo.workdir().context("No working tree")?,
+            &backup.join("worktree"),
+        )?;
+        for name in ["index", STATE, "CHERRY_PICK_HEAD", "MERGE_MSG"] {
+            let path = repo.path().join(name);
+            if path.is_file() {
+                fs::copy(path, backup.join(name))?;
+                fs::File::open(backup.join(name))?.sync_all()?;
+            }
+        }
+        fs::File::open(&backup)?.sync_all()?;
+        fs::File::open(backup.parent().unwrap())?.sync_all()?;
+        let result = (|| -> Result<String> {
+            {
+                // Keep external checkout/ref updates out of the destructive
+                // reset. HEAD already names the preceding replayed commit.
+                let mut refs = repo.transaction()?;
+                refs.lock_ref("HEAD")?;
+                refs.lock_ref(&state.branch)?;
+                checked_branch(&repo, &state)?;
+                ensure!(
+                    head_state(&repo)?.reference == "HEAD",
+                    "Rebase HEAD is no longer detached"
+                );
+                state.restarting = true;
+                save(&repo, &state)?;
+                let current = repo.find_commit(oid(&state.current)?)?;
+                let mut checkout = CheckoutBuilder::new();
+                checkout.force();
+                repo.checkout_tree(current.as_object(), Some(&mut checkout))?;
+                let mut index = repo.index()?;
+                index.read_tree(&current.tree()?)?;
+                index.write()?;
+                repo.cleanup_state()?;
+                state.pending = false;
+                state.applied = false;
+                state.restarting = false;
+                if skip {
+                    state.cursor += 1;
+                    if let Some(next) = state.steps.get_mut(state.cursor)
+                        && matches!(next.action, RebaseAction::Squash | RebaseAction::Fixup)
+                    {
+                        // The skipped group's follower must not amend onto.
+                        next.action = RebaseAction::Pick;
+                    }
+                }
+                save(&repo, &state)?;
+            }
+            super::lfs::hydrate(&repo)?;
+            super::lfs::dehydrate(&repo)?;
+            run(&repo, &mut state)
+        })();
+        let hydration = super::lfs::hydrate(&repo);
+        let result = result.and_then(|message| hydration.map(|_| message));
+        match result {
+            Ok(message) => Ok(format!("{message}; recovery files: {}", backup.display())),
+            Err(error) => {
+                Err(error.context(format!("Recovery files saved at {}", backup.display())))
+            }
+        }
+    }
     pub fn rebase_preview(&self, upstream: &str) -> Result<RebasePreview> {
+        self.rebase_preview_onto(upstream, None)
+    }
+    /// With an explicit target, upstream is the exclusive range boundary.
+    pub fn rebase_preview_onto(
+        &self,
+        upstream: &str,
+        target: Option<&str>,
+    ) -> Result<RebasePreview> {
         let repo = raw(self)?;
         clean(&repo)?;
         let head = head_state(&repo)?;
@@ -220,13 +401,26 @@ impl Repository {
             "Check out a local branch before rebasing"
         );
         let original = oid(head.id.as_deref().context("No commits to rebase")?)?;
-        let onto = repo
+        let upstream = repo
             .revparse_single(upstream.trim())?
             .peel_to_commit()?
             .id();
-        let base = repo
-            .merge_base(original, onto)
-            .context("Rebase requires a common ancestor")?;
+        let (base, onto) = if let Some(target) = target.filter(|s| !s.trim().is_empty()) {
+            ensure!(
+                upstream == original || repo.graph_descendant_of(original, upstream)?,
+                "The --onto range boundary must be an ancestor of the current branch"
+            );
+            (
+                upstream,
+                repo.revparse_single(target.trim())?.peel_to_commit()?.id(),
+            )
+        } else {
+            (
+                repo.merge_base(original, upstream)
+                    .context("Rebase requires a common ancestor")?,
+                upstream,
+            )
+        };
         let mut current = original;
         let mut steps = Vec::new();
         while current != base {
@@ -271,6 +465,20 @@ impl Repository {
             backup: s.backup,
             editing: s.editing,
             replacement_commits: s.replacement_commits,
+            paused: s.paused,
+            interrupted: s.restarting
+                || (s.pending
+                    && !s.editing
+                    && s.prepared.is_none()
+                    && (!s.applied
+                        || fs::read_to_string(repo.path().join("CHERRY_PICK_HEAD"))
+                            .ok()
+                            .is_none_or(|marker| {
+                                s.steps
+                                    .get(s.cursor)
+                                    .is_none_or(|step| marker.trim() != step.id)
+                            }))),
+            recoverable: s.pending && !s.editing && !s.finishing && s.prepared.is_none(),
         }))
     }
     pub(super) fn start_rebase(
@@ -356,6 +564,8 @@ impl Repository {
             editing: false,
             replacement_commits: 0,
             prepared_edit: false,
+            paused: false,
+            restarting: false,
         };
         // Lock both references through the initial checkout and detachment.
         let mut refs = repo.transaction()?;
@@ -370,7 +580,6 @@ impl Repository {
         let mut checkout = CheckoutBuilder::new();
         checkout.safe();
         if let Err(error) = repo.checkout_tree(target.as_object(), Some(&mut checkout)) {
-            let _ = fs::remove_file(repo.path().join(STATE));
             return Err(error.into());
         }
         repo.reference_ensure_log("HEAD")?;
@@ -389,6 +598,19 @@ impl Repository {
         let mut state = load(&repo)?;
         checked_branch(&repo, &state)?;
         settle_prepared(&repo, &mut state)?;
+        ensure!(
+            !state.restarting,
+            "Recovery was interrupted; choose Retry step again. Saved recovery files are retained"
+        );
+        if state.paused {
+            ensure!(
+                repo.state() == RepositoryState::Clean
+                    && super::libgit::file_changes(&repo)?.is_empty(),
+                "Working tree changed while paused; preserve changes before continuing"
+            );
+            state.paused = false;
+            save(&repo, &state)?;
+        }
         if state.editing {
             ensure!(
                 state.replacement_commits > 0,
@@ -556,6 +778,10 @@ fn settle_prepared(repo: &Raw, state: &mut State) -> Result<()> {
         if state.prepared_edit {
             state.replacement_commits += 1;
         } else {
+            state.paused = state
+                .steps
+                .get(state.cursor)
+                .is_some_and(|s| s.action == RebaseAction::Break);
             state.cursor += 1;
             state.pending = false;
             state.applied = false;
@@ -593,6 +819,13 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
     loop {
         checked_branch(repo, state)?;
         settle_prepared(repo, state)?;
+        ensure!(
+            !state.restarting,
+            "Recovery was interrupted; choose Retry step again"
+        );
+        if state.paused {
+            return Ok("Rebase paused after Break; Continue rebase to replay the next step".into());
+        }
         if state.editing {
             return Ok("Rebase paused: edit files, stage and create replacement commits, then Continue rebase".into());
         }
@@ -883,6 +1116,8 @@ mod tests {
             prepared_edit: false,
             prepared: None,
             finishing: false,
+            paused: false,
+            restarting: false,
         };
         save(&raw, &state).unwrap();
         assert!(
