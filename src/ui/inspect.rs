@@ -6,6 +6,7 @@ pub(super) enum InspectResult {
     History(Arc<git::FileHistory>),
     Blame(Arc<git::BlameView>),
     Compare(Arc<git::Comparison>),
+    Stash(Arc<git::StashPreview>),
 }
 #[derive(Clone, Debug, Default)]
 pub(super) enum InspectState {
@@ -57,6 +58,9 @@ impl GitBuddy {
                 InspectRequest::Compare(base, target) => repo
                     .compare(&base, &target)
                     .map(|v| InspectResult::Compare(Arc::new(v))),
+                InspectRequest::Stash(id) => repo
+                    .stash_preview(&id)
+                    .map(|v| InspectResult::Stash(Arc::new(v))),
             }
         });
         cx.spawn(async move |this, cx| {
@@ -87,12 +91,25 @@ impl GitBuddy {
             }
             InspectState::Ready(InspectResult::Blame(v)) => format!("Blame · {}", v.path.display()),
             InspectState::Ready(InspectResult::Compare(_)) => "Compare revisions".into(),
+            InspectState::Ready(InspectResult::Stash(v)) => format!("Stash · {}", &v.id[..8]),
             _ => "Repository inspection".into(),
         }
     }
 
     pub(super) fn inspection_sources(&self) -> Vec<PatchSource> {
         match &self.active.inspection {
+            InspectState::Ready(InspectResult::Stash(v)) => v
+                .sections
+                .iter()
+                .flat_map(|section| {
+                    let section = Arc::new(section.clone());
+                    section
+                        .files
+                        .clone()
+                        .into_iter()
+                        .map(move |f| PatchSource::Stash(section.clone(), f))
+                })
+                .collect(),
             InspectState::Ready(InspectResult::Compare(v)) => v
                 .files
                 .iter()
@@ -410,6 +427,9 @@ impl GitBuddy {
             InspectState::Ready(InspectResult::Blame(blame)) => self.blame_view(blame, cx),
             InspectState::Ready(InspectResult::Compare(comparison)) => {
                 self.comparison_view(comparison, cx)
+            }
+            InspectState::Ready(InspectResult::Stash(preview)) => {
+                self.stash_preview_view(preview, cx)
             }
         }
     }

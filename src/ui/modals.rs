@@ -64,7 +64,16 @@ impl GitBuddy {
             Modal::RenameRemote(expected) => {
                 self.perform(Operation::RenameRemote { expected, name: a }, cx)
             }
-            Modal::Stash => self.perform(Operation::Stash(a), cx),
+            Modal::Stash => self.submit_stash(a, cx),
+            Modal::StashBranch(context, id) => self.perform(
+                Operation::RestoreStash {
+                    context,
+                    id,
+                    action: git::StashAction::Branch(a),
+                    reinstate_index: true,
+                },
+                cx,
+            ),
             Modal::Identity => self.perform(Operation::SetIdentity(a, b), cx),
             Modal::Confirm(_, operation) => self.perform(operation, cx),
             Modal::RecoveryBranch(target) => {
@@ -76,6 +85,9 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::Stash | Modal::StashActions(_)) {
+            return self.stash_modal(modal, cx);
+        }
         if matches!(modal, Modal::ResetHistory(_) | Modal::CommitSelection) {
             return self.history_actions_modal(modal, cx);
         }
@@ -191,6 +203,12 @@ impl GitBuddy {
                 None,
                 "Stash",
             ),
+            Modal::StashBranch(..) => (
+                "Create branch from Stash",
+                "New branch name",
+                None,
+                "Create & restore",
+            ),
             Modal::Identity => (
                 "Commit identity",
                 "Author name (this repository only)",
@@ -278,6 +296,9 @@ impl GitBuddy {
                     }))
                 })));
         }
+        if let Modal::StashBranch(_, id) = &modal {
+            card = card.child(div().text_xs().text_color(rgb(MUTED)).child(format!("Stash {} · starts at the saved base commit and restores the saved index. Current working tree must be clean. The stash is deleted only after successful restoration.", &id[..8])));
+        }
         if let Some(error) = &self.modal_error {
             card = card.child(
                 div()
@@ -351,30 +372,6 @@ impl GitBuddy {
                 if !remote {
                     card = card.child(self.button("branch-delete","Delete merged branch…").on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::Confirm(format!("Delete local branch {delete}? Git will reject unmerged branches."),Operation::DeleteBranch(delete.clone())),w,cx))));
                 }
-            }
-            Modal::StashActions(id) => {
-                let apply = id.clone();
-                let drop = id.clone();
-                card =
-                    card.child(id)
-                        .child(self.button("stash-apply", "Apply (keep stash)").on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.perform(Operation::ApplyStash(apply.clone()), cx)
-                            }),
-                        ))
-                        .child(
-                            self.button("stash-drop", "Delete stash…")
-                                .on_click(cx.listener(move |this, _, w, cx| {
-                                    this.show_modal(
-                                        Modal::Confirm(
-                                            format!("Permanently delete {drop}?"),
-                                            Operation::DropStash(drop.clone()),
-                                        ),
-                                        w,
-                                        cx,
-                                    )
-                                })),
-                        );
             }
             Modal::CommitActions(id) => {
                 let branch_id = id.clone();

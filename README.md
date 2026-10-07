@@ -39,6 +39,10 @@ cargo run --locked -- ./target/history-ui-20261005/project
 cargo run --locked --example demo_diff
 GITBUDDY_CONFIG_DIR="$PWD/target/demo-diff/config" cargo run --locked
 
+# 创建含暂存 / 未暂存 / 未跟踪内容的独立 Stash 演示仓库
+cargo run --locked --example demo_stash
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-stash/config" cargo run --locked
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -63,7 +67,7 @@ open dist/GitBuddy.app
 | Git LFS | Track / Untrack、原生 SHA-256 对象缓存及指针暂存、本地对象展开、缺失对象提示、按 remote Fetch / Push、普通 Push 前上传 LFS 对象 |
 | 分支 | 创建并切换、本地切换、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
 | 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、pull --ff-only、快捷 push、传输进度及取消、领先 / 落后计数 |
-| Stash | 保存（包含未跟踪文件）、应用并保留、确认后删除 |
+| Stash | 按选定文件保存、工作区 / 索引 / 未跟踪文件分组预览、Apply / Pop、恢复索引、从 Stash 建分支、确认后删除 |
 | 标签 | 创建 HEAD 标签、删除本地标签、推送选定标签 / 全部标签（支持已有轻量与附注标签） |
 | 配置 | 设置仓库级作者姓名 / 邮箱，读取 Git 配置，并通过 SSH agent 或凭据助手认证 |
 
@@ -76,6 +80,16 @@ open dist/GitBuddy.app
 新增行与删除行独立选择：若要暂存一次完整替换，请同时选中对应的红、绿行。部分操作只更新暂存区，不改写工作区，保留其他文件与未选中行；操作完成后刷新 diff。外部编辑、HEAD 或暂存区变化导致 diff 过期时会拒绝执行，需重新选择。普通的新建、删除文件也支持部分操作；文件权限变化、重命名、二进制、符号链接、子模块、冲突及截断预览应使用整文件操作。
 
 ## 操作约定
+
+### Stash
+
+工作区 **Stash…** 或侧栏 **STASHES → +** 打开文件选择器，默认选择全部变更，可按文件勾选；每个选定文件同时保存它的已暂存和未暂存状态，选定的未跟踪文件也会保存。成功后仅清理所选文件，未选文件的工作内容和索引条目保留。重命名包含旧、新两个路径；旧路径已被另一个文件复用时需同时选中，避免混淆。子模块内部工作区不能由父仓库 Stash 保存，需在子模块仓库标签中操作。
+
+点击侧栏某条 Stash，预览其 **Working tree**（基础提交到保存的完整工作版本）、**Index**（基础提交到保存的暂存版本）、**Untracked files**。各部分按文件折叠，点击文件行加载 Diff，沿用并排、词级高亮与完整上下文选项；当前 Stash、展开文件和滚动位置随会话恢复。
+
+预览的 **Actions…** 中，**Apply (keep stash)** 恢复并保留原记录，**Pop** 在恢复成功后删除选定记录。勾选 **Restore saved index** 同时恢复保存时的暂存 / 未暂存划分，不勾选时将已保存的已跟踪文件变更作为未暂存修改恢复。原来的无关暂存修改会保留；同一文件已有暂存修改则拒绝操作，需先提交或另存 Stash。全部操作由 `git2` / `libgit2` 实现，按固定对象 ID 定位；仓库在对话框打开后变化时需重新打开复核。
+
+**Create branch from Stash…** 要求当前工作区与索引干净，使用 Stash 的基础提交创建并切换到新分支，强制恢复保存的索引，成功后删除该 Stash。原来的分支不移动。恢复冲突、文件占用或 LFS 对象缺失时保留 Stash；建分支后的恢复失败可能留下已创建的分支，应先检查现场。libgit2 可能在后续失败前恢复部分未跟踪文件，错误会提醒复核；不会自动删除这些文件或在失败后自动 Pop。
 
 ### Diff 显示
 
@@ -173,7 +187,7 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 **Repository → Git LFS…** 查看根 `.gitattributes` 中的 LFS 规则、暂存区指针及缓存状态。**Track pattern… / Untrack pattern…** 修改本客户端生成的规则，例如 `*.bin`，修改仍需暂存及提交；不会迁移既有历史。由于当前 libgit2 对属性模式的支持限制，规则不接受空白、引号或反斜杠；可以用 `*.bin` 匹配含空格的文件名。已有带引号的属性规则会明确拒绝暂存，包括通过属性宏间接设置 LFS 的规则；工作区、索引回退、info 和配置的全局属性文件使用相同保护，需先改为无引号的 glob。
 
-整文件暂存原生计算 SHA-256、缓存对象并写入标准 LFS 指针；LFS 冲突编辑、采用工作文件及选择完整版本也通过相同 clean 逻辑，提交保存指针，正文保留在工作区或本地对象缓存。LFS 不支持 hunk / 行暂存；Stash 前需先暂存新增 / 已修改的 LFS 文件。切换版本、丢弃、Rebase 和 Stash 恢复会展开本地对象，写入前校验哈希及大小；缺失对象时保留指针，不覆盖用户编辑，可随后下载对象。使用默认共享 LFS 对象目录，不支持自定义 `lfs.storage` 或扩展指针。
+整文件暂存原生计算 SHA-256、缓存对象并写入标准 LFS 指针；LFS 冲突编辑、采用工作文件及选择完整版本也通过相同 clean 逻辑，提交保存指针，正文保留在工作区或本地对象缓存。LFS 不支持 hunk / 行暂存；新的选定文件 Stash 使用相同 clean 逻辑，可分别保存 LFS 文件的暂存版本和未暂存正文，不要求提前暂存。切换版本、丢弃、Rebase 和 Stash 恢复会展开本地对象，写入前校验哈希及大小；缺失对象时保留指针，不覆盖用户编辑，可随后下载对象。使用默认共享 LFS 对象目录，不支持自定义 `lfs.storage` 或扩展指针。
 
 本地 Track、暂存和 **Checkout local objects** 不需要 `git-lfs`。远程 Fetch / Push 需要安装官方 `git-lfs` 及其 Git 运行环境；选择 remote 后下载 / 上传 HEAD 所需的 LFS 对象，Fetch 成功后展开本地文件。普通 Push 先上传待推送历史涉及的 LFS 对象，上传失败则不更新远程 Git 引用。普通 Clone / Fetch 不自动下载 LFS 对象。LFS 传输提供取消，停止进程及其 Unix 子进程组，但已上传 / 下载的对象不会回滚。
 
@@ -235,6 +249,7 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `src/ui/inspect.rs`：文件选择器、文件历史、Blame 虚拟列表和版本比较页面，后台加载及过期结果隔离。
 - `src/ui/conflicts.rs`：三方预览、独立文件草稿、结果编辑、删除确认与继续 / 中止入口。
 - `src/ui/management.rs`：Rebase 计划编辑与进度、Worktree / 子模块 / LFS 管理对话框。
+- `src/git/stash.rs`、`src/ui/stash.rs`：分组预览、选定文件保存、恢复索引、Pop 与建分支；保护无关暂存内容和固定 Stash 对象身份。
 - `src/settings.rs`：最近仓库和外部合并工具配置（损坏时备份为 `.json.broken` 并重建）。
 - `src/session.rs`：带版本的会话格式、路径编码、原子保存与旧快照保护。
 - `src/ui/session.rs`：按仓库捕获 / 恢复界面状态、独立滚动句柄及退出保存。
@@ -249,6 +264,7 @@ Rebase 当前只支持有共同祖先的本地分支线性历史，不支持根�
 - `tests/conflict_resolution.rs`：三方版本、删除 / 二进制 / 可执行文件、过期请求、索引锁、多文件独立解决和继续操作的 libgit2 隔离仓库测试。
 - `tests/diff_conflict_tools.rs`、`examples/demo_diff.rs`：完整上下文 / 部分暂存、词级高亮、块选择、外部工具保护的隔离回归与多仓库演示。
 - `tests/advanced_git.rs`：提交重写、跨工作树保护、子模块及 LFS 指针 / 缓存 / Stash 的隔离仓库回归测试。
+- `tests/stash_management.rs`、`examples/demo_stash.rs`：Stash 操作、冲突与数据保留、LFS、关联工作树及会话回归；提供独立演示仓库与配置。
 - `examples/demo_repo.rs`：可重复生成的隔离演示仓库。
 - `examples/demo_conflicts.rs`：包含文本、二进制、修改 / 删除冲突的隔离演示仓库。
 - `examples/demo_advanced.rs`：包含 Rebase / Squash、Worktree、子模块与 LFS 对象的隔离演示仓库。

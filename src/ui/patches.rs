@@ -33,6 +33,9 @@ impl GitBuddy {
                 PatchSource::Compare(comparison, file) => repo
                     .comparison_file_diff_context(&comparison, &file, full)
                     .and_then(|raw| git::FilePatch::read_only_context(&raw, full)),
+                PatchSource::Stash(section, file) => repo
+                    .stash_file_diff_context(&section, &file, full)
+                    .and_then(|raw| git::FilePatch::read_only_context(&raw, full)),
             }?;
             anyhow::Ok(Arc::new(patch))
         });

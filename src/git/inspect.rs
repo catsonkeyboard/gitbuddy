@@ -140,7 +140,7 @@ pub(super) fn tree_diff_context<'a>(
     ))?;
     Ok(diff)
 }
-fn changed_file(delta: git2::DiffDelta<'_>) -> CommitFile {
+pub(super) fn changed_file(delta: git2::DiffDelta<'_>) -> CommitFile {
     CommitFile {
         path: delta
             .new_file()

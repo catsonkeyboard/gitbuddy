@@ -166,6 +166,7 @@ pub enum PatchKey {
     Work(#[serde(with = "path_encoding")] PathBuf, bool),
     Commit(String, #[serde(with = "path_encoding")] PathBuf),
     Compare(String, String, #[serde(with = "path_encoding")] PathBuf),
+    Stash(String, String, #[serde(with = "path_encoding")] PathBuf),
 }
 impl PatchKey {
     pub fn scroll_id(&self) -> String {
@@ -180,6 +181,7 @@ pub enum Inspection {
     History(#[serde(with = "path_encoding")] PathBuf, String, usize),
     Blame(#[serde(with = "path_encoding")] PathBuf, String),
     Compare(String, String),
+    Stash(String),
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Offset {

@@ -191,6 +191,17 @@ pub enum Operation {
     Stash(String),
     ApplyStash(String),
     DropStash(String),
+    SaveStash {
+        context: std::sync::Arc<StashContext>,
+        paths: Vec<PathBuf>,
+        message: String,
+    },
+    RestoreStash {
+        context: std::sync::Arc<StashContext>,
+        id: String,
+        action: StashAction,
+        reinstate_index: bool,
+    },
     Tag(String),
     DeleteTag(String),
     AddRemote(String, String),
@@ -247,6 +258,9 @@ pub fn parse_status(bytes: &[u8]) -> Vec<FileChange> {
 
 #[path = "git/libgit.rs"]
 mod libgit;
+#[path = "git/stash.rs"]
+mod stash;
+pub use stash::{StashAction, StashContext, StashPreview, StashSection};
 #[path = "git/partial.rs"]
 mod partial;
 pub use partial::{FilePatch, PartialPatch, PatchSelection};

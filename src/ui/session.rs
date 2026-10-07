@@ -93,6 +93,9 @@ impl RepoTab {
             inspect::InspectState::Ready(inspect::InspectResult::Compare(v)) => Some(
                 disk::Inspection::Compare(v.base.id.clone(), v.target.id.clone()),
             ),
+            inspect::InspectState::Ready(inspect::InspectResult::Stash(v)) => {
+                Some(disk::Inspection::Stash(v.id.clone()))
+            }
             inspect::InspectState::Empty => None,
         };
         let selection = match &self.selection {

@@ -11,6 +11,7 @@ mod recovery;
 mod remotes;
 mod session;
 mod sidebar;
+mod stash;
 mod tasks;
 mod toolbar;
 use gitbuddy::session::PatchKey;
@@ -84,6 +85,7 @@ enum PatchSource {
     Work(FileChange, bool),
     Commit(String, CommitFile),
     Compare(Arc<git::Comparison>, CommitFile),
+    Stash(Arc<git::StashSection>, CommitFile),
 }
 impl PatchSource {
     fn key(&self) -> PatchKey {
@@ -93,6 +95,11 @@ impl PatchSource {
             Self::Compare(comparison, file) => PatchKey::Compare(
                 comparison.base.id.clone(),
                 comparison.target.id.clone(),
+                file.path.clone(),
+            ),
+            Self::Stash(section, file) => PatchKey::Stash(
+                section.stash.clone(),
+                section.kind.clone(),
                 file.path.clone(),
             ),
         }
@@ -167,6 +174,7 @@ enum Modal {
     Identity,
     BranchActions(String, bool),
     StashActions(String),
+    StashBranch(Arc<git::StashContext>, String),
     CommitActions(String),
     TagActions(String),
     Confirm(String, Operation),
@@ -353,6 +361,10 @@ pub struct GitBuddy {
     management_generation: u64,
     remote_data: remotes::Data,
     remote_generation: u64,
+    stash_data: stash::Data,
+    stash_generation: u64,
+    stash_selected: HashSet<PathBuf>,
+    stash_restore_index: bool,
     push_choice: git::PushSelection,
     restore_push_target: Option<String>,
     push_preparing: bool,
@@ -489,6 +501,10 @@ impl GitBuddy {
             management_generation: 0,
             remote_data: remotes::Data::Loading,
             remote_generation: 0,
+            stash_data: stash::Data::Loading,
+            stash_generation: 0,
+            stash_selected: HashSet::new(),
+            stash_restore_index: false,
             push_choice: git::PushSelection::default(),
             restore_push_target: None,
             push_preparing: false,
@@ -821,6 +837,8 @@ impl GitBuddy {
                 | Operation::ContinueRebase
                 | Operation::AbortRebase
                 | Operation::Reset { .. }
+                | Operation::SaveStash { .. }
+                | Operation::RestoreStash { .. }
         );
         let retry_modal = if matches!(operation, Operation::Amend { .. }) {
             self.modal.clone()
@@ -872,8 +890,11 @@ impl GitBuddy {
         }
         self.form_a.update(cx, |s, cx| s.set_value("", window, cx));
         self.form_b.update(cx, |s, cx| s.set_value("", window, cx));
-        self.modal = Some(modal);
+        self.modal = Some(modal.clone());
         self.modal_error = None;
+        if matches!(modal, Modal::Stash | Modal::StashActions(_)) {
+            self.load_stash_modal(modal, cx);
+        }
         self.form_a.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }

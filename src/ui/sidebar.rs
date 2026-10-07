@@ -149,7 +149,8 @@ impl GitBuddy {
                     .ghost()
                     .tooltip(summary.clone())
                     .on_click(cx.listener(move |this, _, w, cx| {
-                        this.show_modal(Modal::StashActions(id.clone()), w, cx)
+                        let _ = w;
+                        this.begin_inspection(inspect::InspectRequest::Stash(id.clone()), cx)
                     })),
             );
         }

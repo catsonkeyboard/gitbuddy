@@ -1130,6 +1130,17 @@ impl Repository {
                 }
                 Operation::Push => self.default_push(control.clone()),
                 Operation::PushTo(plan) => self.push_plan(&plan, control.clone()),
+                Operation::SaveStash {
+                    context,
+                    paths,
+                    message,
+                } => self.save_stash_files(&context, &paths, &message),
+                Operation::RestoreStash {
+                    context,
+                    id,
+                    action,
+                    reinstate_index,
+                } => self.restore_stash(&context, &id, &action, reinstate_index),
                 Operation::Stash(message) => {
                     for file in file_changes(&repo)? {
                         ensure!(
@@ -1276,7 +1287,7 @@ fn unstage_paths(repo: &RawRepo, paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn stash_position(log: &git2::Reflog, id: &str) -> Result<usize> {
+pub(super) fn stash_position(log: &git2::Reflog, id: &str) -> Result<usize> {
     let expected = oid(id).context("Select a stash by its stable object ID, not stash@{n}")?;
     let matches: Vec<_> = log
         .iter()
