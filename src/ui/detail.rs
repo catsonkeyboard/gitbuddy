@@ -90,7 +90,10 @@ impl GitBuddy {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(MUTED))
-                                    .child("⌘ Enter to commit"),
+                                    .child({
+                                        let binding = self.settings.preferences.binding("commit");
+                                        if binding.is_empty() { String::new() } else { format!("{binding} to commit") }
+                                    }),
                             ),
                     )
                     .child(Textarea::new(&self.message).h(px(64.)).appearance(false))
@@ -144,14 +147,7 @@ impl GitBuddy {
                 },
             )
             .child(
-                v_flex()
-                    .id("changes-scroll")
-                    .track_scroll(&self.active.scroll.area("changes-scroll"))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(self.file_group(false, cx))
-                    .child(self.file_group(true, cx))
+                v_flex().flex_1().min_h_0().child(self.changes_list(cx))
                     .when(self.snapshot.files.is_empty(), |col| {
                         col.child(
                             v_flex()

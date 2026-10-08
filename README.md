@@ -47,6 +47,10 @@ GITBUDDY_CONFIG_DIR="$PWD/target/demo-stash/config" cargo run --locked
 cargo run --locked --example demo_advanced_recovery
 GITBUDDY_CONFIG_DIR="$PWD/target/demo-advanced-recovery/config" cargo run --locked
 
+# 创建 5,001 个提交、2,000 个变更文件、1,000 个标签的隔离演示仓库
+cargo run --locked --example demo_scalability
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-scalability/config" cargo run --locked
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -73,9 +77,23 @@ open dist/GitBuddy.app
 | 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、pull --ff-only、快捷 push、传输进度及取消、领先 / 落后计数 |
 | Stash | 按选定文件保存、工作区 / 索引 / 未跟踪文件分组预览、Apply / Pop、恢复索引、从 Stash 建分支、确认后删除 |
 | 标签 | 创建 HEAD 标签、删除本地标签、推送选定标签 / 全部标签（支持已有轻量与附注标签） |
-| 配置 | 设置仓库级作者姓名 / 邮箱，读取 Git 配置，并通过 SSH agent 或凭据助手认证 |
+| 大仓库 | 提交、侧栏与文件列表虚拟化，按文件展开 Diff；缓存图与过滤索引，历史加载上限、按条数及估算字节的 LRU 缓存 |
+| 任务日志 | 按仓库 / 全部查看操作、进度、成功 / 失败 / 取消结果，重启保留、复制 JSON、清理已完成记录 |
+| 配置 | 性能上限、20 项快捷键及组合键、热更新、冲突校验；仓库级作者姓名 / 邮箱，SSH agent 或凭据助手认证 |
 
-快捷键：`⌘O` 打开仓库，`⌘R` 刷新，`⌘Enter` 提交，`⌘Q` 退出。其他平台使用对应的 Ctrl 修饰键。
+默认快捷键：`⌘O` 打开仓库，`⌘R` 刷新，`⌘Enter` 提交，`⌘Q` 退出，`⌘,` 设置，`⌘Shift L` 任务日志，`Ctrl Tab / Ctrl Shift Tab` 切换标签，`⌘W` 关闭标签。其他平台的 `secondary` 对应 Ctrl。
+
+### 性能、缓存与快捷键
+
+**Repository → Preferences / Shortcuts…** 可逐项配置，Save & apply 原子保存后立即生效。历史默认最多加载 10,000 条，每次加载 300 条；搜索覆盖当前已加载历史。每仓库默认提交详情缓存最多 64 条 / 16 MiB，Diff 缓存最多 16 条 / 64 MiB，同时最多加载 4 份 Diff；按最近读取淘汰，超过预算的补丁明确报错，可调大预算后重新展开。预算估算包含文本、行映射和部分暂存数据；当前文档、仓库快照和后台临时分配另计，**不是整个进程的内存硬上限**。淘汰补丁会折叠对应文件并释放其滚动句柄。
+
+快捷键支持 `secondary-shift-r`、`ctrl-k ctrl-o` 等最多两次按键，留空禁用，Load defaults 后需保存。重复按键、组合键前缀冲突及会抢占普通输入的单键会拒绝保存；组件输入框的编辑绑定保留。设置保存在配置目录的 `settings.json`。
+
+### 任务日志
+
+**Repository → Task log…** 或状态栏 **Tasks…** 查看。每条记录包含仓库、时间、操作、结果及进度；后台自动刷新不生成日志。最多保留 100 项任务、每项 128 条事件、合计保守估算 1 MiB，旧事件省略数量可见；超限优先淘汰已完成任务。Copy JSON 复制当前筛选，Clear finished 清除筛选内已结束任务，保留正在执行的任务。
+
+开始与结束时原子保存 `tasks.json`，重启将遗留 Running 标为 Interrupted，不自动重放操作。运行中采样进度保留在内存，异常退出可能丢失最后一次保存后的事件。日志记录操作标签、进度与结果，移除 URL 的认证信息、查询参数和控制字符；不记录完整命令参数或文件正文，也不保证过滤任意错误消息中的所有敏感文本。默认配置目录 `~/.config/gitbuddy`，可通过 `GITBUDDY_CONFIG_DIR` 隔离。
 
 ### 部分暂存与取消暂存
 

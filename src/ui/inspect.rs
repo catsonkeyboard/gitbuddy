@@ -37,6 +37,7 @@ impl GitBuddy {
         self.active.selection = Selection::Inspect;
         self.active.commit_detail = None;
         self.active.inspection = InspectState::Loading(request.clone());
+        self.active.scroll.invalidate_variables();
         if !restoring {
             self.active.expanded.clear();
             self.active.patches.clear();
@@ -77,6 +78,7 @@ impl GitBuddy {
                     Err(error) => InspectState::Error(request, format!("{error:#}")),
                 };
                 this.resume_expanded(cx);
+                this.active.scroll.invalidate_variables();
                 cx.notify();
             });
         })
@@ -102,7 +104,7 @@ impl GitBuddy {
                 .sections
                 .iter()
                 .flat_map(|section| {
-                    let section = Arc::new(section.clone());
+                    let section = section.clone();
                     section
                         .files
                         .clone()
@@ -561,90 +563,105 @@ impl GitBuddy {
                                     .ghost()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.expanded.clear();
+                                        this.active.scroll.invalidate_variables();
                                         cx.notify();
                                     })),
                             ),
                     ),
             )
             .child(
-                v_flex()
-                    .id("comparison-scroll")
-                    .track_scroll(&self.active.scroll.area("comparison-scroll"))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(comparison.files.iter().enumerate().map(|(i, file)| {
-                        let source = PatchSource::Compare(comparison.clone(), file.clone());
-                        let key = source.key();
-                        let open = self.expanded.contains(&key);
-                        let path = file.path.clone();
-                        let revision = comparison.target.id.clone();
-                        let blame = if file.status == 'D' {
-                            Some((file.path.clone(), comparison.base.id.clone()))
-                        } else {
-                            Some((file.path.clone(), revision.clone()))
+                list(
+                    self.active
+                        .scroll
+                        .variable("comparison-scroll", comparison.files.len()),
+                    cx.processor(|this, i: usize, _, cx| {
+                        let InspectState::Ready(InspectResult::Compare(comparison)) =
+                            &this.active.inspection
+                        else {
+                            return div().into_any_element();
                         };
-                        v_flex()
-                            .flex_shrink_0()
-                            .child(
-                                h_flex()
-                                    .id(("compare-file", i))
-                                    .h(px(32.))
-                                    .px_3()
-                                    .gap_2()
-                                    .cursor_pointer()
-                                    .bg(rgb(if open { 0x333c48 } else { PANEL }))
-                                    .border_b_1()
-                                    .border_color(rgb(BORDER))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_patch(source.clone(), cx)
-                                    }))
-                                    .child(div().text_color(rgb(ACCENT)).child(if open {
-                                        "▾"
-                                    } else {
-                                        "▸"
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(ACCENT))
-                                            .child(file.status.to_string()),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w_0().truncate().text_sm().child(
-                                            file.original
-                                                .as_ref()
-                                                .map(|p| {
-                                                    format!(
-                                                        "{} → {}",
-                                                        p.display(),
-                                                        file.path.display()
-                                                    )
-                                                })
-                                                .unwrap_or_else(|| file.path.display().to_string()),
-                                        ),
-                                    )
-                                    .child(self.file_inspect_buttons(
-                                        path,
-                                        revision,
-                                        blame,
-                                        ("compare-tools", i),
-                                        cx,
-                                    )),
-                            )
-                            .when(open, |col| {
-                                col.child(self.patch_body(&key, ("comparison-patch", i), cx))
-                            })
-                    }))
-                    .when(comparison.files.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .p_3()
-                                .child("No file differences between these revisions."),
-                        )
+                        let Some(file) = comparison.files.get(i) else {
+                            return div().into_any_element();
+                        };
+                        this.comparison_row(comparison, i, file, cx)
+                            .into_any_element()
                     }),
+                )
+                .flex_1()
+                .min_h_0(),
             )
+            .when(comparison.files.is_empty(), |col| {
+                col.child(
+                    div()
+                        .p_3()
+                        .child("No file differences between these revisions."),
+                )
+            })
             .into_any_element()
+    }
+    fn comparison_row(
+        &self,
+        comparison: &Arc<git::Comparison>,
+        i: usize,
+        file: &CommitFile,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let source = PatchSource::Compare(comparison.clone(), file.clone());
+        let key = source.key();
+        let open = self.expanded.contains(&key);
+        let path = file.path.clone();
+        let revision = comparison.target.id.clone();
+        let blame = if file.status == 'D' {
+            Some((file.path.clone(), comparison.base.id.clone()))
+        } else {
+            Some((file.path.clone(), revision.clone()))
+        };
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .child(
+                h_flex()
+                    .id(("compare-file", i))
+                    .h(px(32.))
+                    .px_3()
+                    .gap_2()
+                    .cursor_pointer()
+                    .bg(rgb(if open { 0x333c48 } else { PANEL }))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_patch(source.clone(), cx)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(ACCENT))
+                            .child(if open { "▾" } else { "▸" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .child(file.status.to_string()),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().truncate().text_sm().child(
+                            file.original
+                                .as_ref()
+                                .map(|p| format!("{} → {}", p.display(), file.path.display()))
+                                .unwrap_or_else(|| file.path.display().to_string()),
+                        ),
+                    )
+                    .child(self.file_inspect_buttons(
+                        path,
+                        revision,
+                        blame,
+                        ("compare-tools", i),
+                        cx,
+                    )),
+            )
+            .when(open, |col| {
+                col.child(self.patch_body(&key, ("comparison-patch", i), cx))
+            })
     }
 
     pub(super) fn file_inspect_buttons(

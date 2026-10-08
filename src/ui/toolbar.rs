@@ -65,6 +65,13 @@ impl GitBuddy {
                                 Box::new(InitRepository),
                             )
                             .separator()
+                            .menu_with_icon(
+                                "Preferences / Shortcuts…",
+                                IconName::Settings,
+                                Box::new(OpenPreferences),
+                            )
+                            .menu_with_icon("Task log…", IconName::FileText, Box::new(OpenTaskLog))
+                            .separator()
                             .menu_with_icon_and_disabled(
                                 "Resolve conflicts…",
                                 IconName::FileText,
@@ -152,7 +159,10 @@ impl GitBuddy {
                 self.button("refresh", "")
                     .ghost()
                     .icon(IconName::RotateCw)
-                    .tooltip("Refresh · ⌘R")
+                    .tooltip(format!(
+                        "Refresh · {}",
+                        self.settings.preferences.binding("refresh")
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.refresh_with_notice("Refreshed".into(), cx)
                     })),
@@ -345,7 +355,10 @@ impl GitBuddy {
                 self.button("add-repo-tab", "+")
                     .disabled(false)
                     .ghost()
-                    .tooltip("Open another repository · ⌘O")
+                    .tooltip(format!(
+                        "Open another repository · {}",
+                        self.settings.preferences.binding("open")
+                    ))
                     .on_click(
                         cx.listener(|this, _, window, cx| this.show_modal(Modal::Open, window, cx)),
                     ),

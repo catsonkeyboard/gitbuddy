@@ -15,6 +15,39 @@ pub struct FilePatch {
 }
 
 impl FilePatch {
+    /// Retained allocations, including the lossless partial-staging source.
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.lines.capacity() * std::mem::size_of::<DiffLine>()
+            + self
+                .lines
+                .iter()
+                .map(|l| l.old.capacity() + l.new.capacity() + l.text.capacity())
+                .sum::<usize>()
+            + self.display.rows.capacity() * std::mem::size_of::<super::SplitRow>()
+            + self.display.highlights.capacity()
+                * std::mem::size_of::<Vec<std::ops::Range<usize>>>()
+            + self
+                .display
+                .highlights
+                .iter()
+                .map(|r| r.capacity() * std::mem::size_of::<std::ops::Range<usize>>())
+                .sum::<usize>()
+            + self.unavailable.as_ref().map_or(0, String::capacity)
+            + self.partial.as_ref().map_or(0, |p| {
+                std::mem::size_of::<PartialPatch>()
+                    + p.diff.capacity()
+                    + p.path_bytes.capacity()
+                    + p.hunks.capacity() * std::mem::size_of::<Hunk>()
+                    + p.hunks
+                        .iter()
+                        .map(|h| {
+                            h.lines.capacity() * std::mem::size_of::<PatchLine>()
+                                + h.lines.iter().map(|l| l.bytes.capacity()).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+    }
     pub fn read_only(text: &str) -> Self {
         let lines = diff_preview(text);
         Self {

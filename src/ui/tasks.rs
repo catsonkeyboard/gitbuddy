@@ -46,6 +46,7 @@ pub(super) struct RunningTask {
     ticket: Ticket,
     completion: Arc<Completion>,
     scopes: Vec<PathBuf>,
+    log_id: Option<u64>,
 }
 #[derive(Default)]
 pub(super) struct RepositoryTasks {
@@ -91,6 +92,7 @@ impl RepositoryTasks {
                 completion: Arc::new(Completion::default()),
                 cancellation: cancellable.then(git::CancellationToken::default),
                 scopes: Vec::new(),
+                log_id: None,
             },
         );
         Some(ticket)
@@ -156,6 +158,9 @@ impl GitBuddy {
             && let Some(token) = &task.cancellation
             && token.cancel()
         {
+            if let Some(id) = task.log_id {
+                self.task_log.event(id, "Cancellation requested");
+            }
             self.active.notice = format!(
                 "Cancelling {}… waiting for the network operation to stop",
                 task.label
@@ -202,6 +207,7 @@ impl GitBuddy {
         }
         self.modal = None;
         self.active.retry_preparation = Some(preparation.clone());
+        self.active.apply_cache_limits(&self.settings.preferences);
         let limit = self.active.limit;
         self.dispatch(
             label,
@@ -249,18 +255,43 @@ impl GitBuddy {
         let running = self.tasks.get(ticket.tab).unwrap();
         let cancellation = running.cancellation.clone().unwrap();
         let completion = CompletionGuard(running.completion.clone());
+        let log_id = self.task_log.start(&repo.root, "External merge tool");
+        self.tasks.running.get_mut(&ticket.tab).unwrap().log_id = Some(log_id);
+        let logs = self.task_log.clone();
         self.active.notice =
             "External merge tool running · finish and close the tool to review its result".into();
         self.active.error = false;
         let expected = context.clone();
         let task = cx.background_executor().spawn(async move {
             let _completion = completion;
-            repo.run_merge_tool(
+            if let Err(error) = logs.checkpoint() {
+                eprintln!("Cannot save task log: {error:#}");
+            }
+            let result = repo.run_merge_tool(
                 &context,
                 &text,
                 &tool,
                 git::NetworkControl::new(None, cancellation),
-            )
+            );
+            use gitbuddy::task_log::Outcome;
+            let (outcome, message) = match &result {
+                Ok(_) => (
+                    Outcome::Success,
+                    "External tool returned a result for review".into(),
+                ),
+                Err(error) => (
+                    if git::is_cancelled(error) {
+                        Outcome::Cancelled
+                    } else {
+                        Outcome::Failed
+                    },
+                    format!("{error:#}"),
+                ),
+            };
+            if let Err(error) = logs.finish(log_id, outcome, &message) {
+                eprintln!("Cannot save task log: {error:#}");
+            }
+            result
         });
         cx.spawn(async move|this,cx| {
             let result=task.await;
@@ -347,6 +378,21 @@ impl GitBuddy {
             return;
         };
         self.tasks.running.get_mut(&ticket.tab).unwrap().scopes = scopes;
+        let log_id = if label.is_empty() {
+            None
+        } else {
+            let root = self
+                .active
+                .repo
+                .as_ref()
+                .map(|repo| repo.root.as_path())
+                .or(self.active.preparing.as_deref())
+                .unwrap_or_else(|| Path::new(""));
+            Some(self.task_log.start(root, label))
+        };
+        self.tasks.running.get_mut(&ticket.tab).unwrap().log_id = log_id;
+        let logs = self.task_log.clone();
+        let sink_logs = logs.clone();
         let cancellation = self
             .tasks
             .get(ticket.tab)
@@ -362,12 +408,60 @@ impl GitBuddy {
         let retry_message = self.amend_message.read(cx).value().to_string();
         let (tx, rx) = async_channel::bounded::<String>(64);
         let sink: git::ProgressSink = Arc::new(std::sync::Mutex::new(move |text: &str| {
-            let _ = tx.try_send(text.to_owned());
+            if let Some(id) = log_id {
+                sink_logs.event(id, text);
+            }
+            let _ = tx.try_send(gitbuddy::task_log::sanitize(text));
         }));
         let completion = CompletionGuard(self.tasks.get(ticket.tab).unwrap().completion.clone());
         let task = cx.background_executor().spawn(async move {
             let _completion = completion;
-            work(git::NetworkControl::new(Some(sink), cancellation))
+            let checkpoint_error = log_id.and_then(|_| logs.checkpoint().err());
+            let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                work(git::NetworkControl::new(Some(sink), cancellation))
+            }))
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "Repository task panicked; inspect repository state before retrying"
+                ))
+            });
+            if let Some(id) = log_id {
+                use gitbuddy::task_log::Outcome;
+                let (outcome, message) = match &result {
+                    Ok(loaded) => (
+                        if loaded.cancelled {
+                            Outcome::Cancelled
+                        } else if loaded.error {
+                            Outcome::Failed
+                        } else {
+                            Outcome::Success
+                        },
+                        loaded.notice.clone(),
+                    ),
+                    Err(error) => (
+                        if git::is_cancelled(error) {
+                            Outcome::Cancelled
+                        } else {
+                            Outcome::Failed
+                        },
+                        format!("{error:#}"),
+                    ),
+                };
+                let log_error = logs
+                    .finish(id, outcome, &message)
+                    .err()
+                    .or(checkpoint_error);
+                if let Some(error) = log_error {
+                    if let Ok(loaded) = &mut result {
+                        loaded
+                            .notice
+                            .push_str(&format!("; Cannot save task log: {error:#}"));
+                    } else {
+                        eprintln!("Cannot save task log: {error:#}");
+                    }
+                }
+            }
+            result
         });
         cx.spawn(async move |this, cx| {
             while let Ok(text) = rx.recv().await {
@@ -448,6 +542,10 @@ impl GitBuddy {
                             tab.history_retry =
                                 retry.map(|modal| (modal, retry_history, retry_message));
                             tab.management_result = management;
+                        }
+                        let preferences = this.settings.preferences.clone();
+                        if let Some(tab) = this.tab_mut(ticket.tab) {
+                            tab.apply_cache_limits(&preferences);
                         }
                         if active {
                             if this.modal.is_none()
@@ -600,6 +698,10 @@ fn tab_mut_by_id<'a>(
 impl RepoTab {
     pub(super) fn apply_loaded(&mut self, mut loaded: Loaded, requested: &Selection) {
         let changed = self.snapshot.fingerprint != loaded.snapshot.fingerprint;
+        if changed || self.snapshot.commits.len() != loaded.snapshot.commits.len() {
+            self.history_projection.borrow_mut().take();
+            self.scroll.invalidate_variables();
+        }
         if self.selection != *requested {
             loaded.selection = self.selection.clone();
             loaded.diff = self.diff.clone();
@@ -817,6 +919,7 @@ mod tests {
             open_as_tab: false,
             retry_modal: None,
             management_result: None,
+            cancelled: false,
         };
         tab.apply_loaded(loaded, &Selection::Work);
         assert_eq!(tab.selection, Selection::Commit("selected-later".into()));
@@ -858,6 +961,7 @@ mod tests {
             open_as_tab: false,
             retry_modal: None,
             management_result: None,
+            cancelled: false,
         };
         tab.apply_loaded(loaded, &Selection::Work);
         let Some(PatchState::Ready(retained, selection)) = tab.patches.get(&key) else {

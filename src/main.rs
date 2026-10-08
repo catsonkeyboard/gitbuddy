@@ -17,13 +17,6 @@ fn main() {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             cx.set_window_appearance(Some(WindowAppearance::Dark));
-            cx.bind_keys([
-                KeyBinding::new("secondary-o", ui::OpenRepository, None),
-                KeyBinding::new("secondary-r", ui::Refresh, None),
-                KeyBinding::new("secondary-enter", ui::CommitChanges, None),
-                KeyBinding::new("secondary-q", ui::Quit, None),
-                KeyBinding::new("escape", ui::CloseModal, None),
-            ]);
             let close_subscription = cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

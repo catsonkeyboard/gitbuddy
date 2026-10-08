@@ -73,7 +73,7 @@ pub(crate) mod paths_encoding {
             .collect()
     }
 }
-mod path_encoding {
+pub(crate) mod path_encoding {
     use super::*;
     pub fn serialize<S: serde::Serializer>(
         path: &std::path::Path,

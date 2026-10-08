@@ -93,6 +93,12 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::Preferences) {
+            return self.preferences_modal(cx);
+        }
+        if matches!(modal, Modal::TaskLog) {
+            return self.task_log_modal(cx);
+        }
         if matches!(modal, Modal::Stash | Modal::StashActions(_)) {
             return self.stash_modal(modal, cx);
         }
@@ -171,6 +177,8 @@ impl GitBuddy {
             | Modal::Submodules
             | Modal::Lfs
             | Modal::LfsReport
+            | Modal::Preferences
+            | Modal::TaskLog
             | Modal::RebaseMessage(_) => unreachable!(),
             Modal::Open => ("Open repository", "Local repository path", None, "Open"),
             Modal::Init => (

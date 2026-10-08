@@ -218,22 +218,29 @@ impl GitBuddy {
                     ))),
             )
             .child(
-                v_flex()
-                    .id("stash-preview-scroll")
-                    .track_scroll(&self.active.scroll.area("stash-preview-scroll"))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(preview.sections.iter().enumerate().map(|(s, section)| {
-                        let section = Arc::new(section.clone());
-                        v_flex()
-                            .flex_shrink_0()
-                            .child(
-                                div()
+                list(
+                    self.active.scroll.variable(
+                        "stash-preview-scroll",
+                        preview
+                            .sections
+                            .iter()
+                            .map(|section| 1 + section.files.len().max(1))
+                            .sum(),
+                    ),
+                    cx.processor(|this, mut index: usize, _, cx| {
+                        let inspect::InspectState::Ready(inspect::InspectResult::Stash(preview)) =
+                            &this.active.inspection
+                        else {
+                            return div().into_any_element();
+                        };
+                        for (s, section) in preview.sections.iter().enumerate() {
+                            if index == 0 {
+                                return div()
+                                    .w_full()
+                                    .h(px(32.))
                                     .px_3()
-                                    .py_2()
                                     .bg(rgb(PANEL))
-                                    .text_sm()
+                                    .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(format!(
                                         "{} · {} files · +{} −{}",
@@ -241,77 +248,88 @@ impl GitBuddy {
                                         section.files.len(),
                                         section.insertions,
                                         section.deletions
-                                    )),
-                            )
-                            .children(section.files.iter().enumerate().map(|(i, file)| {
-                                let source = PatchSource::Stash(section.clone(), file.clone());
-                                let key = source.key();
-                                let open = self.expanded.contains(&key);
-                                let file_name = file
-                                    .original
-                                    .as_ref()
-                                    .map(|old| {
-                                        format!("{} → {}", old.display(), file.path.display())
-                                    })
-                                    .unwrap_or_else(|| file.path.display().to_string());
-                                v_flex()
-                                    .flex_shrink_0()
-                                    .child(
-                                        h_flex()
-                                            .id(("stash-file-row", s * 100000 + i))
-                                            .cursor_pointer()
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.toggle_patch(source.clone(), cx);
-                                                }),
-                                            )
-                                            .px_3()
+                                    ))
+                                    .into_any_element();
+                            }
+                            let count = section.files.len().max(1);
+                            if index <= count {
+                                let i = index - 1;
+                                return section.files.get(i).map_or_else(
+                                    || {
+                                        div()
                                             .h(px(30.))
-                                            .gap_2()
-                                            .bg(rgb(EDITOR))
-                                            .border_b_1()
-                                            .border_color(rgb(BORDER))
-                                            .child(
-                                                div()
-                                                    .w(px(20.))
-                                                    .text_color(rgb(MUTED))
-                                                    .child(if open { "▾" } else { "▸" }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(ACCENT))
-                                                    .child(file.status.to_string()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .truncate()
-                                                    .text_sm()
-                                                    .child(file_name),
-                                            ),
-                                    )
-                                    .when(open, |col| {
-                                        col.child(self.patch_body(
-                                            &key,
-                                            ("stash-patch", s * 100000 + i),
-                                            cx,
-                                        ))
-                                    })
-                            }))
-                            .when(section.files.is_empty(), |col| {
-                                col.child(
-                                    div()
-                                        .px_3()
-                                        .py_2()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child("No changes in this section."),
-                                )
-                            })
-                    })),
+                                            .px_3()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child("No changes in this section.")
+                                            .into_any_element()
+                                    },
+                                    |file| {
+                                        this.stash_file_row(section, s, i, file, cx)
+                                            .into_any_element()
+                                    },
+                                );
+                            }
+                            index -= count + 1;
+                        }
+                        div().into_any_element()
+                    }),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
+    }
+    fn stash_file_row(
+        &self,
+        section: &Arc<git::StashSection>,
+        s: usize,
+        i: usize,
+        file: &CommitFile,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let source = PatchSource::Stash(section.clone(), file.clone());
+        let key = source.key();
+        let open = self.expanded.contains(&key);
+        let file_name = file
+            .original
+            .as_ref()
+            .map(|old| format!("{} → {}", old.display(), file.path.display()))
+            .unwrap_or_else(|| file.path.display().to_string());
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .child(
+                h_flex()
+                    .id(("stash-file-row", s * 100000 + i))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_patch(source.clone(), cx);
+                        }),
+                    )
+                    .px_3()
+                    .h(px(30.))
+                    .gap_2()
+                    .bg(rgb(EDITOR))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(div().w(px(20.)).text_color(rgb(MUTED)).child(if open {
+                        "▾"
+                    } else {
+                        "▸"
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .child(file.status.to_string()),
+                    )
+                    .child(div().flex_1().truncate().text_sm().child(file_name)),
+            )
+            .when(open, |col| {
+                col.child(self.patch_body(&key, ("stash-patch", s * 100000 + i), cx))
+            })
     }
 }

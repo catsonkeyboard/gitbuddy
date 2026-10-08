@@ -7,8 +7,44 @@ use std::{cell::RefCell, collections::BTreeMap};
 pub(super) struct ViewScroll {
     handles: RefCell<BTreeMap<String, UniformListScrollHandle>>,
     pending: RefCell<BTreeMap<String, disk::Offset>>,
+    variables: RefCell<BTreeMap<String, ListState>>,
 }
 impl ViewScroll {
+    pub fn variable(&self, id: &str, count: usize) -> ListState {
+        let mut lists = self.variables.borrow_mut();
+        let state = lists
+            .entry(id.into())
+            .or_insert_with(|| ListState::new(count, ListAlignment::Top, px(160.)));
+        if state.item_count() != count {
+            let top = state.logical_scroll_top();
+            state.splice(0..state.item_count(), count);
+            if count > 0 {
+                state.scroll_to(ListOffset {
+                    item_ix: top.item_ix.min(count - 1),
+                    offset_in_item: top.offset_in_item,
+                });
+            }
+        }
+        state.clone()
+    }
+    pub fn invalidate_variables(&self) {
+        for state in self.variables.borrow().values() {
+            let count = state.item_count();
+            let top = state.logical_scroll_top();
+            state.splice(0..count, count);
+            if count > 0 {
+                state.scroll_to(top);
+            }
+        }
+    }
+    pub fn prune_patch_handles(&self, keep: &HashSet<String>) {
+        self.handles
+            .borrow_mut()
+            .retain(|id, _| !id.starts_with("patch:") || keep.contains(id));
+        self.pending
+            .borrow_mut()
+            .retain(|id, _| !id.starts_with("patch:") || keep.contains(id));
+    }
     pub fn list(&self, id: &str) -> UniformListScrollHandle {
         self.handles
             .borrow_mut()
@@ -36,6 +72,16 @@ impl ViewScroll {
             })
             .collect::<BTreeMap<_, _>>();
         // Inactive or still-loading panes must not erase their saved position.
+        for (id, state) in self.variables.borrow().iter() {
+            let top = state.logical_scroll_top();
+            values.insert(
+                format!("{id}:logical"),
+                disk::Offset {
+                    x: top.item_ix as f32,
+                    y: f32::from(top.offset_in_item),
+                },
+            );
+        }
         values.extend(self.pending.borrow().clone());
         values
     }
@@ -53,6 +99,40 @@ impl ViewScroll {
                     .borrow()
                     .base_handle
                     .set_offset(point(px(valid(offset.x)), px(valid(offset.y))));
+                changed = true;
+            }
+        }
+        for (id, state) in self.variables.borrow().iter() {
+            if state.item_count() == 0 {
+                continue;
+            }
+            if let Some(offset) = pending.remove(&format!("{id}:logical")) {
+                state.scroll_to(ListOffset {
+                    item_ix: if offset.x.is_finite() {
+                        (offset.x.max(0.) as usize).min(state.item_count() - 1)
+                    } else {
+                        0
+                    },
+                    offset_in_item: px(if offset.y.is_finite() {
+                        offset.y.max(0.)
+                    } else {
+                        0.
+                    }),
+                });
+                changed = true;
+            }
+            // Migrate the old pixel-only outer file-list position once. New
+            // sessions store exact logical row + offset for variable-height rows.
+            else if let Some(offset) = pending.remove(id) {
+                let pixels = if offset.y.is_finite() {
+                    (-offset.y).max(0.)
+                } else {
+                    0.
+                };
+                state.scroll_to(ListOffset {
+                    item_ix: (pixels as usize / 32).min(state.item_count() - 1),
+                    offset_in_item: px(pixels % 32.),
+                });
                 changed = true;
             }
         }
@@ -108,7 +188,7 @@ impl RepoTab {
         let mut expanded = self.expanded.iter().cloned().collect::<Vec<_>>();
         expanded.sort();
         let mut lines = self.restored_lines.clone();
-        for (key, state) in &self.patches {
+        for (key, state) in self.patches.iter() {
             if let PatchState::Ready(patch, selected) = state {
                 lines.remove(key);
                 if !selected.rows.is_empty() {
@@ -194,7 +274,7 @@ impl RepoTab {
             .unwrap_or_default();
         self.comparison_base = saved.comparison_base;
         self.history_tab = saved.history_tab.min(1);
-        self.limit = saved.history_limit.max(HISTORY_PAGE_SIZE);
+        self.limit = saved.history_limit.clamp(HISTORY_PAGE_SIZE, 100_000);
         self.show_commit_body = saved.show_commit_body;
         self.diff_preferences = saved.diff_preferences;
         self.expanded.extend(saved.expanded);
@@ -378,7 +458,9 @@ impl GitBuddy {
                 message: saved_tab.message.clone(),
                 message_view: saved_tab.message_view.clone(),
                 amend_draft: saved_tab.amend.clone(),
-                limit: saved_tab.history_limit.max(HISTORY_PAGE_SIZE),
+                limit: saved_tab
+                    .history_limit
+                    .clamp(HISTORY_PAGE_SIZE, self.settings.preferences.history_limit),
                 restoring: Some(saved_tab),
                 ..RepoTab::default()
             }));
@@ -468,6 +550,56 @@ fn editor_view(range: std::ops::Range<usize>, offset: Point<Pixels>) -> disk::Ed
 #[cfg(test)]
 mod tests {
     use super::{BTreeMap, Loaded, PatchKey, RepoTab, Repository, Selection, ViewScroll, disk};
+    use gpui_kit::{ListOffset, px};
+    use std::collections::HashSet;
+    #[test]
+    fn variable_lists_remeasure_without_losing_anchor_and_restore_per_tab() {
+        let view = ViewScroll::default();
+        let list = view.variable("changes-scroll", 10_000);
+        list.scroll_to(ListOffset {
+            item_ix: 6_400,
+            offset_in_item: px(17.),
+        });
+        view.invalidate_variables();
+        assert_eq!(list.logical_scroll_top().item_ix, 6_400);
+        assert_eq!(list.logical_scroll_top().offset_in_item, px(17.));
+        let saved = view.capture();
+        let restored = ViewScroll::default();
+        restored.restore(saved);
+        restored.variable("changes-scroll", 10_000);
+        assert!(restored.apply());
+        assert_eq!(
+            restored
+                .variable("changes-scroll", 10_000)
+                .logical_scroll_top()
+                .item_ix,
+            6_400
+        );
+        assert_eq!(
+            restored
+                .variable("changes-scroll", 3)
+                .logical_scroll_top()
+                .item_ix,
+            2
+        );
+        assert_eq!(
+            ViewScroll::default()
+                .variable("changes-scroll", 10_000)
+                .logical_scroll_top()
+                .item_ix,
+            0
+        );
+    }
+    #[test]
+    fn evicted_patch_scroll_handles_are_released_but_open_files_remain() {
+        let view = ViewScroll::default();
+        view.list("patch:evicted");
+        view.list("patch:open");
+        view.list("commit-list");
+        view.prune_patch_handles(&HashSet::from(["patch:open".to_owned()]));
+        assert_eq!(view.handles.borrow().len(), 2);
+        assert!(view.handles.borrow().contains_key("commit-list"));
+    }
     #[test]
     fn unavailable_tab_retains_draft_and_unloaded_views() {
         let saved = disk::Tab {

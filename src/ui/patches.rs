@@ -1,15 +1,50 @@
 use super::*;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
+struct LoadPermit(Arc<std::sync::atomic::AtomicUsize>);
+impl LoadPermit {
+    fn acquire(count: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        count
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| (n < 4).then_some(n + 1),
+            )
+            .ok()?;
+        Some(Self(count.clone()))
+    }
+}
+impl Drop for LoadPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+impl gitbuddy::cache::Weight for PatchState {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                PatchState::Ready(patch, selection) => {
+                    patch.estimated_bytes() + selection.rows.len() * 32
+                }
+                PatchState::Error(error) => error.capacity(),
+                PatchState::Loading => 0,
+            }
+    }
+}
 
 impl GitBuddy {
     pub(super) fn toggle_patch(&mut self, source: PatchSource, cx: &mut Context<Self>) {
         let key = source.key();
         if !self.active.expanded.remove(&key) {
             self.active.expanded.insert(key.clone());
-            if !self.active.patches.contains_key(&key) {
+            if !matches!(
+                self.active.patches.get(&key),
+                Some(PatchState::Loading | PatchState::Ready(..))
+            ) {
                 self.load_patch(source, cx);
             }
         }
+        self.active.scroll.invalidate_variables();
+        self.active.prune_patch_views();
         cx.notify();
     }
 
@@ -18,13 +53,36 @@ impl GitBuddy {
             return;
         };
         let key = source.key();
+        if matches!(self.active.patches.get(&key), Some(PatchState::Loading)) {
+            return;
+        }
+        // Bound simultaneous loads as well as retained values (including restored
+        // sessions with many expanded files). Opening another file retries it.
+        let Some(permit) = LoadPermit::acquire(&self.active.patch_loading) else {
+            self.active.patches.insert(
+                key,
+                PatchState::Error(
+                    "Four diffs are loading. Collapse and reopen this file when they finish."
+                        .into(),
+                ),
+            );
+            return;
+        };
         let generation = self.patch_generation;
         let full = self.active.diff_preferences.full_context;
-        self.active
+        let previous: HashSet<_> = self
+            .active
             .patches
-            .entry(key.clone())
-            .or_insert(PatchState::Loading);
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.active.patches.insert(key.clone(), PatchState::Loading);
+        self.active
+            .expanded
+            .retain(|k| !previous.contains(k) || self.active.patches.contains_key(k));
+        let max_bytes = self.settings.preferences.patch_cache_mb * 1024 * 1024;
         let task = cx.background_executor().spawn(async move {
+            let _permit = permit;
             let patch = match source {
                 PatchSource::Work(file, staged) => repo.worktree_patch_context(&file, staged, full),
                 PatchSource::Commit(id, file) => repo
@@ -43,7 +101,7 @@ impl GitBuddy {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 // Never attach an old repository/selection's response to the new view.
-                if this.patch_generation != generation {
+                if this.patch_generation != generation || !this.active.patches.contains_key(&key) {
                     return;
                 }
                 let mut selection = match (&result, this.active.patches.get(&key)) {
@@ -61,13 +119,18 @@ impl GitBuddy {
                     selection.rows = rows;
                     selection.anchor = anchor;
                 }
+                let previous: HashSet<_> = this.active.patches.iter().map(|(k, _)| k.clone()).collect();
                 this.active.patches.insert(
                     key,
                     match result {
-                        Ok(patch) => PatchState::Ready(patch, selection),
+                        Ok(patch) if patch.estimated_bytes() + selection.rows.len() * 32 <= max_bytes.saturating_sub(std::mem::size_of::<PatchState>()) => PatchState::Ready(patch, selection),
+                        Ok(_) => PatchState::Error("This diff exceeds the patch cache budget. Increase the budget in Preferences or use compact context.".into()),
                         Err(error) => PatchState::Error(error.to_string()),
                     },
                 );
+                this.active.expanded.retain(|k| !previous.contains(k) || this.active.patches.contains_key(k));
+                this.active.scroll.invalidate_variables();
+                this.active.prune_patch_views();
                 cx.notify();
             });
         })
@@ -424,6 +487,7 @@ impl GitBuddy {
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.active.diff_preferences.side_by_side =
                         !this.active.diff_preferences.side_by_side;
+                    this.active.scroll.invalidate_variables();
                     cx.notify();
                 })),
             )
@@ -461,6 +525,7 @@ impl GitBuddy {
                         !this.active.diff_preferences.full_context;
                     this.patch_generation += 1;
                     this.active.patches.clear();
+                    this.active.scroll.invalidate_variables();
                     this.active.restored_lines.clear();
                     this.resume_expanded(cx);
                     cx.notify();
@@ -561,109 +626,183 @@ impl GitBuddy {
                             .ghost()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.expanded.clear();
+                                this.active.scroll.invalidate_variables();
                                 cx.notify();
                             })),
                     ),
             )
             .child(
-                v_flex()
-                    .id("commit-files-scroll")
-                    .track_scroll(&self.active.scroll.area("commit-files-scroll"))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(detail.files.iter().enumerate().map(|(index, file)| {
-                        let source = PatchSource::Commit(detail.id.clone(), file.clone());
-                        let key = source.key();
-                        let expanded = self.active.expanded.contains(&key);
-                        let label = if let Some(old) = &file.original {
-                            format!("{} → {}", old.display(), file.path.display())
-                        } else {
-                            file.path.display().to_string()
+                list(
+                    self.active
+                        .scroll
+                        .variable("commit-files-scroll", detail.files.len()),
+                    cx.processor(|this, index: usize, _, cx| {
+                        let Some(detail) = &this.active.commit_detail else {
+                            return div().into_any_element();
                         };
-                        v_flex()
-                            .flex_shrink_0()
-                            .child(
-                                h_flex()
-                                    .id(("commit-file", index))
-                                    .h(px(32.))
-                                    .px_3()
-                                    .gap_2()
-                                    .cursor_pointer()
-                                    .bg(rgb(if expanded { 0x333c48 } else { PANEL }))
-                                    .hover(|s| s.bg(rgb(0x343e4b)))
-                                    .border_b_1()
-                                    .border_color(rgb(BORDER))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_patch(source.clone(), cx)
-                                    }))
-                                    .child(
-                                        Icon::new(if expanded {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        })
-                                        .size(px(12.))
-                                        .text_color(rgb(MUTED)),
-                                    )
-                                    .child(status_badge(file.status))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(px(12.))
-                                            .child(label),
-                                    )
-                                    .child(patch_stat(self.active.patches.get(&key)))
-                                    .child(self.file_inspect_buttons(
-                                        file.path.clone(),
-                                        detail.id.clone(),
-                                        if file.status == 'D' {
-                                            None
-                                        } else {
-                                            Some((file.path.clone(), detail.id.clone()))
-                                        },
-                                        ("commit-file-tools", index),
-                                        cx,
-                                    )),
-                            )
-                            .when(expanded, |col| {
-                                col.child(self.patch_body(&key, ("commit-patch", index), cx))
-                            })
-                    }))
-                    .when(detail.files.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .p_3()
-                                .text_color(rgb(MUTED))
-                                .child("No file changes relative to the first parent."),
-                        )
+                        let Some(file) = detail.files.get(index) else {
+                            return div().into_any_element();
+                        };
+                        this.commit_file_row(index, file, &detail.id, cx)
+                            .into_any_element()
                     }),
+                )
+                .flex_1()
+                .min_h_0(),
             )
+            .when(detail.files.is_empty(), |col| {
+                col.child(
+                    div()
+                        .p_3()
+                        .text_color(rgb(MUTED))
+                        .child("No file changes relative to the first parent."),
+                )
+            })
             .into_any_element()
     }
 
-    pub(super) fn file_group(&self, staged: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let files: Vec<_> = self
-            .snapshot
-            .files
-            .iter()
-            .filter(|f| if staged { f.staged() } else { f.unstaged() })
-            .collect();
-        v_flex().flex_shrink_0()
-            .child(h_flex().h(px(32.)).px_3().gap_2().bg(rgb(BG)).border_b_1().border_color(rgb(BORDER))
+    fn commit_file_row(
+        &self,
+        index: usize,
+        file: &CommitFile,
+        revision: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let source = PatchSource::Commit(revision.to_owned(), file.clone());
+        let key = source.key();
+        let expanded = self.active.expanded.contains(&key);
+        let label = if let Some(old) = &file.original {
+            format!("{} → {}", old.display(), file.path.display())
+        } else {
+            file.path.display().to_string()
+        };
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .child(
+                h_flex()
+                    .id(("commit-file", index))
+                    .h(px(32.))
+                    .px_3()
+                    .gap_2()
+                    .cursor_pointer()
+                    .bg(rgb(if expanded { 0x333c48 } else { PANEL }))
+                    .hover(|s| s.bg(rgb(0x343e4b)))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_patch(source.clone(), cx)),
+                    )
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(px(12.))
+                        .text_color(rgb(MUTED)),
+                    )
+                    .child(status_badge(file.status))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .child(label),
+                    )
+                    .child(patch_stat(self.active.patches.get(&key)))
+                    .child(self.file_inspect_buttons(
+                        file.path.clone(),
+                        revision.to_owned(),
+                        if file.status == 'D' {
+                            None
+                        } else {
+                            Some((file.path.clone(), revision.to_owned()))
+                        },
+                        ("commit-file-tools", index),
+                        cx,
+                    )),
+            )
+            .when(expanded, |col| {
+                col.child(self.patch_body(&key, ("commit-patch", index), cx))
+            })
+    }
+
+    fn file_group_header(
+        &self,
+        staged: bool,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        v_flex().w_full().flex_shrink_0().child(
+            h_flex()
+                .h(px(32.))
+                .px_3()
+                .gap_2()
+                .bg(rgb(BG))
+                .border_b_1()
+                .border_color(rgb(BORDER))
                 .child(div().text_xs().text_color(rgb(MUTED)).child("▾"))
-                .child(div().flex_1().text_xs().font_weight(FontWeight::SEMIBOLD).child(format!("{}  {}", if staged {"Staged files"} else {"Working directory"},files.len())))
-                .child(self.button(if staged {"unstage-all"} else {"stage-all"}, if staged {"Unstage all"} else {"Stage all"}).ghost().disabled(self.busy() || files.is_empty() || self.snapshot.files.iter().any(|f|f.conflict()))
-                    .on_click(cx.listener(move |this, _, _, cx|this.perform(if staged {Operation::UnstageAll} else {Operation::StageAll},cx)))))
-            .children(files.into_iter().enumerate().map(|(index, file)| {
-                let source = PatchSource::Work(file.clone(),staged);
-                let key = source.key();
-                let expanded = self.active.expanded.contains(&key);
-                let action = file.clone(); let discard = file.clone();
-                let status = if file.conflict() {'!'} else if staged {file.index} else {file.worktree};
-                v_flex().flex_shrink_0()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!(
+                            "{}  {}",
+                            if staged {
+                                "Staged files"
+                            } else {
+                                "Working directory"
+                            },
+                            count
+                        )),
+                )
+                .child(
+                    self.button(
+                        if staged { "unstage-all" } else { "stage-all" },
+                        if staged { "Unstage all" } else { "Stage all" },
+                    )
+                    .ghost()
+                    .disabled(
+                        self.busy()
+                            || count == 0
+                            || self.snapshot.files.iter().any(|f| f.conflict()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.perform(
+                            if staged {
+                                Operation::UnstageAll
+                            } else {
+                                Operation::StageAll
+                            },
+                            cx,
+                        )
+                    })),
+                ),
+        )
+    }
+    fn work_file_row(
+        &self,
+        index: usize,
+        file: &FileChange,
+        staged: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let source = PatchSource::Work(file.clone(), staged);
+        let key = source.key();
+        let expanded = self.active.expanded.contains(&key);
+        let action = file.clone();
+        let discard = file.clone();
+        let status = if file.conflict() {
+            '!'
+        } else if staged {
+            file.index
+        } else {
+            file.worktree
+        };
+        v_flex().w_full().flex_shrink_0()
                     .child(h_flex().id((if staged {"staged-row"} else {"work-row"},index)).h(px(32.)).px_3().gap_2().cursor_pointer()
                         .bg(rgb(if expanded {0x333c48} else {PANEL})).hover(|s|s.bg(rgb(0x343e4b)))
                         .border_b_1().border_color(rgb(BORDER))
@@ -687,7 +826,38 @@ impl GitBuddy {
                                 this.perform(if staged {Operation::Unstage(paths)} else {Operation::Stage(paths)},cx);
                             })))))
                     .when(expanded, |col|col.child(self.patch_body(&key,(if staged {"staged-patch"} else {"work-patch"},index),cx)))
-            }))
+    }
+    pub(super) fn changes_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let projection = self.active.projection();
+        let unstaged = projection.unstaged.len();
+        let staged = projection.staged.len();
+        list(
+            self.active
+                .scroll
+                .variable("changes-scroll", unstaged + staged + 2),
+            cx.processor(move |this, index: usize, _, cx| {
+                if index == 0 {
+                    return this
+                        .file_group_header(false, unstaged, cx)
+                        .into_any_element();
+                }
+                if index == unstaged + 1 {
+                    return this.file_group_header(true, staged, cx).into_any_element();
+                }
+                let (staged, row, indices) = if index <= unstaged {
+                    (false, index - 1, &projection.unstaged)
+                } else {
+                    (true, index - unstaged - 2, &projection.staged)
+                };
+                let Some(file) = indices.get(row).and_then(|&i| this.snapshot.files.get(i)) else {
+                    return div().into_any_element();
+                };
+                this.work_file_row(row, file, staged, cx).into_any_element()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
     }
 }
 
@@ -707,6 +877,7 @@ fn status_badge(status: char) -> impl IntoElement {
         .text_color(rgb(color))
         .child(status.to_string())
 }
+
 fn patch_stat(state: Option<&PatchState>) -> impl IntoElement {
     let text = if let Some(PatchState::Ready(patch, _)) = state {
         format!(
@@ -795,4 +966,32 @@ fn highlighted_text(text: &str, ranges: &[std::ops::Range<usize>], color: u32) -
         );
     }
     row
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    #[::core::prelude::v1::test]
+    fn load_limit_survives_cache_eviction_and_is_per_repository() {
+        let mut tab = RepoTab::default();
+        tab.patches.set_limits(1, 1024);
+        let mut permits = Vec::new();
+        for i in 0..4 {
+            permits.push(LoadPermit::acquire(&tab.patch_loading).unwrap());
+            tab.patches.insert(
+                PatchKey::Work(format!("file-{i}").into(), false),
+                PatchState::Loading,
+            );
+        }
+        assert_eq!(tab.patches.len(), 1);
+        assert!(LoadPermit::acquire(&tab.patch_loading).is_none());
+        assert!(LoadPermit::acquire(&RepoTab::default().patch_loading).is_some());
+        permits.pop();
+        assert!(LoadPermit::acquire(&tab.patch_loading).is_some());
+        drop(permits);
+        assert_eq!(
+            tab.patch_loading.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
 }

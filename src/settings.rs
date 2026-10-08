@@ -17,6 +17,88 @@ pub struct Settings {
     pub recent: Vec<PathBuf>,
     #[serde(default)]
     pub merge_tool: crate::git::MergeTool,
+    #[serde(default)]
+    pub preferences: Preferences,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Preferences {
+    pub history_limit: usize,
+    pub commit_cache_entries: usize,
+    pub commit_cache_mb: usize,
+    pub patch_cache_entries: usize,
+    pub patch_cache_mb: usize,
+    /// Empty binding disables an action; absent entries inherit defaults.
+    pub shortcuts: std::collections::BTreeMap<String, String>,
+}
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            history_limit: 10_000,
+            commit_cache_entries: 64,
+            commit_cache_mb: 16,
+            patch_cache_entries: 16,
+            patch_cache_mb: 64,
+            shortcuts: Default::default(),
+        }
+    }
+}
+pub const SHORTCUTS: &[(&str, &str, &str)] = &[
+    ("open", "Open repository", "secondary-o"),
+    ("clone", "Clone repository", ""),
+    ("init", "Initialize repository", ""),
+    ("refresh", "Refresh", "secondary-r"),
+    ("commit", "Commit staged changes", "secondary-enter"),
+    ("amend", "Amend", ""),
+    ("reflog", "Reflog", ""),
+    ("compare", "Compare", ""),
+    ("conflicts", "Resolve conflicts", ""),
+    ("fetch", "Fetch", ""),
+    ("pull", "Pull", ""),
+    ("push", "Push", ""),
+    ("next_tab", "Next repository", "ctrl-tab"),
+    ("previous_tab", "Previous repository", "ctrl-shift-tab"),
+    ("close_tab", "Close repository", "secondary-w"),
+    (
+        "cancel_task",
+        "Cancel current task",
+        "secondary-shift-escape",
+    ),
+    ("task_log", "Task log", "secondary-shift-l"),
+    ("preferences", "Preferences", "secondary-,"),
+    ("quit", "Quit", "secondary-q"),
+    ("close_modal", "Close dialog", "escape"),
+];
+impl Preferences {
+    pub fn binding(&self, action: &str) -> &str {
+        self.shortcuts
+            .get(action)
+            .map(String::as_str)
+            .unwrap_or_else(|| SHORTCUTS.iter().find(|s| s.0 == action).map_or("", |s| s.2))
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (300..=100_000).contains(&self.history_limit),
+            "History limit must be 300–100,000"
+        );
+        anyhow::ensure!(
+            (1..=256).contains(&self.commit_cache_entries)
+                && (1..=64).contains(&self.patch_cache_entries),
+            "Cache entries: commits 1–256, patches 1–64"
+        );
+        anyhow::ensure!(
+            (1..=128).contains(&self.commit_cache_mb) && (16..=512).contains(&self.patch_cache_mb),
+            "Cache MB: commits 1–128, patches 16–512"
+        );
+        for (action, binding) in &self.shortcuts {
+            anyhow::ensure!(
+                SHORTCUTS.iter().any(|s| s.0 == action),
+                "Unknown shortcut action: {action}"
+            );
+            anyhow::ensure!(binding.len() <= 128, "Shortcut is too long: {action}");
+        }
+        Ok(())
+    }
 }
 impl Settings {
     fn path() -> PathBuf {
@@ -34,8 +116,14 @@ impl Settings {
                 return Self::default();
             }
         };
-        match serde_json::from_slice(&bytes) {
-            Ok(settings) => settings,
+        match serde_json::from_slice::<Self>(&bytes) {
+            Ok(mut settings) => {
+                if let Err(error) = settings.preferences.validate() {
+                    eprintln!("Ignoring invalid performance preferences: {error}");
+                    settings.preferences = Preferences::default();
+                }
+                settings
+            }
             Err(error) => {
                 // Keep the broken file for inspection instead of silently
                 // overwriting the user's recent list on the next save.
@@ -59,6 +147,14 @@ impl Settings {
         tool.validate()?;
         let mut next = self.clone();
         next.merge_tool = tool;
+        next.save_at(&Self::path())?;
+        *self = next;
+        Ok(())
+    }
+    pub fn set_preferences(&mut self, preferences: Preferences) -> anyhow::Result<()> {
+        preferences.validate()?;
+        let mut next = self.clone();
+        next.preferences = preferences;
         next.save_at(&Self::path())?;
         *self = next;
         Ok(())
@@ -90,6 +186,26 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preferences_default_migration_validation_and_persistence() {
+        let legacy: Settings = serde_json::from_str(r#"{"recent":["/repo"]}"#).unwrap();
+        assert_eq!(legacy.preferences, Preferences::default());
+        let mut settings = legacy;
+        settings.preferences.history_limit = 600;
+        settings
+            .preferences
+            .shortcuts
+            .insert("open".into(), "ctrl-k ctrl-o".into());
+        settings.preferences.validate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings.remember_at("/another".into(), &path).unwrap();
+        let restored: Settings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(restored.preferences, settings.preferences);
+        settings.preferences.patch_cache_mb = usize::MAX;
+        assert!(settings.preferences.validate().is_err());
+        assert!(serde_json::from_str::<Preferences>(r#"{"unknown":12}"#).is_err());
+    }
     #[test]
     fn merge_tool_survives_recent_repository_updates_and_old_settings_load() {
         let dir = tempfile::tempdir().unwrap();

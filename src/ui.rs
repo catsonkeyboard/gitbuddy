@@ -7,11 +7,13 @@ mod inspect;
 mod management;
 mod modals;
 mod patches;
+mod preferences;
 mod recovery;
 mod remotes;
 mod session;
 mod sidebar;
 mod stash;
+mod task_log;
 mod tasks;
 mod toolbar;
 use gitbuddy::session::PatchKey;
@@ -59,6 +61,15 @@ gpui_kit::actions!(
         OpenLfs,
         OpenRemotes,
         OpenPushOptions,
+        OpenPreferences,
+        OpenTaskLog,
+        NextTab,
+        PreviousTab,
+        CloseTab,
+        CancelTask,
+        Fetch,
+        Pull,
+        Push,
         Quit,
         CloseModal
     ]
@@ -185,6 +196,8 @@ enum Modal {
     FileTools,
     Compare,
     MergeTool,
+    Preferences,
+    TaskLog,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistoryKind {
@@ -212,6 +225,7 @@ struct Loaded {
     open_as_tab: bool,
     retry_modal: Option<Modal>,
     management_result: Option<management::Data>,
+    cancelled: bool,
 }
 impl Loaded {
     fn read(
@@ -253,6 +267,7 @@ impl Loaded {
             open_as_tab,
             retry_modal: None,
             management_result: None,
+            cancelled: false,
         })
     }
 }
@@ -272,10 +287,12 @@ pub struct RepoTab {
     selection: Selection,
     diff: Vec<DiffLine>,
     commit_detail: Option<CommitDetail>,
-    commit_cache: HashMap<String, CommitDetail>,
+    commit_cache: gitbuddy::cache::Cache<String, CommitDetail>,
     commit_selection: history_actions::CommitSelection,
     expanded: HashSet<PatchKey>,
-    patches: HashMap<PatchKey, PatchState>,
+    patches: gitbuddy::cache::Cache<PatchKey, PatchState>,
+    patch_loading: Arc<std::sync::atomic::AtomicUsize>,
+    history_projection: std::cell::RefCell<Option<Arc<history::Projection>>>,
     diff_preferences: git::DiffPreferences,
     show_commit_body: bool,
     inspection: inspect::InspectState,
@@ -314,10 +331,12 @@ impl Default for RepoTab {
             selection: Selection::default(),
             diff: Vec::new(),
             commit_detail: None,
-            commit_cache: HashMap::new(),
+            commit_cache: gitbuddy::cache::Cache::new(64, 16 * 1024 * 1024),
             commit_selection: history_actions::CommitSelection::default(),
             expanded: HashSet::new(),
-            patches: HashMap::new(),
+            patches: gitbuddy::cache::Cache::new(16, 64 * 1024 * 1024),
+            patch_loading: Default::default(),
+            history_projection: Default::default(),
             diff_preferences: git::DiffPreferences::default(),
             show_commit_body: false,
             inspection: inspect::InspectState::default(),
@@ -385,6 +404,9 @@ pub struct GitBuddy {
     tab_scroll: session::ViewScroll,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    preference_fields: Vec<Entity<InputState>>,
+    task_log: Arc<gitbuddy::task_log::Store>,
+    log_all_repositories: bool,
 }
 impl std::ops::Deref for GitBuddy {
     type Target = RepoTab;
@@ -410,6 +432,9 @@ impl GitBuddy {
         let form_b = cx.new(|cx| InputState::new(window, cx));
         let amend_message =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Commit message"));
+        let preference_fields = (0..(5 + gitbuddy::settings::SHORTCUTS.len()))
+            .map(|_| cx.new(|cx| InputState::new(window, cx)))
+            .collect();
         let conflict_editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
@@ -525,7 +550,13 @@ impl GitBuddy {
             tab_scroll: session::ViewScroll::default(),
             focus,
             _subscriptions: subscriptions,
+            preference_fields,
+            task_log: Arc::new(gitbuddy::task_log::Store::open(
+                gitbuddy::settings::config_dir().join("tasks.json"),
+            )),
+            log_all_repositories: false,
         };
+        preferences::install_keys(&this.settings.preferences, cx);
         if let Ok(Some(saved)) = saved {
             this.restore_session(saved, cx);
         }
@@ -691,7 +722,7 @@ impl GitBuddy {
         let selection = self.active.selection.clone();
         let limit = self.active.limit;
         self.dispatch(
-            "",
+            if notice.is_empty() { "" } else { "Refresh" },
             false,
             move |_progress| Loaded::read(repo, selection, limit, notice, false, false, false),
             cx,
@@ -727,12 +758,14 @@ impl GitBuddy {
         if self.busy() {
             return;
         }
+        self.active.scroll.invalidate_variables();
         if let Selection::File(file, staged) = selection {
             if self.active.commit_detail.take().is_some()
                 || matches!(self.active.selection, Selection::Inspect)
             {
                 self.active.expanded.clear();
                 self.active.patches.clear();
+                self.active.prune_patch_views();
                 self.patch_generation += 1;
             }
             self.active.selection = Selection::Work;
@@ -753,6 +786,7 @@ impl GitBuddy {
                 {
                     self.active.expanded.clear();
                     self.active.patches.clear();
+                    self.active.prune_patch_views();
                     self.patch_generation += 1;
                 }
                 self.active.selection = Selection::Work;
@@ -770,6 +804,7 @@ impl GitBuddy {
                 self.active.commit_detail = self.active.commit_cache.get(&id).cloned();
                 self.active.expanded.clear();
                 self.active.patches.clear();
+                self.active.prune_patch_views();
                 self.patch_generation += 1;
                 self.selection_generation += 1;
                 self.active.show_commit_body = false;
@@ -785,6 +820,7 @@ impl GitBuddy {
                 self.active.commit_detail = None;
                 self.active.expanded.clear();
                 self.active.patches.clear();
+                self.active.prune_patch_views();
                 self.patch_generation += 1;
                 self.selection_generation += 1;
                 if let inspect::InspectState::Loading(request) = &self.active.inspection {
@@ -825,6 +861,7 @@ impl GitBuddy {
                         this.active.expanded.clear();
                     }
                 }
+                this.active.scroll.invalidate_variables();
                 cx.notify();
             });
         })
@@ -875,7 +912,8 @@ impl GitBuddy {
             operation.is_network(),
             scopes,
             move |control| {
-                let (notice, error) = match repo.execute_with_control(operation, control) {
+                let (notice, error, cancelled) = match repo.execute_with_control(operation, control)
+                {
                     Ok(out) => (
                         if out.is_empty() {
                             "Operation completed".into()
@@ -883,8 +921,13 @@ impl GitBuddy {
                             out
                         },
                         false,
+                        false,
                     ),
-                    Err(err) => (format!("{err:#}"), !git::is_cancelled(&err)),
+                    Err(err) => (
+                        format!("{err:#}"),
+                        !git::is_cancelled(&err),
+                        git::is_cancelled(&err),
+                    ),
                 };
                 let mut loaded = Loaded::read(
                     repo,
@@ -895,6 +938,7 @@ impl GitBuddy {
                     clear_message && !error,
                     false,
                 )?;
+                loaded.cancelled = cancelled;
                 if error {
                     loaded.retry_modal = retry_modal;
                 }
@@ -904,7 +948,26 @@ impl GitBuddy {
         );
     }
     fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy() && !matches!(modal, Modal::Open | Modal::Init | Modal::Clone) {
+        if matches!(modal, Modal::Preferences) {
+            self.open_preferences(window, cx);
+            return;
+        }
+        if matches!(modal, Modal::TaskLog) {
+            if self.modal.is_some() {
+                return;
+            }
+            self.modal = Some(modal);
+            self.modal_error = None;
+            self.focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.busy()
+            && !matches!(
+                modal,
+                Modal::Open | Modal::Init | Modal::Clone | Modal::TaskLog
+            )
+        {
             return;
         }
         self.form_a.update(cx, |s, cx| s.set_value("", window, cx));
@@ -1049,12 +1112,45 @@ impl Render for GitBuddy {
             .text_sm()
             .text_color(rgb(TEXT))
             .bg(rgb(BG))
+            .key_context("GitBuddy")
             .track_focus(&self.focus)
             .on_action(
                 cx.listener(|this, _: &OpenRepository, w, cx| this.show_modal(Modal::Open, w, cx)),
             )
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                if this.modal.is_some() {
+                    return;
+                }
                 this.refresh_with_notice("Refreshed".into(), cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenPreferences, w, cx| this.open_preferences(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenTaskLog, w, cx| this.show_modal(Modal::TaskLog, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(-1, cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
+                if this.modal.is_none()
+                    && let Some(index) = this.active_index
+                {
+                    this.close_tab(index, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CancelTask, _, cx| this.cancel_task(cx)))
+            .on_action(cx.listener(|this, _: &Fetch, _, cx| {
+                if this.modal.is_none() {
+                    this.perform(Operation::Fetch, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Pull, _, cx| {
+                if this.modal.is_none() {
+                    this.perform(Operation::Pull, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Push, _, cx| {
+                if this.modal.is_none() {
+                    this.perform(Operation::Push, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &CommitChanges, _, cx| this.commit(cx)))
             .on_action(cx.listener(|this, _: &AmendCommit, w, cx| {
@@ -1184,6 +1280,16 @@ impl Render for GitBuddy {
                                 .on_click(cx.listener(|this, _, _, cx| this.cancel_task(cx))),
                             )
                         },
+                    )
+                    .child(
+                        self.button("task-log", "Tasks…")
+                            .ghost()
+                            .disabled(false)
+                            .on_click(
+                                cx.listener(|this, _, w, cx| {
+                                    this.show_modal(Modal::TaskLog, w, cx)
+                                }),
+                            ),
                     )
                     .child(
                         div()

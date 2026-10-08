@@ -9,6 +9,7 @@ use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Debug)]
@@ -38,7 +39,7 @@ pub struct StashPreview {
     pub id: String,
     pub message: String,
     pub base: String,
-    pub sections: Vec<StashSection>,
+    pub sections: Vec<Arc<StashSection>>,
 }
 
 fn section(
@@ -244,7 +245,7 @@ impl Repository {
             id: id.into(),
             message: stash.message().ok().unwrap_or_default().into(),
             base: base.id().to_string(),
-            sections,
+            sections: sections.into_iter().map(Arc::new).collect(),
         })
     }
     pub fn stash_file_diff_context(
