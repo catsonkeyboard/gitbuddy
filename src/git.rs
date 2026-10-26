@@ -192,6 +192,12 @@ pub enum Operation {
         mode: ResetMode,
     },
     Checkout(String),
+    CheckoutDetached(std::sync::Arc<DetachedCheckout>),
+    RenameBranch {
+        expected: std::sync::Arc<BranchRename>,
+        name: String,
+    },
+    DeleteRemoteBranch(std::sync::Arc<PushPlan>),
     DeleteBranch(String),
     Merge(String),
     AbortMerge,
@@ -292,6 +298,9 @@ pub use recovery::{CommitEdit, HeadState, ReflogEntry, ReflogPage, ReflogTarget}
 #[path = "git/history.rs"]
 mod history;
 pub use history::{ResetContext, ResetMode};
+#[path = "git/branches.rs"]
+mod branches;
+pub use branches::{BranchRename, DetachedCheckout};
 #[path = "git/inspect.rs"]
 mod inspect;
 pub use inspect::{
@@ -343,6 +352,7 @@ impl Operation {
                 | Self::Pull
                 | Self::Push
                 | Self::PushTo(_)
+                | Self::DeleteRemoteBranch(_)
                 | Self::AddSubmodule { .. }
                 | Self::UpdateSubmodules { .. }
                 | Self::LfsFetch(_)
@@ -362,6 +372,9 @@ impl Operation {
             Self::Pull => "Pull",
             Self::Push => "Push",
             Self::PushTo(_) => "Push",
+            Self::DeleteRemoteBranch(_) => "Delete remote branch",
+            Self::RenameBranch { .. } => "Rename branch",
+            Self::CheckoutDetached(_) => "Checkout detached HEAD",
             Self::Rebase { .. } => "Rebase",
             Self::ContinueRebase => "Continue rebase",
             Self::AbortRebase => "Abort rebase",

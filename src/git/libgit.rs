@@ -293,7 +293,10 @@ fn fingerprint_of(
         .entries(None)?
         .for_each(|entry| {
             entry.name_bytes().hash(&mut hasher);
-            entry.value_bytes().hash(&mut hasher);
+            entry.has_value().hash(&mut hasher);
+            if entry.has_value() {
+                entry.value_bytes().hash(&mut hasher);
+            }
         })?;
     let index = repo.index()?;
     let workdir = repo.workdir().context("仓库没有工作区")?;
@@ -1059,6 +1062,12 @@ impl Repository {
                     validate_branch(&name)?;
                     checkout_branch(&repo, &name, BranchType::Local)?;
                     Ok(format!("Switched to {name}"))
+                }
+                Operation::CheckoutDetached(expected) => self.checkout_detached(&expected),
+                Operation::RenameBranch { expected, name } => self.rename_branch(&expected, &name),
+                Operation::DeleteRemoteBranch(plan) => {
+                    ensure!(plan.is_deletion(), "Expected a remote branch deletion plan");
+                    self.push_plan(&plan, control.clone())
                 }
                 Operation::TrackBranch(name) => {
                     validate_branch(&name)?;

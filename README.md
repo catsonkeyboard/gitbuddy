@@ -51,6 +51,10 @@ GITBUDDY_CONFIG_DIR="$PWD/target/demo-advanced-recovery/config" cargo run --lock
 cargo run --locked --example demo_scalability
 GITBUDDY_CONFIG_DIR="$PWD/target/demo-scalability/config" cargo run --locked
 
+# 创建分支重命名、远程分支删除及 detached checkout 的隔离演示仓库
+cargo run --locked --example demo_branches
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-branches/config" cargo run --locked
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -73,7 +77,7 @@ open dist/GitBuddy.app
 | Worktree | 列出关联工作树、新建分支及工作树、独立标签打开、锁定 / 解锁、移除干净工作树、清理失效登记、创建后展开共享 LFS 缓存、准备递归子模块 |
 | 子模块 | 添加、递归列出 / 初始化 / 更新 / 同步 URL、嵌套 gitlink 暂存、独立标签打开、Worktree 独立检出、脏工作区保护及网络取消 |
 | Git LFS | Track / Untrack、原生 SHA-256 缓存及指针暂存、本地对象展开、remote Fetch / Push、普通 Push 前上传、锁列表 / 创建 / 解锁 / 强制解锁、缓存校验 / 隔离清理 / 恢复 / 确认后永久删除 |
-| 分支 | 创建并切换、本地切换、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
+| 分支 | 创建并切换、本地切换、重命名并保留自身配置 / Reflog、带远端 ID 校验的远程分支删除、检出提交 / 标签进入 detached HEAD、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
 | 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、pull --ff-only、快捷 push、传输进度及取消、领先 / 落后计数 |
 | Stash | 按选定文件保存、工作区 / 索引 / 未跟踪文件分组预览、Apply / Pop、恢复索引、从 Stash 建分支、确认后删除 |
 | 标签 | 创建 HEAD 标签、删除本地标签、推送选定标签 / 全部标签（支持已有轻量与附注标签） |
@@ -102,6 +106,18 @@ open dist/GitBuddy.app
 新增行与删除行独立选择：若要暂存一次完整替换，请同时选中对应的红、绿行。部分操作只更新暂存区，不改写工作区，保留其他文件与未选中行；操作完成后刷新 diff。外部编辑、HEAD 或暂存区变化导致 diff 过期时会拒绝执行，需重新选择。普通的新建、删除文件也支持部分操作；文件权限变化、重命名、二进制、符号链接、子模块、冲突及截断预览应使用整文件操作。
 
 ## 操作约定
+
+### 分支管理
+
+点击侧栏本地分支的 **Rename branch…**，输入新名字后执行。支持当前分支及非当前分支，保留提交位置、自身 upstream / 自定义配置与 Reflog，不修改索引和工作文件；当前分支的 HEAD 跟随新名称。其他 Worktree 正在使用的分支需在其所在标签中重命名。不会覆盖已有分支、遗留分支配置或 Reflog；`main → main/topic` 这类嵌套引用路径需先改为独立的中间名称。分支专属设置位于全局 / include / Worktree 配置时要求先手动迁移，避免遗漏或改写其他仓库配置。
+
+重命名前取得源 / 目标引用、HEAD 与标准 `config.lock`，在配置副本中仅替换 section 名并通过 libgit2 解析核对所有值，保留重复值、空值、隐式布尔值、多行内容和注释。新引用 / HEAD / 配置就绪后才移除旧引用；遇到后期 I/O 失败会保留旧引用并提示检查可能存在的两个分支。配置与 refs 是不同文件，不宣称跨文件断电原子性。其他本地分支若以旧名称为本地 upstream，可通过 Set / clear upstream 更新。
+
+点击远程跟踪分支的 **Delete branch on remote…**，确认实际服务器地址、完整远程引用和期望提交 ID 后删除。目标由 Fetch refspec 反向映射，支持含 `/` 的 remote 名称与自定义 tracking 路径；有歧义的映射、符号引用 `origin/HEAD`、默认分支及 Fetch / Push URL 不同的配置会拒绝操作。不会隐式 Fetch：远端已变化时先 Fetch 并重新复核，避免删除他人刚更新的分支。服务器保护规则仍然生效。
+
+远程删除保留本地分支和 upstream 配置，仅清理对应的本地 tracking ref；原有 upstream 可能显示为缺失。沿用网络任务日志和取消：发出最终远端写入前可停止，之后等待结果，不承诺撤销已完成的删除。远程成功但本地 tracking 清理被锁阻止时明确提示，需 Fetch 核对；不会删除他人的锁文件。
+
+提交的 **Actions… → Checkout this commit (detached HEAD)…**、标签的 **Checkout tag (detached HEAD)…**，以及 **Repository → Checkout commit / tag…** 支持检出任意提交 / 标签 / revision。先确认固定目标，再检查 HEAD、目标引用及仓库指纹；不移动任何本地分支，保留不冲突的暂存 / 未跟踪内容，会覆盖修改时拒绝执行，继续使用本地 LFS 展开逻辑。返回普通状态可选择本地分支 **Switch to branch**。在 detached HEAD 上创建提交后，应先新建分支保留它们再切走。
 
 ### Stash
 
@@ -288,6 +304,7 @@ Rebase 当前只支持本地分支线性历史，不支持根提交重写或保�
 - `src/ui/session.rs`：按仓库捕获 / 恢复界面状态、独立滚动句柄及退出保存。
 - `tests/git_workflows.rs`：真实 Git 仓库的集成测试。
 - `src/git/remotes.rs`、`src/ui/remotes.rs`：远程配置、完整引用 upstream、固定推送计划及管理面板。
+- `src/git/branches.rs`、`src/ui/branches.rs`：固定目标的分支重命名 / detached checkout，以及带标签身份校验的后台操作预览；远程分支删除复用带 lease 的推送计划。
 - `tests/remote_management.rs`：远程配置、推送目标、lease 并发保护与标签推送的 libgit2 隔离回归；`examples/demo_remotes.rs` 提供本地演示仓库。
 - `tests/p1_regressions.rs`、`tests/p2_regressions.rs`：审查问题的隔离仓库回归，P2 含本地 Basic-auth HTTP 服务验证凭据助手、Push 和子模块克隆；HTTP 夹具通过系统 Git 提供协议，客户端仍使用 libgit2。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。

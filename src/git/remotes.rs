@@ -41,6 +41,7 @@ struct Update {
 }
 #[derive(Clone, Debug)]
 pub struct PushPlan {
+    git_dir: std::path::PathBuf,
     remote: RemoteInfo,
     updates: Vec<Update>,
     upstream: Option<(String, String)>,
@@ -50,6 +51,9 @@ impl PushPlan {
         self.updates
             .iter()
             .map(|u| {
+                if u.id.is_zero() {
+                    return format!("DELETE {} / {} · expected {}\nEndpoint: {}\nLocal branches and upstream configuration are preserved.", self.remote.name, u.target, u.lease.unwrap(), self.remote.destination());
+                }
                 let lease = u
                     .lease
                     .map(|id| {
@@ -76,6 +80,12 @@ impl PushPlan {
     }
     pub fn has_lease(&self) -> bool {
         self.updates.iter().any(|u| u.lease.is_some())
+    }
+    pub fn is_deletion(&self) -> bool {
+        self.updates.len() == 1
+            && self.updates[0].id.is_zero()
+            && self.updates[0].target.starts_with("refs/heads/")
+            && self.updates[0].lease.is_some_and(|id| !id.is_zero())
     }
 }
 
@@ -183,6 +193,9 @@ fn push_local_leased(
         "Force-with-lease to a local path requires a bare repository"
     );
     let mut transaction = destination.transaction()?;
+    if plan.is_deletion() {
+        transaction.lock_ref("HEAD")?;
+    }
     let mut ordered: Vec<_> = plan.updates.iter().collect();
     ordered.sort_by(|a, b| a.target.cmp(&b.target));
     for update in &ordered {
@@ -213,6 +226,19 @@ fn push_local_leased(
             );
         }
         old_ids.push(old);
+    }
+    if plan.is_deletion() {
+        let update = ordered[0];
+        ensure!(
+            destination.find_reference("HEAD")?.symbolic_target()? != Some(update.target.as_str()),
+            "Cannot delete the remote default branch"
+        );
+        transaction.remove(&update.target)?;
+        control.check()?;
+        control.cancellation.finish()?;
+        control.phase("Delete remote branch: updating locked reference…");
+        transaction.commit()?;
+        return Ok(());
     }
     control.phase("Push: preparing upload…");
     control.check()?;
@@ -278,6 +304,55 @@ fn push_local_leased(
 }
 
 impl Repository {
+    /// Resolve the remote and source ref via fetch mappings, never by splitting
+    /// `origin/topic` (remote names and custom destinations may contain slashes).
+    pub fn prepare_remote_branch_delete(&self, tracking: &str) -> Result<PushPlan> {
+        let repo = super::libgit::raw(self)?;
+        let full = format!("refs/remotes/{tracking}");
+        ensure!(
+            git2::Reference::is_valid_name(&full),
+            "Invalid remote-tracking branch"
+        );
+        let reference = repo.find_reference(&full)?;
+        let expected = reference
+            .target()
+            .context("Select a direct remote branch, not symbolic remote HEAD")?;
+        let mut matches = Vec::new();
+        for name in repo.remotes()?.iter() {
+            let name = name?.context("Invalid remote name")?;
+            let remote = repo.find_remote(name)?;
+            for spec in remote
+                .refspecs()
+                .filter(|s| s.direction() == Direction::Fetch && s.dst_matches(&full))
+            {
+                let target = spec.rtransform(&full)?.as_str()?.to_owned();
+                if target.starts_with("refs/heads/") {
+                    matches.push((name.to_owned(), target));
+                }
+            }
+        }
+        ensure!(
+            matches.len() == 1,
+            "Remote branch must match exactly one remote fetch mapping; fix ambiguous mappings before deletion"
+        );
+        let (name, target) = matches.remove(0);
+        let remote = remote_info(&repo, &name)?;
+        ensure!(
+            remote.destination() == remote.url,
+            "Deleting a remote branch requires matching fetch and push URLs; review the endpoint configuration first"
+        );
+        Ok(PushPlan {
+            git_dir: repo.path().into(),
+            remote,
+            updates: vec![Update {
+                source: full,
+                target,
+                id: Oid::ZERO_SHA1,
+                lease: Some(expected),
+            }],
+            upstream: None,
+        })
+    }
     pub fn remote_state(&self) -> Result<RemoteState> {
         let repo = super::libgit::raw(self)?;
         let remotes = self.remote_info()?;
@@ -533,6 +608,7 @@ impl Repository {
         }
         ensure!(!updates.is_empty(), "Select a branch or at least one tag");
         Ok(PushPlan {
+            git_dir: repo.path().into(),
             remote,
             updates,
             upstream,
@@ -577,15 +653,26 @@ impl Repository {
     pub(super) fn push_plan(&self, plan: &PushPlan, control: NetworkControl) -> Result<String> {
         control.check()?;
         let repo = super::libgit::raw(self)?;
+        ensure!(
+            repo.path() == plan.git_dir,
+            "Push selection belongs to another repository"
+        );
         check_remote(&repo, &plan.remote)?;
         for update in &plan.updates {
             ensure!(
-                repo.find_reference(&update.source)?.target() == Some(update.id),
+                repo.find_reference(&update.source)?.target()
+                    == Some(if update.id.is_zero() {
+                        update.lease.context("Missing deletion lease")?
+                    } else {
+                        update.id
+                    }),
                 "Source {} changed; reopen the push dialog",
                 update.source
             );
             // Pinned commits also cover annotated tags and older LFS objects.
-            if let Ok(commit) = repo.find_object(update.id, None)?.peel_to_commit() {
+            if !update.id.is_zero()
+                && let Ok(commit) = repo.find_object(update.id, None)?.peel_to_commit()
+            {
                 super::lfs::upload_before_push(
                     &repo,
                     &plan.remote.name,
@@ -604,7 +691,7 @@ impl Repository {
                 if update.target.starts_with("refs/heads/")
                     && let Ok(tracking) = tracking_ref(&repo, &plan.remote.name, &update.target)
                 {
-                    repo.reference(&tracking, update.id, true, "GitBuddy push")
+                    update_tracking(&repo, &tracking, update)
                         .context("Remote push succeeded, but local tracking ref update failed")?;
                 }
             }
@@ -612,11 +699,17 @@ impl Repository {
                 self.set_upstream(branch, Some(upstream))
                     .context("Remote push succeeded, but upstream could not be saved")?;
             }
-            return Ok("Push completed".into());
+            return Ok(if plan.is_deletion() {
+                "Remote branch deleted; local branches and upstream settings preserved"
+            } else {
+                "Push completed"
+            }
+            .into());
         }
         let mut callbacks =
             super::libgit::network_callbacks(control.clone(), repo.config()?.snapshot()?);
         let updates = plan.updates.clone();
+        let deleting = plan.is_deletion();
         let negotiation = control.clone();
         callbacks.push_negotiation(move |proposed| {
             negotiation.check_git()?;
@@ -638,9 +731,9 @@ impl Repository {
                     }
                 }
             }
-            negotiation.phase("Push: preparing upload…");
+            negotiation.phase(if deleting { "Delete remote branch: preparing deletion…" } else { "Push: preparing upload…" });
             negotiation.cancellation.finish().map_err(|_| git2::Error::from_str("Operation cancelled"))?;
-            negotiation.phase("Push: uploading; waiting for remote confirmation…");
+            negotiation.phase(if deleting { "Delete remote branch: waiting for remote confirmation…" } else { "Push: uploading; waiting for remote confirmation…" });
             Ok(())
         });
         let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -655,6 +748,9 @@ impl Repository {
             .updates
             .iter()
             .map(|u| {
+                if u.id.is_zero() {
+                    return format!(":{}", u.target);
+                }
                 format!(
                     "{}{}:{}",
                     if u.lease.is_some() { "+" } else { "" },
@@ -667,13 +763,32 @@ impl Repository {
         options.remote_callbacks(callbacks);
         // Pin the actual push endpoint. libgit2's local transport can reopen
         // the remote's fetch URL when applying refs despite advertising pushurl.
-        let anonymous = plan.remote.destination() != plan.remote.url
-            && local_destination(&self.root, plan.remote.destination())?.is_some();
+        let anonymous = plan.is_deletion()
+            || (plan.remote.destination() != plan.remote.url
+                && local_destination(&self.root, plan.remote.destination())?.is_some());
         let mut remote = if anonymous {
             repo.remote_anonymous(plan.remote.destination())?
         } else {
             repo.find_remote(&plan.remote.name)?
         };
+        if plan.is_deletion() {
+            control.phase("Delete remote branch: checking remote default branch…");
+            let connection = remote.connect_auth(
+                Direction::Fetch,
+                Some(super::libgit::network_callbacks(
+                    control.clone(),
+                    repo.config()?.snapshot()?,
+                )),
+                None,
+            )?;
+            ensure!(
+                !connection.list()?.iter().any(|head| head.name() == "HEAD"
+                    && head.symref_target() == Some(plan.updates[0].target.as_str())),
+                "Cannot delete the remote default branch"
+            );
+            drop(connection);
+            control.check()?;
+        }
         remote.push(&specs, Some(&mut options))?;
         control.cancellation.finish()?;
         let errors = errors.lock().unwrap();
@@ -688,7 +803,7 @@ impl Repository {
                 if update.target.starts_with("refs/heads/")
                     && let Ok(tracking) = tracking_ref(&repo, &plan.remote.name, &update.target)
                 {
-                    repo.reference(&tracking, update.id, true, "GitBuddy push")
+                    update_tracking(&repo, &tracking, update)
                         .context("Remote push succeeded, but local tracking ref update failed")?;
                 }
             }
@@ -697,6 +812,40 @@ impl Repository {
             self.set_upstream(branch, Some(upstream))
                 .context("Remote push succeeded, but upstream could not be saved")?;
         }
-        Ok("Push completed".into())
+        if plan.is_deletion() {
+            // Named transport may already prune this tracking ref. A concurrent
+            // fetch that advanced it must not be silently removed.
+            update_tracking(&repo, &plan.updates[0].source, &plan.updates[0]).context(
+                "Remote deletion succeeded, but local tracking cleanup failed; Fetch and review",
+            )?;
+        }
+        Ok(if plan.is_deletion() {
+            "Remote branch deleted; local branches and upstream settings preserved"
+        } else {
+            "Push completed"
+        }
+        .into())
     }
+}
+
+fn update_tracking(repo: &git2::Repository, tracking: &str, update: &Update) -> Result<()> {
+    if !update.id.is_zero() {
+        repo.reference(tracking, update.id, true, "GitBuddy push")?;
+        return Ok(());
+    }
+    let mut transaction = repo.transaction()?;
+    transaction.lock_ref(tracking)?;
+    match repo.find_reference(tracking) {
+        Ok(reference) => {
+            ensure!(
+                reference.target() == update.lease,
+                "Tracking branch moved after remote deletion; Fetch and review"
+            );
+            transaction.remove(tracking)?;
+            transaction.commit()?;
+        }
+        Err(e) if e.code() == ErrorCode::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }

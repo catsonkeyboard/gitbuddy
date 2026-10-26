@@ -14,6 +14,10 @@ impl GitBuddy {
             return;
         };
         match modal {
+            Modal::RenameBranch(expected) => {
+                self.perform(Operation::RenameBranch { expected, name: a }, cx)
+            }
+            Modal::CheckoutRevision => self.prepare_branch_action(branches::Request::Detach(a), cx),
             Modal::MergeTool => self.submit_merge_tool(a, b, cx),
             Modal::RebaseSetup => self.preview_rebase(a, b, cx),
             Modal::WorktreeCreate => self.perform(
@@ -199,6 +203,19 @@ impl GitBuddy {
                 None,
                 "Create & switch",
             ),
+            Modal::RenameBranch(_) => (
+                "Rename local branch",
+                "New branch name (files and index stay unchanged)",
+                None,
+                "Rename branch",
+            ),
+            Modal::CheckoutRevision => (
+                "Checkout detached HEAD",
+                "Commit, tag or revision (e.g. HEAD~2)",
+                None,
+                "Review checkout…",
+            ),
+            Modal::BranchPreparing(_) => ("Review branch operation", "", None, ""),
             Modal::BranchAt(_) => (
                 "Create branch from commit",
                 "New branch name (current checkout stays unchanged)",
@@ -333,6 +350,12 @@ impl GitBuddy {
         }
         let is_compare = matches!(modal, Modal::Compare);
         match modal {
+            Modal::BranchPreparing(message) => {
+                card = card.child(div().text_sm().child(message));
+            }
+            Modal::RenameBranch(ref expected) => {
+                card = card.child(div().text_xs().text_color(rgb(MUTED)).child(format!("{} @ {} · own upstream configuration and reflog move with the branch. Branches checked out in another worktree cannot be renamed here.", expected.name, &expected.id[..8])));
+            }
             Modal::Confirm(ref message, _) => {
                 card = card.child(
                     div()
@@ -356,6 +379,15 @@ impl GitBuddy {
                 let delete = name.clone();
                 card = card.child(div().text_color(rgb(ACCENT)).child(name.clone()));
                 if !remote {
+                    let rename = name.clone();
+                    card = card.child(self.button("branch-rename", "Rename branch…").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.prepare_branch_action(
+                                branches::Request::Rename(rename.clone()),
+                                cx,
+                            );
+                        }),
+                    ));
                     let upstream_branch = name.clone();
                     card = card.child(
                         self.button("branch-upstream", "Set / clear upstream…")
@@ -373,6 +405,16 @@ impl GitBuddy {
                         }),
                     ));
                 } else {
+                    let remote_delete = name.clone();
+                    card = card.child(
+                        self.button("remote-branch-delete", "Delete branch on remote…")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.prepare_branch_action(
+                                    branches::Request::DeleteRemote(remote_delete.clone()),
+                                    cx,
+                                );
+                            })),
+                    );
                     card = card.child(
                         self.button("branch-track", "Create local tracking branch & switch")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -398,6 +440,16 @@ impl GitBuddy {
                 }
             }
             Modal::CommitActions(id) => {
+                let detached = id.clone();
+                card = card.child(
+                    self.button(
+                        "commit-checkout-detached",
+                        "Checkout this commit (detached HEAD)…",
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.prepare_branch_action(branches::Request::Detach(detached.clone()), cx);
+                    })),
+                );
                 let branch_id = id.clone();
                 let reset_id = id.clone();
                 let edit_id = id.clone();
@@ -554,6 +606,16 @@ impl GitBuddy {
                         );
             }
             Modal::TagActions(name) => {
+                let revision = format!("refs/tags/{name}");
+                card = card.child(
+                    self.button("tag-checkout-detached", "Checkout tag (detached HEAD)…")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.prepare_branch_action(
+                                branches::Request::Detach(revision.clone()),
+                                cx,
+                            );
+                        })),
+                );
                 let push_tag = name.clone();
                 card = card.child(
                     self.button("push-tag", "Push this tag…")

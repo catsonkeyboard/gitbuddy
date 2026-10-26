@@ -2,6 +2,20 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-26 分支管理
+
+本节使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。新增运行时 Git 操作均通过 git2 / libgit2 完成，不调用 Bash 或系统 Git。
+
+- 本地分支支持当前 / 非当前分支重命名，保留提交、索引、工作文件、自身 upstream / 配置和 Reflog；当前 HEAD 跟随新引用。固定原仓库、HEAD 与源 ID，拒绝目标重名、遗留配置 / Reflog、其他 Worktree 占用和进行中的仓库操作；在所属 linked Worktree 中可正常重命名。
+- libgit2 `git_branch_move` / `git_reference_rename` 先删除源引用，再锁目标 / 更新 HEAD / 改配置，因此未直接采用其顺序。提前获取源 / 目标 / HEAD 和标准 config.lock，准备配置后先创建目的引用与 Reflog，更新配置和 HEAD，再清理源；后期错误保留源并说明部分完成。不宣称 refs / 配置跨文件断电原子性。嵌套引用路径重命名要求中间名称；全局 / include / Worktree 内的分支专属配置、符号链接 config 拒绝自动改写。
+- LLDB 定位到 libgit2 `config_file_delete_multivar → write_on_variable → git_regexp_match(NULL)`：对隐式布尔值执行多值正则删除会触发原生空指针崩溃。现仅替换标准 / legacy 分支 section header，保留原始值与注释；由 libgit2 对副本解析，核对所有键、值、顺序和 include 深度都符合预期后才安装。重复值、空值、隐式布尔、多行、CRLF、带引号分支名均有回归。
+- 远程分支删除反向解析唯一 Fetch refspec，固定 endpoint、完整目标和 tracking ID。复用 lease 推送计划和仓库任务取消；Fetch / Push URL 不同或映射歧义时拒绝。默认分支先由 Fetch 连接读取远端 HEAD 检查（Push 广告可能缺少 HEAD），再在 Push negotiation 校验旧 ID。使用匿名 remote 防止 libgit2 自动无条件清除 tracking ref；成功后在引用锁内按期望 ID 清理。保留本地分支和 upstream 配置，服务端保护拒绝或本地清理失败分别说明。
+- 本地 bare 目标在目标引用及 HEAD 锁内核对旧 ID / 默认分支再删除，不需要上传 pack 或 LFS。网络目标使用标准删除 refspec；预检阶段可取消，开始最终远端写入后等待结果。远端已移动时拒绝，不隐式 Fetch 更换期望值；目标 tracking / remote 配置改变或跨仓库计划复用也拒绝。
+- 提交 Actions、标签 Actions 和 Repository 菜单支持任意 revision 的 detached checkout。后台准备固定目标，确认前说明 detached HEAD 及保留提交的方式；执行前核对 HEAD / 指纹 / 引用。持有 HEAD / 当前分支锁，SAFE dry-run 后检出，不移动原分支；保留无关暂存 / 未跟踪文件，冲突覆盖、HEAD / index 锁及 LFS 脏正文拒绝；正常 LFS 版本切换重新展开本地对象。返回本地分支沿用 Switch to branch。草稿、会话和任务日志沿用既有机制，不自动重放写操作。
+- 新增 `tests/branch_management.rs` **26 项**隔离集成回归：重命名与配置 / Reflog、锁与 stale / Worktree；detached checkout 的提交 / annotated tag / revision、原分支和未提交内容、LFS、过期标签与跨仓库；远程删除 lease / 默认分支 / 自定义映射 / remote 名称含斜杠 / 服务端拒绝 / 取消 / 本地清理失败。4 项使用临时回环 `git daemon` 验证网络协议（系统 Git 只作测试服务器，Drop 关闭所属进程），其余使用原生临时仓库和本地 bare 目标；不连接真实托管服务。
+- 全量 `cargo test --locked --quiet` **303 项通过（248 集成 + 55 单元）**；`cargo clippy --locked --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。`python3 scripts/bundle_macos.py --debug` 重建成功；既有 block 0.1.6 未来兼容性提示保持。临时测试服务器已退出；未测试真实远端保护分支权限、SSH / HTTPS 认证及跨平台 GUI。
+- 原生 GUI 操作工具本轮未提供，**没有实机点击 / 布局 / GUI 重启验收**，不将编译或后端回归作为 GUI 验收。`examples/demo_branches.rs` 已创建 `/Users/liming/Code/Github/MyCode/gitbuddy/target/branches-ui-20261026`，包含本地 bare remote、两条本地分支、远程 tracking 分支及附注标签，独立配置为其 `config/`；拒绝覆盖已有夹具。正常开发包在 `dist/GitBuddy.app`，隔离测试包为夹具内 `GitBuddyBranchesQA.app`。未改写用户工作仓库历史、未向真实远程执行分支删除，代码未提交 / 推送。
+
 ## 2026-10-08 大仓库列表、缓存、任务日志与快捷键
 
 本节使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7、GPUI Kit 0.6.6。

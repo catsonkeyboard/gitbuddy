@@ -90,6 +90,12 @@ impl GitBuddy {
                                 Box::new(CompareRevisions),
                                 busy || !has_head,
                             )
+                            .menu_with_icon_and_disabled(
+                                "Checkout commit / tag…",
+                                IconName::ArrowLeft,
+                                Box::new(CheckoutRevision),
+                                busy || !has_head,
+                            )
                             .separator()
                             .menu_with_icon_and_disabled(
                                 "Amend latest commit…",

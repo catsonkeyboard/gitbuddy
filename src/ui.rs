@@ -1,3 +1,4 @@
+mod branches;
 mod conflicts;
 mod detail;
 mod graph;
@@ -48,6 +49,7 @@ gpui_kit::actions!(
         InitRepository,
         EditIdentity,
         Refresh,
+        CheckoutRevision,
         CommitChanges,
         AmendCommit,
         UndoCommit,
@@ -173,6 +175,9 @@ enum Modal {
     Init,
     Clone,
     Branch,
+    RenameBranch(Arc<git::BranchRename>),
+    CheckoutRevision,
+    BranchPreparing(String),
     BranchAt(String),
     ResetHistory(Option<Arc<git::ResetContext>>),
     CommitSelection,
@@ -376,6 +381,9 @@ pub struct GitBuddy {
     modal_error: Option<String>,
     history_data: HistoryData,
     history_generation: u64,
+    branch_generation: u64,
+    branch_focus: bool,
+    restore_branch_name: Option<String>,
     reflog_limit: usize,
     reflog_selected: Option<git::ReflogTarget>,
     amend_message: Entity<TextareaState>,
@@ -522,6 +530,9 @@ impl GitBuddy {
             modal_error: None,
             history_data: HistoryData::default(),
             history_generation: 0,
+            branch_generation: 0,
+            branch_focus: false,
+            restore_branch_name: None,
             reflog_limit: 100,
             reflog_selected: None,
             amend_message,
@@ -877,7 +888,8 @@ impl GitBuddy {
         let clear_message = matches!(operation, Operation::Commit(_) | Operation::CommitRebase(_));
         let history_edit = matches!(
             operation,
-            Operation::Amend { .. }
+            Operation::CheckoutDetached(_)
+                | Operation::Amend { .. }
                 | Operation::UndoLast(_)
                 | Operation::RestoreReflog { .. }
                 | Operation::Rebase { .. }
@@ -1050,6 +1062,19 @@ impl GitBuddy {
 impl Render for GitBuddy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.restore_scroll_on_next_frame(window, cx);
+        if self.branch_focus {
+            self.branch_focus = false;
+            if matches!(self.modal, Some(Modal::RenameBranch(_))) {
+                if let Some(name) = self.restore_branch_name.take() {
+                    self.form_a
+                        .update(cx, |s, cx| s.set_value(name, window, cx));
+                }
+                self.form_a.read(cx).focus_handle(cx).focus(window, cx);
+            } else {
+                self.restore_branch_name = None;
+                self.focus.focus(window, cx);
+            }
+        }
         if let Some(value) = self.restore_push_target.take()
             && matches!(self.modal, Some(Modal::PushSettings))
         {
@@ -1117,6 +1142,9 @@ impl Render for GitBuddy {
             .on_action(
                 cx.listener(|this, _: &OpenRepository, w, cx| this.show_modal(Modal::Open, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &CheckoutRevision, w, cx| {
+                this.show_modal(Modal::CheckoutRevision, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 if this.modal.is_some() {
                     return;
