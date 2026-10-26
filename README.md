@@ -55,6 +55,10 @@ GITBUDDY_CONFIG_DIR="$PWD/target/demo-scalability/config" cargo run --locked
 cargo run --locked --example demo_branches
 GITBUDDY_CONFIG_DIR="$PWD/target/demo-branches/config" cargo run --locked
 
+# 创建快进、分叉合并 / squash、Pull rebase 与冲突的独立演示仓库
+cargo run --locked --example demo_merge_pull
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-merge-pull/config" cargo run --locked
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -78,7 +82,8 @@ open dist/GitBuddy.app
 | 子模块 | 添加、递归列出 / 初始化 / 更新 / 同步 URL、嵌套 gitlink 暂存、独立标签打开、Worktree 独立检出、脏工作区保护及网络取消 |
 | Git LFS | Track / Untrack、原生 SHA-256 缓存及指针暂存、本地对象展开、remote Fetch / Push、普通 Push 前上传、锁列表 / 创建 / 解锁 / 强制解锁、缓存校验 / 隔离清理 / 恢复 / 确认后永久删除 |
 | 分支 | 创建并切换、本地切换、重命名并保留自身配置 / Reflog、带远端 ID 校验的远程分支删除、检出提交 / 标签进入 detached HEAD、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
-| 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、pull --ff-only、快捷 push、传输进度及取消、领先 / 落后计数 |
+| Merge / Pull | 默认快进或合并、no-ff、squash 暂存后提交；Pull 的仅快进 / merge / rebase 策略、冲突继续 / 中止及持久化恢复 |
+| 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、Pull 策略选择、快捷 push、传输进度及取消、领先 / 落后计数 |
 | Stash | 按选定文件保存、工作区 / 索引 / 未跟踪文件分组预览、Apply / Pop、恢复索引、从 Stash 建分支、确认后删除 |
 | 标签 | 创建 HEAD 标签、删除本地标签、推送选定标签 / 全部标签（支持已有轻量与附注标签） |
 | 大仓库 | 提交、侧栏与文件列表虚拟化，按文件展开 Diff；缓存图与过滤索引，历史加载上限、按条数及估算字节的 LRU 缓存 |
@@ -106,6 +111,16 @@ open dist/GitBuddy.app
 新增行与删除行独立选择：若要暂存一次完整替换，请同时选中对应的红、绿行。部分操作只更新暂存区，不改写工作区，保留其他文件与未选中行；操作完成后刷新 diff。外部编辑、HEAD 或暂存区变化导致 diff 过期时会拒绝执行，需重新选择。普通的新建、删除文件也支持部分操作；文件权限变化、重命名、二进制、符号链接、子模块、冲突及截断预览应使用整文件操作。
 
 ## 操作约定
+
+### Merge / Pull 策略
+
+侧栏本地 / 远程分支的 **Merge…** 打开选项页，展示固定的源提交和当前目标分支。默认 **Fast-forward or merge** 可以快进时直接移动分支，否则创建双父提交；**No fast-forward** 即使可以快进也创建双父提交，已完全合并的来源仍返回 Already up to date。**Squash** 合并到索引和工作区但不移动 HEAD，不自动提交；检查暂存内容后填写说明提交，或点击 **Use squash message** 使用建议说明。最终提交只有当前 HEAD 一个父提交，不记录来源分支为父提交。没有净改动时直接结束。
+
+Squash 冲突沿用逐文件 / 逐块解决界面；可通过普通 Commit 提交自定义说明，也可 **Continue Squash merge…** 使用建议说明。待完成状态保存在当前工作树 Git 管理目录的 `gitbuddy-squash.json` / `SQUASH_MSG`，重启后可继续。**Abort squash…** 恢复开始前的索引和 tracked 文件，丢弃期间的 tracked 编辑，保留未跟踪文件；执行前有修改时拒绝开始。若应用过程被中断、尚未确认索引完整，禁用提交，先保存需要的编辑再 Abort / 重试。已准备提交的日志在引用发布前 / 后可恢复，避免重复提交；状态损坏时保留现场并报错。
+
+工具栏 **Pull** 和对应快捷键打开策略选择页，每次默认 **Fast-forward only**；分叉时拒绝移动本地分支。**Merge** 可快进则快进，否则创建双父合并提交；**Rebase** 把本地线性提交重放到本次 Fetch 的 upstream 上，保留作者并改变本地提交 ID。仅有远程更新时直接快进；upstream 已包含在本地历史中时不改写。Pull 使用当前分支配置的 upstream 和唯一 Fetch 映射，只 Fetch 对应 remote；本地 upstream（remote 为 `.`）不联网。仓库、HEAD、工作区及 upstream 配置变化时要求重新审查。
+
+Merge 冲突通过现有 Continue / Abort 操作处理。Pull rebase 复用持久化 GitBuddy Rebase，冲突或重启后到 **Rebase progress…** 继续 / 中止；保留原历史备份。它要求共同祖先、线性本地范围且最多 2,000 条，不支持保留合并提交，含合并提交时改用 Pull merge。Pull Fetch 阶段可取消；开始本地合并 / 引用更新 / 重放后等待结果，此时取消不再生效。Fetch 已取得的对象及 tracking 更新不会回滚。Merge 和 Pull 都要求无未提交修改，复用 LFS 原生指针处理与本地展开，不自动下载 LFS 正文。后端旧 `Operation::Pull` 仍默认仅快进，`Operation::Merge` 仍使用默认合并策略；新界面通过带预览的策略操作执行。
 
 ### 分支管理
 
@@ -286,6 +301,7 @@ Rebase 当前只支持本地分支线性历史，不支持根提交重写或保�
 - `src/git/conflicts.rs`：索引三方内容、结果保存、引用 / 索引锁和过期校验、继续冲突操作。
 - `src/git/conflict_blocks.rs`、`src/git/merge_tool.rs`：逐块选择、直接参数启动外部工具、临时结果与取消 / 过期保护。
 - `src/git/rebase.rs`：基于 libgit2 的可编辑提交序列、引用事务、持久化进度、冲突继续与中止。
+- `src/git/integration.rs`、`src/ui/integration.rs`：Merge / Pull 策略、upstream 预检、squash 单父提交与持久化恢复、异步选项页。
 - `src/git/lfs_maintenance.rs`：LFS 锁核验、全历史 / Worktree 对象保护、缓存校验与隔离清理。
 - `src/git/workspaces.rs`：Worktree 与子模块管理、跨工作树分支占用检查。
 - `src/git/lfs.rs`：原生指针暂存 / 本地展开、对象校验，以及可取消的官方 git-lfs 传输进程。
@@ -306,6 +322,7 @@ Rebase 当前只支持本地分支线性历史，不支持根提交重写或保�
 - `src/git/remotes.rs`、`src/ui/remotes.rs`：远程配置、完整引用 upstream、固定推送计划及管理面板。
 - `src/git/branches.rs`、`src/ui/branches.rs`：固定目标的分支重命名 / detached checkout，以及带标签身份校验的后台操作预览；远程分支删除复用带 lease 的推送计划。
 - `tests/remote_management.rs`：远程配置、推送目标、lease 并发保护与标签推送的 libgit2 隔离回归；`examples/demo_remotes.rs` 提供本地演示仓库。
+- `tests/merge_pull_strategies.rs`、`examples/demo_merge_pull.rs`：no-ff / squash、Pull 三种策略、冲突和重启恢复、取消 / 过期保护及 LFS 回归，独立多仓库演示会话。
 - `tests/p1_regressions.rs`、`tests/p2_regressions.rs`：审查问题的隔离仓库回归，P2 含本地 Basic-auth HTTP 服务验证凭据助手、Push 和子模块克隆；HTTP 夹具通过系统 Git 提供协议，客户端仍使用 libgit2。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。
 - `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。

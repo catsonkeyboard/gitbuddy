@@ -97,6 +97,9 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::Integration) {
+            return self.integration_modal(cx);
+        }
         if matches!(modal, Modal::Preferences) {
             return self.preferences_modal(cx);
         }
@@ -183,6 +186,7 @@ impl GitBuddy {
             | Modal::LfsReport
             | Modal::Preferences
             | Modal::TaskLog
+            | Modal::Integration
             | Modal::RebaseMessage(_) => unreachable!(),
             Modal::Open => ("Open repository", "Local repository path", None, "Open"),
             Modal::Init => (
@@ -425,14 +429,7 @@ impl GitBuddy {
                 card = card.child(
                     self.button("branch-merge", "Merge into current branch…")
                         .on_click(cx.listener(move |this, _, w, cx| {
-                            this.show_modal(
-                                Modal::Confirm(
-                                    format!("Merge {merge} into {}?", this.snapshot.branch),
-                                    Operation::Merge(merge.clone()),
-                                ),
-                                w,
-                                cx,
-                            )
+                            this.open_integration(Some(merge.clone()), w, cx)
                         })),
                 );
                 if !remote {

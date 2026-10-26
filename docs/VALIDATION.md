@@ -2,6 +2,20 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-26 Merge / Pull 策略
+
+本节使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。新增运行时 Git 操作均调用 git2 / libgit2，不调用 Bash 或系统 Git；命令行 Git 仅用于只读核对隔离夹具。
+
+- 分支 Merge 选项页固定仓库、HEAD、来源引用 / OID 与指纹。默认可快进则快进，否则双父合并；no-ff 在可快进时也创建双父提交。标准 Merge 冲突沿用已有继续 / 中止流程。持有 HEAD / 当前分支标准引用锁，SAFE checkout；拒绝脏工作区、索引及过期目标。
+- Squash 合并结果写索引和工作区，HEAD 保持不动，移除 MERGE_HEAD，最终普通 Commit 或 Continue 只生成单父提交。建议说明通过按钮显式填入，保留原草稿；无净变化自动结束。工作树专属 `gitbuddy-squash.json` / SQUASH_MSG 纳入刷新指纹和冲突 token；日志绑定仓库 / HEAD，先记录应用未确认、再标记完整索引。中断未确认时禁用提交；准备提交 ID 在发布引用前记录，重启可在发布前 / 后继续且不重复提交。损坏状态保留并拒绝写入；Abort 恢复原 tracked 文件 / 索引，保留 untracked，期间不允许开始其他历史操作。多文件更新不宣称断电原子性。
+- Pull 对话框每次默认仅快进，可选 Merge / Rebase；复核当前 upstream、唯一 Fetch 映射和 remote endpoint，仅 Fetch 该 remote，本地 upstream 不联网。Fetch 前校验审查指纹，Fetch 后及本地应用前再核对 HEAD / 工作区 / upstream 配置。Fetch 可取消，进入本地写入阶段前封闭取消；已 Fetch 的对象和 tracking refs 不回滚。
+- Pull Merge 分叉时双父提交；Pull Rebase 复用已有持久化重放 / 备份 / 冲突恢复，保留作者，要求共同祖先、线性本地范围且最多 2,000 条。含本地 merge 的范围在分离 HEAD 前拒绝；无本地提交时快进，已包含 upstream 时不改写。本地配置复核不重复生成完整指纹，减少 LFS 大正文的额外扫描。
+- Merge / Pull 保持 LFS 标准指针和本地正文展开。补测发现 squash 冲突的完整版本选择后可能保留指针文本，现对冲突保存及 squash Commit / Continue / Discard 增加本地展开，避免先 dehydrate 改变已审查索引；缺失本地对象仍提示 LFS Fetch，不自动下载。
+- 新增 `tests/merge_pull_strategies.rs` **27 项**隔离回归：三种 Merge / Pull 策略的父关系与树、冲突继续 / 中止、重开仓库、squash 发布前 / 后的恰好一次恢复、应用中断和损坏状态、无净改动、锁 / 脏索引、过期仓库 / HEAD / 来源 / 配置、Fetch 后变化、取消封闭边界、本地 upstream、自定义 Fetch 映射、隐式布尔配置，以及 LFS 的正常合并 / 重放 / 冲突与中止。网络夹具仅使用临时本地 bare 仓库，无真实外部服务器写入。
+- 全量 `cargo test --locked --no-fail-fast --quiet` **330 项通过（275 集成 + 55 单元）**；`cargo clippy --locked --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。`python3 scripts/bundle_macos.py --debug` 重建 `dist/GitBuddy.app`；既有 block 0.1.6 未来兼容性提示保持。
+- 原生 GPUI 使用 `examples/demo_merge_pull.rs` 创建的 `target/merge-pull-ui-20261026`，独立 bundle ID / 配置，四个标签。验证可快进来源 no-ff 生成双父 `5af557b`；分叉来源 squash 暂存且 HEAD 保持 `c8bcae0`，正常退出 / 重启后待完成状态与说明恢复，再 Commit 生成单父 `802b3ee`；Pull 默认 FF-only 拒绝分叉，选 Rebase 后本地提交变为 `45f8f19` 并以 upstream `e051d4e` 为父；Pull Merge 在 settings.toml 冲突，Use theirs → Save & mark resolved → Continue → Confirm 后生成双父 `1d6c68c`，磁盘与界面均无工作区变化。测试应用正常退出。
+- 验证边界：Pull rebase 的冲突重启 / 中止以及 LFS 冲突由集成回归验证，本轮未逐一原生点击；未测试真实外部 SSH / HTTPS 认证、远程 LFS 服务、断电和 Windows / Linux 原生界面。未创建本项目的新 commit，未修改真实仓库历史或向外部服务器推送；上一轮尚未提交的分支管理改动保留。
+
 ## 2026-10-26 分支管理
 
 本节使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。新增运行时 Git 操作均通过 git2 / libgit2 完成，不调用 Bash 或系统 Git。

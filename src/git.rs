@@ -79,10 +79,15 @@ pub struct Snapshot {
     pub conflict_operation: ConflictOperation,
     /// The sequencer is paused for user-created replacement commits.
     pub rebase_editing: bool,
+    pub squash_pending: bool,
+    pub squash_message: Option<String>,
 }
 impl Snapshot {
     /// Shared eligibility for the button, keyboard action and backend entry.
     pub fn can_commit(&self) -> bool {
+        if self.squash_pending {
+            return false;
+        }
         Self::commit_allowed(
             &self.files,
             if self.rebase_editing {
@@ -95,7 +100,7 @@ impl Snapshot {
     pub(crate) fn commit_allowed(files: &[FileChange], operation: ConflictOperation) -> bool {
         matches!(
             operation,
-            ConflictOperation::None | ConflictOperation::Merge
+            ConflictOperation::None | ConflictOperation::Merge | ConflictOperation::Squash
         ) && !files.iter().any(FileChange::conflict)
             && (files.iter().any(FileChange::staged) || operation == ConflictOperation::Merge)
     }
@@ -200,6 +205,10 @@ pub enum Operation {
     DeleteRemoteBranch(std::sync::Arc<PushPlan>),
     DeleteBranch(String),
     Merge(String),
+    MergeWith {
+        context: std::sync::Arc<MergePreview>,
+        mode: MergeMode,
+    },
     AbortMerge,
     Revert(String),
     CherryPick(String),
@@ -211,6 +220,10 @@ pub enum Operation {
     SetIdentity(String, String),
     Fetch,
     Pull,
+    PullWith {
+        context: std::sync::Arc<PullPreview>,
+        strategy: PullStrategy,
+    },
     Push,
     PushTo(std::sync::Arc<PushPlan>),
     Stash(String),
@@ -301,6 +314,9 @@ pub use history::{ResetContext, ResetMode};
 #[path = "git/branches.rs"]
 mod branches;
 pub use branches::{BranchRename, DetachedCheckout};
+#[path = "git/integration.rs"]
+mod integration;
+pub use integration::{MergeMode, MergePreview, PullPreview, PullStrategy};
 #[path = "git/inspect.rs"]
 mod inspect;
 pub use inspect::{
@@ -350,6 +366,7 @@ impl Operation {
             self,
             Self::Fetch
                 | Self::Pull
+                | Self::PullWith { .. }
                 | Self::Push
                 | Self::PushTo(_)
                 | Self::DeleteRemoteBranch(_)
@@ -370,6 +387,8 @@ impl Operation {
         match self {
             Self::Fetch => "Fetch",
             Self::Pull => "Pull",
+            Self::PullWith { .. } => "Pull",
+            Self::MergeWith { .. } => "Merge",
             Self::Push => "Push",
             Self::PushTo(_) => "Push",
             Self::DeleteRemoteBranch(_) => "Delete remote branch",

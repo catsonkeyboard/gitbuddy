@@ -269,10 +269,16 @@ fn fingerprint_of(
         "unborn".hash(&mut hasher);
     }
     format!("{:?}", repo.state()).hash(&mut hasher);
-    match fs::read(repo.path().join("gitbuddy-rebase.json")) {
-        Ok(state) => state.hash(&mut hasher),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    for name in [
+        "gitbuddy-rebase.json",
+        super::integration::SQUASH_STATE,
+        "SQUASH_MSG",
+    ] {
+        match fs::read(repo.path().join(name)) {
+            Ok(state) => state.hash(&mut hasher),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     let mut references: Vec<String> = Vec::new();
     for item in repo.references()? {
@@ -655,10 +661,15 @@ impl Repository {
             .filter_map(|name| name.ok().flatten().map(str::to_owned))
             .collect();
         let merging = repo.state() == RepositoryState::Merge;
+        let squash = super::integration::squash_status(&repo)?;
         Ok(Snapshot {
+            squash_pending: squash.as_ref().is_some_and(|s| !s.0),
+            squash_message: squash.as_ref().map(|s| s.1.clone()),
             rebase_editing: self.rebase_status()?.is_some_and(|s| s.editing),
             conflict_operation: if super::rebase::active(&repo) {
                 ConflictOperation::Rebase
+            } else if squash.is_some() {
+                ConflictOperation::Squash
             } else {
                 super::conflicts::operation(repo.state())
             },
@@ -866,8 +877,6 @@ impl Repository {
             Operation::Checkout(_)
                 | Operation::TrackBranch(_)
                 | Operation::CreateBranch(_)
-                | Operation::Merge(_)
-                | Operation::Pull
                 | Operation::Revert(_)
                 | Operation::CherryPick(_)
                 | Operation::AbortMerge
@@ -886,9 +895,39 @@ impl Repository {
                 }
         );
         let initial = raw(self)?;
+        let squash = super::integration::squash_active(&initial);
+        let checkout = checkout && !squash;
+        // A conflict choice may install a complete LFS pointer. Squash
+        // continuation must hydrate it without dehydrating the reviewed index.
+        let hydrate = checkout
+            || matches!(&operation, Operation::ResolveConflict { .. })
+            || (squash
+                && matches!(
+                    &operation,
+                    Operation::Commit(_) | Operation::ContinueConflict(_) | Operation::Discard(_)
+                ));
         // Linked worktrees share refs and the LFS object store. This advisory
         // lock serializes GitBuddy writers without blocking unrelated repos.
         let _writer = WriterLock::acquire(&initial)?;
+        if super::integration::squash_active(&initial) {
+            ensure!(
+                matches!(
+                    &operation,
+                    Operation::Stage(_)
+                        | Operation::Unstage(_)
+                        | Operation::StageAll
+                        | Operation::UnstageAll
+                        | Operation::ApplyPartial { .. }
+                        | Operation::Discard(_)
+                        | Operation::ResolveConflict { .. }
+                        | Operation::ContinueConflict(_)
+                        | Operation::AbortMerge
+                        | Operation::Commit(_)
+                        | Operation::SetIdentity(_, _)
+                ),
+                "A squash merge is in progress; commit or abort it before starting another operation"
+            );
+        }
         if super::rebase::active(&initial) {
             ensure!(
                 matches!(
@@ -1033,6 +1072,9 @@ impl Repository {
                     Ok("Working tree changes discarded".into())
                 }
                 Operation::Commit(message) => {
+                    if super::integration::squash_active(&repo) {
+                        return self.commit_squash(&message, None);
+                    }
                     ensure!(
                         matches!(
                             repo.state(),
@@ -1094,11 +1136,14 @@ impl Repository {
                     Ok(format!("Deleted branch {name}"))
                 }
                 Operation::Merge(name) => {
-                    let reference = merge_reference(&repo, &name)?;
-                    let target = reference.target().context("目标分支没有提交")?;
-                    merge_target(&repo, target, &name, false)
+                    let preview = self.prepare_merge(&name)?;
+                    self.merge_with(&preview, super::MergeMode::Auto)
                 }
+                Operation::MergeWith { context, mode } => self.merge_with(&context, mode),
                 Operation::AbortMerge | Operation::AbortRevert | Operation::AbortCherryPick => {
+                    if super::integration::squash_active(&repo) {
+                        return self.abort_squash();
+                    }
                     abort_operation(&repo)?;
                     Ok("Operation aborted".into())
                 }
@@ -1156,35 +1201,15 @@ impl Repository {
                     Ok("Remotes fetched".into())
                 }
                 Operation::Pull => {
-                    let head = repo.head()?;
-                    ensure!(head.is_branch(), "请先切换到本地分支再 Pull");
-                    let source = head.name()?;
-                    let remote = repo
-                        .branch_upstream_remote(source)
-                        .context("当前分支没有上游远程配置")?;
-                    let remote_name = remote.as_str().context("上游远程名称编码无效")?;
-                    let merge = repo
-                        .branch_upstream_merge(source)
-                        .context("当前分支没有上游分支配置")?;
-                    let merge_name = merge.as_str().context("上游分支编码无效")?;
-                    ensure!(
-                        merge_name.starts_with("refs/heads/")
-                            && git2::Reference::is_valid_name(merge_name),
-                        "上游目标不是有效的分支引用"
-                    );
-                    let upstream_name = if remote_name == "." {
-                        merge_name.to_string()
-                    } else {
-                        fetch_one(&repo, remote_name, control.clone())?;
-                        repo.branch_upstream_name(source)?
-                            .as_str()
-                            .context("上游引用编码无效")?
-                            .to_string()
-                    };
-                    let target = repo.find_reference(&upstream_name)?.peel_to_commit()?.id();
-                    control.cancellation.finish()?;
-                    control.phase("Pull: applying fast-forward…");
-                    merge_target(&repo, target, &upstream_name, true)
+                    let preview = self.prepare_pull()?;
+                    self.pull_with(
+                        &preview,
+                        super::PullStrategy::FastForwardOnly,
+                        control.clone(),
+                    )
+                }
+                Operation::PullWith { context, strategy } => {
+                    self.pull_with(&context, strategy, control.clone())
                 }
                 Operation::Push => self.default_push(control.clone()),
                 Operation::PushTo(plan) => self.push_plan(&plan, control.clone()),
@@ -1260,7 +1285,7 @@ impl Repository {
                 }
             }
         })();
-        let result = if checkout {
+        let result = if hydrate {
             match super::lfs::hydrate(&raw(self)?) {
                 Ok(missing) => result.map(|text| {
                     if missing > 0 {
@@ -1278,7 +1303,7 @@ impl Repository {
     }
 }
 
-fn merge_reference<'a>(repo: &'a RawRepo, name: &str) -> Result<git2::Reference<'a>> {
+pub(super) fn merge_reference<'a>(repo: &'a RawRepo, name: &str) -> Result<git2::Reference<'a>> {
     if name.starts_with("refs/heads/") || name.starts_with("refs/remotes/") {
         ensure!(git2::Reference::is_valid_name(name), "无效的引用名称");
         return Ok(repo.find_reference(name)?);
@@ -1462,40 +1487,7 @@ fn abort_operation(repo: &RawRepo) -> Result<()> {
     Ok(())
 }
 
-fn merge_target(repo: &RawRepo, target: Oid, name: &str, ff_only: bool) -> Result<String> {
-    ensure!(
-        file_changes(repo)?.is_empty(),
-        "合并前请先提交、Stash 或丢弃现有修改"
-    );
-    let annotated = repo.find_annotated_commit(target)?;
-    let (analysis, _) = repo.merge_analysis(&[&annotated])?;
-    if analysis.is_up_to_date() {
-        return Ok("Already up to date".into());
-    }
-    if analysis.is_fast_forward() {
-        let commit = repo.find_commit(target)?;
-        let mut checkout = CheckoutBuilder::new();
-        checkout.safe();
-        repo.checkout_tree(commit.as_object(), Some(&mut checkout))?;
-        let mut head = repo.head()?;
-        head.set_target(target, &format!("Fast-forward to {name}"))?;
-        return Ok(format!("Fast-forwarded to {name}"));
-    }
-    ensure!(!ff_only, "不能快进合并上游分支");
-    ensure!(analysis.is_normal(), "无法合并此分支");
-    let mut checkout = CheckoutBuilder::new();
-    checkout
-        .safe()
-        .allow_conflicts(true)
-        .conflict_style_merge(true);
-    repo.merge(&[&annotated], None, Some(&mut checkout))?;
-    if repo.index()?.has_conflicts() {
-        bail!("Merge has conflicts; resolve or abort");
-    }
-    commit_index(repo, &format!("Merge branch '{name}'"), Some(target))
-}
-
-fn fetch_one(repo: &RawRepo, name: &str, control: NetworkControl) -> Result<()> {
+pub(super) fn fetch_one(repo: &RawRepo, name: &str, control: NetworkControl) -> Result<()> {
     control.check()?;
     control.phase(&format!("Fetch: connecting to {name}…"));
     control.check()?;

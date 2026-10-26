@@ -233,6 +233,10 @@ impl Drop for Lock {
 }
 fn clean(repo: &Raw) -> Result<()> {
     ensure!(
+        !super::integration::squash_active(repo),
+        "Finish or abort the squash merge first"
+    );
+    ensure!(
         repo.state() == RepositoryState::Clean && !active(repo),
         "Finish or abort the current repository operation first"
     );

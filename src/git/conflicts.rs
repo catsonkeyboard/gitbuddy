@@ -17,6 +17,7 @@ pub enum ConflictOperation {
     #[default]
     None,
     Merge,
+    Squash,
     CherryPick,
     Revert,
     Rebase,
@@ -27,6 +28,7 @@ impl ConflictOperation {
         match self {
             Self::None => "Index conflicts",
             Self::Merge => "Merge",
+            Self::Squash => "Squash merge",
             Self::CherryPick => "Cherry-pick",
             Self::Revert => "Revert",
             Self::Rebase => "Rebase",
@@ -36,7 +38,7 @@ impl ConflictOperation {
     pub fn can_continue(self) -> bool {
         matches!(
             self,
-            Self::Merge | Self::CherryPick | Self::Revert | Self::Rebase
+            Self::Merge | Self::Squash | Self::CherryPick | Self::Revert | Self::Rebase
         )
     }
 }
@@ -147,6 +149,8 @@ fn token(repo: &git2::Repository) -> Result<Token> {
         "REVERT_HEAD",
         "MERGE_MSG",
         "gitbuddy-rebase.json",
+        "SQUASH_MSG",
+        super::integration::SQUASH_STATE,
     ]
     .iter()
     .map(|name| match fs::read(repo.path().join(name)) {
@@ -299,13 +303,13 @@ fn worktree(root: &Path, path: &Path) -> Result<(WorkVersion, Option<Vec<u8>>)> 
 }
 // Own the standard index lock before reading or replacing either file. A copy
 // of the latest index preserves unrelated staged entries and index extensions.
-struct IndexLock {
+pub(super) struct IndexLock {
     path: PathBuf,
     file: fs::File,
     cleanup: bool,
 }
 impl IndexLock {
-    fn acquire(index: &Path) -> Result<Self> {
+    pub(super) fn acquire(index: &Path) -> Result<Self> {
         let mut name = index.as_os_str().to_owned();
         name.push(".lock");
         let path = PathBuf::from(name);
@@ -347,13 +351,19 @@ impl Repository {
         let token = token(&repo)?;
         let operation = if super::rebase::active(&repo) {
             ConflictOperation::Rebase
+        } else if super::integration::squash_active(&repo) {
+            ConflictOperation::Squash
         } else {
             operation(token.state)
         };
-        let message = token.markers[3]
-            .as_ref()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_else(|| format!("Complete {}", operation.label()));
+        let message = token.markers[if operation == ConflictOperation::Squash {
+            5
+        } else {
+            3
+        }]
+        .as_ref()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_else(|| format!("Complete {}", operation.label()));
         let message = message
             .lines()
             .filter(|l| !l.starts_with('#'))
@@ -619,6 +629,16 @@ impl Repository {
     }
     pub(super) fn continue_conflict(&self, session: &ConflictSession) -> Result<String> {
         let repo = raw(self)?;
+        if session.operation == ConflictOperation::Squash {
+            ensure!(
+                token(&repo)? == session.token,
+                "Squash changed; reload before continuing"
+            );
+            let marker = session.token.markers[6]
+                .as_deref()
+                .context("Missing squash state")?;
+            return self.commit_squash(&session.message, Some((&session.index, marker)));
+        }
         if session.operation == ConflictOperation::Rebase {
             ensure!(
                 token(&repo)? == session.token && index_bytes(&repo.index()?)? == session.index,

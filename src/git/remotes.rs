@@ -120,7 +120,7 @@ fn branch_ref(name: &str) -> Result<String> {
     );
     Ok(full)
 }
-fn tracking_ref(repo: &git2::Repository, remote: &str, target: &str) -> Result<String> {
+pub(super) fn tracking_ref(repo: &git2::Repository, remote: &str, target: &str) -> Result<String> {
     let remote = repo.find_remote(remote)?;
     let mapped: Vec<_> = remote
         .refspecs()

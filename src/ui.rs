@@ -5,6 +5,7 @@ mod graph;
 mod history;
 mod history_actions;
 mod inspect;
+mod integration;
 mod management;
 mod modals;
 mod patches;
@@ -160,6 +161,7 @@ impl PatchLineSelection {
 }
 #[derive(Clone)]
 enum Modal {
+    Integration,
     RebaseSetup,
     RebasePlan,
     RebaseMessage(usize),
@@ -382,6 +384,10 @@ pub struct GitBuddy {
     history_data: HistoryData,
     history_generation: u64,
     branch_generation: u64,
+    integration_generation: u64,
+    integration_data: integration::Data,
+    merge_mode: git::MergeMode,
+    pull_strategy: git::PullStrategy,
     branch_focus: bool,
     restore_branch_name: Option<String>,
     reflog_limit: usize,
@@ -531,6 +537,10 @@ impl GitBuddy {
             history_data: HistoryData::default(),
             history_generation: 0,
             branch_generation: 0,
+            integration_generation: 0,
+            integration_data: integration::Data::Loading,
+            merge_mode: git::MergeMode::Auto,
+            pull_strategy: git::PullStrategy::FastForwardOnly,
             branch_focus: false,
             restore_branch_name: None,
             reflog_limit: 100,
@@ -889,6 +899,8 @@ impl GitBuddy {
         let history_edit = matches!(
             operation,
             Operation::CheckoutDetached(_)
+                | Operation::MergeWith { .. }
+                | Operation::PullWith { .. }
                 | Operation::Amend { .. }
                 | Operation::UndoLast(_)
                 | Operation::RestoreReflog { .. }
@@ -1170,9 +1182,9 @@ impl Render for GitBuddy {
                     this.perform(Operation::Fetch, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &Pull, _, cx| {
+            .on_action(cx.listener(|this, _: &Pull, window, cx| {
                 if this.modal.is_none() {
-                    this.perform(Operation::Pull, cx);
+                    this.open_integration(None, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &Push, _, cx| {

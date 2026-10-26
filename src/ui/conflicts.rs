@@ -360,7 +360,7 @@ impl GitBuddy {
             .child(h_flex().h(px(38.)).px_3().gap_2().bg(rgb(PANEL)).border_b_1().border_color(rgb(BORDER))
                 .child(div().flex_1().text_xs().child(format!("{} · {count} unresolved files", operation.label())))
                 .child(self.button("reload-conflicts","Refresh list").ghost().disabled(self.busy()).on_click(cx.listener(|this,_,_,cx|this.reload_conflicts(None,cx))))
-                .when(operation.can_continue(), |row| row.child(self.button("continue-conflict",format!("Continue {}…", operation.label())).primary().disabled(self.busy() || count != 0 || self.active.conflicts.loading)
+                .when(operation.can_continue(), |row| row.child(self.button("continue-conflict",format!("Continue {}…", operation.label())).primary().disabled(self.busy() || count != 0 || self.active.conflicts.loading || self.snapshot.squash_pending)
                     .on_click(cx.listener(|this,_,w,cx| { if let Some(session)=this.active.conflicts.session.clone() {this.show_modal(Modal::Confirm(format!("Complete {} using all staged changes?\n\n{}",session.operation.label(),session.message.trim()),Operation::ContinueConflict(session)),w,cx);} }))))
                 .when(operation.can_continue(), |row| row.child(self.button("abort-conflict","Abort…").disabled(self.busy()).on_click(cx.listener(|this,_,w,cx| {
                     let op = match this.active.conflicts.session.as_ref().map(|s|s.operation) { Some(git::ConflictOperation::Rebase)=>Operation::AbortRebase,Some(git::ConflictOperation::CherryPick)=>Operation::AbortCherryPick,Some(git::ConflictOperation::Revert)=>Operation::AbortRevert,_=>Operation::AbortMerge };

@@ -68,6 +68,10 @@ pub(super) fn head_state(repo: &RawRepo) -> Result<HeadState> {
 
 pub(super) fn editable(repo: &RawRepo) -> Result<()> {
     ensure!(
+        !super::integration::squash_active(repo),
+        "Finish or abort the squash merge before editing history"
+    );
+    ensure!(
         !super::rebase::active(repo),
         "Finish or abort the GitBuddy rebase before editing history."
     );

@@ -136,7 +136,10 @@ impl GitBuddy {
                             .py_2()
                             .gap_2()
                             .bg(rgb(0x51432d))
-                            .child(div().flex_1().text_xs().child(if self.snapshot.rebase_editing { "Rebase paused for editing / splitting. Stage and commit each part, then Continue rebase." } else { "Review and resolve conflicts, then continue the operation." }))
+                            .child(div().flex_1().text_xs().child(if self.snapshot.squash_pending { "Squash was interrupted before application was confirmed. Preserve edits, then abort and retry." } else if self.snapshot.conflict_operation == git::ConflictOperation::Squash { "Squash result: review staged changes and commit once. HEAD stays unchanged until you commit." } else if self.snapshot.rebase_editing { "Rebase paused for editing / splitting. Stage and commit each part, then Continue rebase." } else { "Review and resolve conflicts, then continue the operation." }))
+                            .when_some(self.snapshot.squash_message.clone(), |row, message| row
+                                .child(self.button("use-squash-message", "Use squash message").ghost().on_click(cx.listener(move |this, _, w, cx| this.message.update(cx, |state, cx| state.set_value(message.clone(), w, cx)))))
+                                .child(self.button("abort-squash", "Abort squash…").ghost().on_click(cx.listener(|this, _, w, cx| this.show_modal(Modal::Confirm("Abort squash and restore the original tracked files and index? Resolutions and tracked edits made during squash will be discarded.".into(), Operation::AbortMerge), w, cx)))))
                             .child(
                                 self.button("resolve-conflicts", if self.snapshot.conflict_operation == git::ConflictOperation::Rebase { "Rebase progress…" } else { "Resolve conflicts…" })
                                     .on_click(

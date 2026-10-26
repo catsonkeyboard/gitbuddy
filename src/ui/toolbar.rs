@@ -230,7 +230,9 @@ impl GitBuddy {
                                 .ghost()
                                 .icon(IconName::ArrowDown)
                                 .on_click(
-                                    cx.listener(|this, _, _, cx| this.perform(Operation::Pull, cx)),
+                                    cx.listener(|this, _, w, cx| {
+                                        this.open_integration(None, w, cx)
+                                    }),
                                 ),
                         )
                         .child(
