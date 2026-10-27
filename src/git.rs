@@ -174,6 +174,7 @@ pub enum Operation {
     UnstageAll,
     Discard(PathBuf),
     Commit(String),
+    CommitEmpty(String),
     Amend {
         context: std::sync::Arc<CommitEdit>,
         message: String,
@@ -331,6 +332,7 @@ mod inspect;
 pub use inspect::{
     BlameLine, BlameView, Comparison, FileHistory, FileHistoryEntry, Revision, TreeFiles,
 };
+mod commit_policy;
 #[path = "git/conflict_blocks.rs"]
 mod conflict_blocks;
 #[path = "git/conflicts.rs"]
@@ -399,6 +401,7 @@ impl Operation {
     }
     pub fn label(&self) -> &'static str {
         match self {
+            Self::CommitEmpty(_) => "Create empty commit",
             Self::Fetch => "Fetch",
             Self::CreateTag(plan) => match plan.kind() {
                 TagKind::Lightweight => "Create lightweight tag",

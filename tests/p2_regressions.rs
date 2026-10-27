@@ -266,6 +266,55 @@ fn ordinary_commit_rejects_empty_and_unstaged_only_without_moving_head() {
     repo.execute(Operation::Commit("staged".into())).unwrap();
     assert_ne!(head(&repo), base);
 }
+
+#[test]
+fn explicit_empty_commit_preserves_unstaged_changes_and_rejects_staged_changes() {
+    let (_dir, repo) = setup();
+    repo.execute(Operation::CommitEmpty("initial empty".into()))
+        .unwrap();
+    let first = raw(&repo).head().unwrap().peel_to_commit().unwrap().id();
+    write(&repo, "untracked", "keep");
+    repo.execute(Operation::CommitEmpty("second empty".into()))
+        .unwrap();
+    let r = raw(&repo);
+    let second = r.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(second.parent_id(0).unwrap(), first);
+    assert_eq!(second.tree_id(), r.find_commit(first).unwrap().tree_id());
+    assert_eq!(
+        fs::read_to_string(repo.root.join("untracked")).unwrap(),
+        "keep"
+    );
+    assert!(repo.execute(Operation::CommitEmpty(" ".into())).is_err());
+    repo.execute(Operation::StageAll).unwrap();
+    assert!(
+        repo.execute(Operation::CommitEmpty("must reject".into()))
+            .is_err()
+    );
+    assert_eq!(
+        raw(&repo).head().unwrap().peel_to_commit().unwrap().id(),
+        second.id()
+    );
+    assert!(repo.snapshot(100).unwrap().can_commit());
+}
+
+#[test]
+fn configured_commit_template_loads_without_touching_the_repository() {
+    let (_dir, repo) = setup();
+    assert!(repo.commit_template().is_err());
+    let template = repo.root.join("commit-template.txt");
+    fs::write(&template, "Subject\n\nBody\n").unwrap();
+    raw(&repo)
+        .config()
+        .unwrap()
+        .set_str("commit.template", "commit-template.txt")
+        .unwrap();
+    assert_eq!(repo.commit_template().unwrap(), "Subject\n\nBody\n");
+    assert!(raw(&repo).head().is_err());
+    fs::write(&template, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    assert!(repo.commit_template().is_err());
+    fs::write(&template, b"invalid\0template").unwrap();
+    assert!(repo.commit_template().is_err());
+}
 #[test]
 fn merge_with_unchanged_tree_can_still_be_completed() {
     let (_dir, repo) = setup();

@@ -186,8 +186,15 @@ impl Repository {
     pub(super) fn amend(&self, context: &CommitEdit, message: &str) -> Result<String> {
         ensure!(!message.trim().is_empty(), "Please enter a commit message.");
         let repo = raw(self)?;
+        ensure!(
+            head_state(&repo)? == context.head,
+            "HEAD changed. Reopen Amend and review it again."
+        );
+        let message = super::commit_policy::prepare_message(&repo, message, true)?;
         rewrite_head(&repo, &context.head, "commit (amend): GitBuddy", || {
             let mut index = repo.index()?;
+            let _index_lock =
+                super::conflicts::IndexLock::acquire(index.path().context("Missing index")?)?;
             index.read(true)?;
             ensure!(
                 index.write_tree()? == context.index_tree,
@@ -199,16 +206,32 @@ impl Repository {
                 .id
                 .as_deref()
                 .context("No HEAD commit")?)?)?;
-            Ok(Some(commit.amend(
-                None,
-                None,
-                Some(&author(&repo)?),
-                Some("UTF-8"),
-                Some(message),
-                Some(&tree),
-            )?))
+            let parents = commit.parents().collect::<Vec<_>>();
+            let parent_refs = parents.iter().collect::<Vec<_>>();
+            let config = super::tags::config_fingerprint(&repo)?;
+            let id = super::commit_policy::create_object(
+                &repo,
+                &commit.author(),
+                &author(&repo)?,
+                &message,
+                &tree,
+                &parent_refs,
+            )?;
+            index.read(true)?;
+            ensure!(
+                index.write_tree()? == context.index_tree
+                    && super::tags::config_fingerprint(&repo)? == config,
+                "Index or configuration changed during signing; reopen Amend"
+            );
+            Ok(Some(id))
         })?;
-        Ok("Amended latest commit; unstaged changes preserved".into())
+        let mut outcome = "Amended latest commit; unstaged changes preserved".to_owned();
+        if let Err(error) = super::commit_policy::post_commit(&repo) {
+            outcome.push_str(&format!(
+                "; post-commit hook failed after commit: {error:#}"
+            ));
+        }
+        Ok(outcome)
     }
 
     pub(super) fn undo_last(&self, expected: &HeadState) -> Result<String> {

@@ -713,8 +713,8 @@ impl Repository {
             !message.trim().is_empty(),
             "The operation has no commit message."
         );
-        let id = repo.commit(
-            None,
+        let id = super::commit_policy::create_object(
+            &repo,
             original_author.as_ref().unwrap_or(&signature),
             &signature,
             message.trim(),

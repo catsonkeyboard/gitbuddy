@@ -2,6 +2,12 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-27 提交规范
+
+- `commit.template` 显式载入空草稿；普通提交继续拒绝空暂存区，新增需确认的空提交入口，拒绝已暂存内容并保留未暂存文件。常规提交、空提交、Amend 和 squash 执行提交相关 hooks，支持自定义 hooks 目录、编辑说明和暂存内容，失败不移动提交引用；post-commit 失败报告提交已经完成。其他操作专属 hooks 尚未实现。
+- `commit.gpgsign` 控制 OpenPGP / SSH 签名，libgit2 写入提交对象和引用，独立进程负责签名及密码学验证。测试使用临时 SSH 私钥和隔离 OpenPGP 密钥，普通空提交与 Amend 验证通过，系统 Git `verify-commit` 可接受；错误密钥时 HEAD 不移动。提交详情可按需检查签名，明确提示未验证身份信任。真实 agent / pinentry 口令交互、托管平台 Verified 和 Windows / Linux GUI 未验收。
+- 新增模板与空提交回归、`tests/commit_policy.rs` hooks / 签名回归；全量测试及严格 Clippy、格式和差异检查通过。原生 GUI 使用 `target/commit-policy-ui-20261027` 隔离仓库和一次性 SSH 密钥创建签名空提交；应用验签和系统 Git 验签均通过，空提交的树与父提交一致，工作区干净。
+
 ## 2026-10-27 任意提交标签与签名
 
 - 使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。侧栏可输入 revision，提交 Actions 预填所选完整提交 ID；支持轻量、附注和 OpenPGP / SSH 签名标签。预览固定目标，执行时再次核验引用、HEAD、仓库配置及标签名，持引用锁发布；不覆盖同名标签，保留索引和工作区。签名直接启动配置的工具，不通过 Bash 或系统 Git 执行标签写入。

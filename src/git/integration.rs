@@ -446,7 +446,7 @@ impl Repository {
             let tree = repo.find_tree(index.write_tree()?)?;
             let other = repo.find_commit(target)?;
             let message = format!("Merge branch '{name}'");
-            let id = repo.commit(None, &signature, &signature, &message, &tree, &[&head, &other])?;
+            let id = super::commit_policy::create_object(&repo, &signature, &signature, &message, &tree, &[&head, &other])?;
             refs.set_target(&original.reference, id, Some(&signature), "gitbuddy: merge")?;
             refs.commit()?;
             repo.cleanup_state()?;
@@ -463,6 +463,19 @@ impl Repository {
         ensure!(
             state.applied,
             "Squash application was interrupted; preserve edits and Abort squash before retrying"
+        );
+        let hook_state = fs::read(repo.path().join(SQUASH_STATE))?;
+        let hook_message = if state.prepared.is_none() {
+            Some(super::commit_policy::prepare_message(
+                &repo, message, false,
+            )?)
+        } else {
+            None
+        };
+        let message = hook_message.as_deref().unwrap_or(message);
+        ensure!(
+            fs::read(repo.path().join(SQUASH_STATE))? == hook_state,
+            "Squash state changed while running hooks"
         );
         let head = head_state(&repo)?;
         ensure!(
@@ -519,8 +532,8 @@ impl Repository {
             );
             commit.id()
         } else {
-            let id = repo.commit(
-                None,
+            let id = super::commit_policy::create_object(
+                &repo,
                 &signature,
                 &signature,
                 message.trim(),
@@ -542,7 +555,16 @@ impl Repository {
         clear_squash(&repo).context(
             "Squash commit created, but state cleanup failed; Continue squash to finish cleanup",
         )?;
-        Ok(format!("Created single-parent squash commit {id}"))
+        drop(_index_lock);
+        let mut result = format!("Created single-parent squash commit {id}");
+        if hook_message.is_some()
+            && let Err(error) = super::commit_policy::post_commit(&repo)
+        {
+            result.push_str(&format!(
+                "; post-commit hook failed after commit: {error:#}"
+            ));
+        }
+        Ok(result)
     }
     pub(super) fn abort_squash(&self) -> Result<String> {
         let repo = raw(self)?;

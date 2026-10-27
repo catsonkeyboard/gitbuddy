@@ -658,8 +658,8 @@ impl Repository {
             "Stage changes for the replacement commit first"
         );
         let picked = repo.find_commit(oid(&state.steps[state.cursor].id)?)?;
-        let id = repo.commit(
-            None,
+        let id = super::commit_policy::create_object(
+            &repo,
             &picked.author(),
             &author(&repo)?,
             message,
@@ -928,8 +928,8 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
         } else {
             picked.author()
         };
-        let id = repo.commit(
-            None,
+        let id = super::commit_policy::create_object(
+            repo,
             &original_author,
             &author(repo)?,
             &message,

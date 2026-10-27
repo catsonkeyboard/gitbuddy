@@ -101,6 +101,10 @@ impl GitBuddy {
                         h_flex()
                             .gap_2()
                             .justify_end()
+                            .child(self.button("commit-template", "Use template")
+                                .ghost()
+                                .disabled(self.busy() || !self.message.read(cx).value().is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| this.load_commit_template(cx))))
                             .child(
                                 self.button("amend-latest", "Amend…")
                                     .ghost()
@@ -112,6 +116,18 @@ impl GitBuddy {
                             .child(self.button("stash-work", "Stash…").disabled(self.snapshot.conflict_operation != git::ConflictOperation::None).on_click(
                                 cx.listener(|this, _, w, cx| this.show_modal(Modal::Stash, w, cx)),
                             ))
+                            .child(self.button("commit-empty", "Empty commit…")
+                                .disabled(self.busy() || self.snapshot.can_commit() || self.snapshot.conflict_operation != git::ConflictOperation::None || self.snapshot.rebase_editing || self.snapshot.squash_pending)
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    let message = this.message.read(cx).value().to_string();
+                                    if message.trim().is_empty() {
+                                        this.active.notice = "Enter a commit message first".into();
+                                        this.active.error = true;
+                                        cx.notify();
+                                        return;
+                                    }
+                                    this.show_modal(Modal::Confirm("Create an empty commit using the current message? Staged changes are not allowed.".into(), Operation::CommitEmpty(message)), w, cx);
+                                })))
                             .child(
                                 self.button(
                                     "commit",

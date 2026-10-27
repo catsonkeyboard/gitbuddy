@@ -855,6 +855,31 @@ impl Repository {
         self.execute_with_progress(operation, None)
     }
 
+    /// Load the configured commit template without changing the draft.
+    pub fn commit_template(&self) -> Result<String> {
+        let repo = raw(self)?;
+        let config = repo.config()?;
+        let path = config
+            .get_path("commit.template")
+            .context("No commit.template is configured")?;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        };
+        let metadata = fs::metadata(&path).context("Cannot read commit template")?;
+        ensure!(
+            metadata.len() <= 1024 * 1024,
+            "Commit template exceeds 1 MiB"
+        );
+        let text = fs::read_to_string(path).context("Commit template is not valid UTF-8")?;
+        ensure!(
+            text.len() <= 1024 * 1024 && !text.contains('\0'),
+            "Invalid commit template"
+        );
+        Ok(text)
+    }
+
     /// [`execute`] with an optional progress sink that receives remote
     /// transfer messages while network operations run.
     pub fn execute_with_progress(
@@ -1089,7 +1114,27 @@ impl Repository {
                         ),
                         "No staged changes to commit; empty commits require an explicit allow-empty action"
                     );
-                    commit_index(&repo, &message, None)
+                    commit_index(&repo, &message, None, Some(false))
+                }
+                Operation::CommitEmpty(message) => {
+                    ensure!(
+                        repo.state() == RepositoryState::Clean,
+                        "Complete the current repository operation first"
+                    );
+                    let index = repo.index()?;
+                    ensure!(!index.has_conflicts(), "Resolve conflicts first");
+                    let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+                    let mut index = index;
+                    let index_tree = index.write_tree()?;
+                    let expected_tree = match head {
+                        Some(head) => head.tree_id(),
+                        None => repo.treebuilder(None)?.write()?,
+                    };
+                    ensure!(
+                        index_tree == expected_tree,
+                        "The index contains staged changes; use the normal commit action"
+                    );
+                    commit_index(&repo, &message, None, Some(true))
                 }
                 Operation::CreateBranch(name) => {
                     validate_branch(&name)?;
@@ -1161,7 +1206,7 @@ impl Repository {
                         "Revert \"{}\"",
                         commit.summary().ok().flatten().unwrap_or_default()
                     );
-                    commit_index(&repo, &message, None)
+                    commit_index(&repo, &message, None, None)
                 }
                 Operation::CherryPick(id) => {
                     ensure!(
@@ -1173,7 +1218,12 @@ impl Repository {
                     if repo.index()?.has_conflicts() {
                         bail!("Cherry-pick has conflicts; resolve or abort");
                     }
-                    commit_index(&repo, commit.message().ok().unwrap_or("Cherry-pick"), None)
+                    commit_index(
+                        &repo,
+                        commit.message().ok().unwrap_or("Cherry-pick"),
+                        None,
+                        None,
+                    )
                 }
                 Operation::ContinueCherryPick | Operation::ContinueRevert => {
                     let state = repo.state();
@@ -1428,8 +1478,39 @@ fn drop_stash(repo: &RawRepo, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Result<String> {
+fn commit_index(
+    repo: &RawRepo,
+    message: &str,
+    other_parent: Option<Oid>,
+    hooks: Option<bool>,
+) -> Result<String> {
     ensure!(!message.trim().is_empty(), "请填写提交说明");
+    let before_hooks = super::recovery::head_state(repo)?;
+    let state_before_hooks = repo.state();
+    let config_before_hooks = super::tags::config_fingerprint(repo)?;
+    let prepared = if hooks.is_some() {
+        Some(super::commit_policy::prepare_message(repo, message, false)?)
+    } else {
+        None
+    };
+    let message = prepared.as_deref().unwrap_or(message);
+    ensure!(
+        super::recovery::head_state(repo)? == before_hooks && repo.state() == state_before_hooks,
+        "A hook changed HEAD or repository operation state; review before retrying"
+    );
+    ensure!(
+        super::tags::config_fingerprint(repo)? == config_before_hooks,
+        "Repository configuration changed while preparing the commit; review before retrying"
+    );
+    if hooks == Some(false) {
+        ensure!(
+            Snapshot::commit_allowed(
+                &file_changes(repo)?,
+                super::conflicts::operation(repo.state())
+            ),
+            "No staged changes remain after hooks"
+        );
+    }
     ensure!(
         matches!(
             repo.state(),
@@ -1441,8 +1522,20 @@ fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Res
         "Cannot create a commit in this repository operation; continue it with its owning sequencer"
     );
     let mut index = repo.index()?;
+    let index_lock = super::conflicts::IndexLock::acquire(index.path().context("Missing index")?)?;
+    index.read(true)?;
     ensure!(!index.has_conflicts(), "请先解决冲突");
     let tree_id = index.write_tree()?;
+    if hooks == Some(true) {
+        let expected_tree = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+            Some(head) => head.tree_id(),
+            None => repo.treebuilder(None)?.write()?,
+        };
+        ensure!(
+            tree_id == expected_tree,
+            "A hook staged changes; use the normal commit action"
+        );
+    }
     let tree = repo.find_tree(tree_id)?;
     let signature = author(repo)?;
     let head = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
@@ -1469,14 +1562,73 @@ fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Res
     let original_author = picked
         .as_ref()
         .map_or_else(|| signature.clone(), |c| c.author().to_owned());
-    let id = repo.commit(
-        Some("HEAD"),
+    let expected = super::recovery::head_state(repo)?;
+    ensure!(
+        expected.id == head.as_ref().map(|c| c.id().to_string()),
+        "HEAD changed while reading the commit parent"
+    );
+    let expected_state = repo.state();
+    let mut head_lock = repo.transaction()?;
+    head_lock.lock_ref("HEAD")?;
+    let mut branch_lock = if expected.reference != "HEAD" {
+        let mut lock = repo.transaction()?;
+        lock.lock_ref(&expected.reference)?;
+        Some(lock)
+    } else {
+        None
+    };
+    ensure!(
+        super::recovery::head_state(repo)? == expected,
+        "HEAD changed while preparing the commit"
+    );
+    let id = super::commit_policy::create_object(
+        repo,
         &original_author,
         &signature,
         message,
         &tree,
         &parents,
     )?;
+    index.read(true)?;
+    ensure!(
+        !index.has_conflicts() && index.write_tree()? == tree_id,
+        "Index changed during commit; retry after review"
+    );
+    ensure!(
+        super::recovery::head_state(repo)? == expected && repo.state() == expected_state,
+        "Repository state changed during commit; retry after review"
+    );
+    ensure!(
+        super::tags::config_fingerprint(repo)? == config_before_hooks,
+        "Repository configuration changed during commit; review before retrying"
+    );
+    if expected_state == RepositoryState::Merge {
+        ensure!(
+            fs::read_to_string(repo.path().join("MERGE_HEAD"))?.trim()
+                == merge_parent.context("Missing merge parent")?.to_string(),
+            "Merge target changed during commit"
+        );
+    }
+    if let Some(picked) = &picked {
+        ensure!(
+            fs::read_to_string(repo.path().join("CHERRY_PICK_HEAD"))?.trim()
+                == picked.id().to_string(),
+            "Cherry-pick target changed during commit"
+        );
+    }
+    let transaction = branch_lock.as_mut().unwrap_or(&mut head_lock);
+    transaction.set_target(
+        &expected.reference,
+        id,
+        Some(&signature),
+        "commit: GitBuddy",
+    )?;
+    if let Some(lock) = branch_lock {
+        lock.commit()?;
+        drop(head_lock);
+    } else {
+        head_lock.commit()?;
+    }
     // Only the operation that owns the state may clear it. This helper
     // completes merges, single cherry-picks and single reverts, never a rebase.
     if matches!(
@@ -1485,7 +1637,16 @@ fn commit_index(repo: &RawRepo, message: &str, other_parent: Option<Oid>) -> Res
     ) {
         repo.cleanup_state()?;
     }
-    Ok(format!("Created commit {id}"))
+    drop(index_lock);
+    let mut outcome = format!("Created commit {id}");
+    if hooks.is_some()
+        && let Err(error) = super::commit_policy::post_commit(repo)
+    {
+        outcome.push_str(&format!(
+            "; post-commit hook failed after commit: {error:#}"
+        ));
+    }
+    Ok(outcome)
 }
 
 fn checkout_branch(repo: &RawRepo, name: &str, kind: BranchType) -> Result<()> {

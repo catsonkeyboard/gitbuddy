@@ -164,7 +164,7 @@ impl TagPlan {
         text
     }
 }
-fn config_fingerprint(repo: &git2::Repository) -> Result<u64> {
+pub(super) fn config_fingerprint(repo: &git2::Repository) -> Result<u64> {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     repo.config()?.snapshot()?.entries(None)?.for_each(|e| {
         e.name_bytes().hash(&mut hash);
@@ -380,7 +380,7 @@ fn key_path(root: &Path, key: &str) -> Result<PathBuf> {
         root.join(path)
     })
 }
-fn sign_and_verify(
+pub(super) fn sign_and_verify(
     root: &Path,
     payload: &[u8],
     signer: &TagSigner,
@@ -393,7 +393,7 @@ fn sign_and_verify(
     let input = dir.path().join("tag.data");
     fs::write(&input, payload)?;
     let signature_path = dir.path().join("tag.sig");
-    control.phase("Tag signing: waiting for signer / agent…");
+    control.phase("Signing: waiting for signer / agent…");
     control.check()?;
     let mut command = Command::new(&signer.program);
     match signer.format {
@@ -433,14 +433,14 @@ fn sign_and_verify(
             && signature.matches(begin).count() == 1
             && signature.matches(end).count() == 1
             && !signature.contains('\0'),
-        "Signer did not return a complete {} signature; no tag was created",
+        "Signer did not return a complete {} signature",
         signer.format.label()
     );
     if !signature.ends_with('\n') {
         signature.push('\n');
     }
     fs::write(&signature_path, &signature)?;
-    control.phase("Tag signing: verifying signature…");
+    control.phase("Signing: verifying signature…");
     control.check()?;
     let mut verify = Command::new(&signer.program);
     match signer.format {
@@ -457,7 +457,7 @@ fn sign_and_verify(
         }
     }
     run_tool(root, &mut verify, &input, dir.path(), control)
-        .context("Signature verification failed; no tag was created")?;
+        .context("Signature verification failed")?;
     Ok(signature)
 }
 struct SignerChild {
@@ -477,7 +477,7 @@ impl Drop for SignerChild {
         let _ = self.child.wait();
     }
 }
-fn run_tool(
+pub(super) fn run_tool(
     root: &Path,
     command: &mut Command,
     input: &Path,
@@ -500,7 +500,7 @@ fn run_tool(
     let mut child = SignerChild {
         child: command
             .spawn()
-            .context("Cannot start signing tool; install it or select an executable path")?,
+            .context("Cannot start external tool; check its executable path")?,
         finished: false,
     };
     let start = Instant::now();
@@ -508,12 +508,12 @@ fn run_tool(
         control.check()?;
         ensure!(
             start.elapsed() < Duration::from_secs(300),
-            "Signing tool timed out after 5 minutes; no tag was created"
+            "External tool timed out after 5 minutes"
         );
         ensure!(
             output.as_file().metadata()?.len() <= OUTPUT_LIMIT
                 && errors.as_file().metadata()?.len() <= OUTPUT_LIMIT,
-            "Signing tool output exceeds 1 MiB; no tag was created"
+            "External tool output exceeds 1 MiB"
         );
         if let Some(status) = child.child.try_wait()? {
             child.finished = true;
@@ -525,12 +525,12 @@ fn run_tool(
     ensure!(
         output.as_file().metadata()?.len() <= OUTPUT_LIMIT
             && errors.as_file().metadata()?.len() <= OUTPUT_LIMIT,
-        "Signing tool output exceeds 1 MiB; no tag was created"
+        "External tool output exceeds 1 MiB"
     );
     if !status.success() {
         let text = fs::read(errors.path())?;
         anyhow::bail!(
-            "Signing tool failed ({status}); no tag was created: {}",
+            "External tool failed ({status}): {}",
             String::from_utf8_lossy(&text)
                 .chars()
                 .take(2048)

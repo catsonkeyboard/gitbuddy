@@ -931,7 +931,10 @@ impl GitBuddy {
         let Some(repo) = self.active.repo.clone() else {
             return;
         };
-        let clear_message = matches!(operation, Operation::Commit(_) | Operation::CommitRebase(_));
+        let clear_message = matches!(
+            operation,
+            Operation::Commit(_) | Operation::CommitEmpty(_) | Operation::CommitRebase(_)
+        );
         let history_edit = matches!(
             operation,
             Operation::CheckoutDetached(_)
@@ -1053,6 +1056,68 @@ impl GitBuddy {
             },
             cx,
         );
+    }
+    fn load_commit_template(&mut self, cx: &mut Context<Self>) {
+        if self.busy() || !self.message.read(cx).value().is_empty() {
+            return;
+        }
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        let tab = self.active.id;
+        let work = cx
+            .background_executor()
+            .spawn(async move { repo.commit_template() });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.active.id != tab || !this.message.read(cx).value().is_empty() {
+                    return;
+                }
+                match result {
+                    Ok(message) => this
+                        .message
+                        .update(cx, |s, cx| s.set_value(message, window, cx)),
+                    Err(error) => {
+                        this.active.notice = format!("{error:#}");
+                        this.active.error = true;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn verify_commit_signature(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        let tab = self.active.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { (id.clone(), repo.verify_commit_signature(&id)) });
+        cx.spawn(async move |this, cx| {
+            let (id, result) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.active.id != tab {
+                    return;
+                }
+                match result {
+                    Ok(message) => {
+                        this.active.notice =
+                            format!("Commit {}: {message}", &id[..id.len().min(8)]);
+                        this.active.error = false;
+                    }
+                    Err(error) => {
+                        this.active.notice =
+                            format!("Commit {}: {error:#}", &id[..id.len().min(8)]);
+                        this.active.error = true;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn button(&self, id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
         Button::new(id)

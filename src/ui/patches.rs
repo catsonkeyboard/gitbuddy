@@ -558,6 +558,14 @@ impl GitBuddy {
                     .text_color(rgb(MUTED))
                     .child(detail.author.clone())
                     .child(detail.date.clone())
+                    .child(
+                        self.button("verify-commit-signature", "Verify signature…")
+                            .ghost()
+                            .on_click(cx.listener({
+                                let id = detail.id.clone();
+                                move |this, _, _, cx| this.verify_commit_signature(id.clone(), cx)
+                            })),
+                    )
                     .child(div().flex_1())
                     .when(!detail.body.is_empty(), |row| {
                         row.child(
