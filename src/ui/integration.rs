@@ -15,6 +15,24 @@ impl GitBuddy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.prepare_integration(branch, None, window, cx);
+    }
+    pub(super) fn open_pull_source(
+        &mut self,
+        remote: git::RemoteInfo,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prepare_integration(None, Some((remote, branch)), window, cx);
+    }
+    fn prepare_integration(
+        &mut self,
+        branch: Option<String>,
+        source: Option<(git::RemoteInfo, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.repo.clone().filter(|_| !self.busy()) else {
             return;
         };
@@ -27,6 +45,11 @@ impl GitBuddy {
         self.show_modal(Modal::Integration, window, cx);
         self.focus.focus(window, cx);
         let task = cx.background_executor().spawn(async move {
+            if let Some((remote, branch)) = source {
+                return repo
+                    .prepare_pull_from(&remote, &branch)
+                    .map(|p| Data::Pull(Arc::new(p)));
+            }
             match branch {
                 Some(branch) => repo
                     .prepare_merge(&branch)

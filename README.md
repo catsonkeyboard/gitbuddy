@@ -59,6 +59,14 @@ GITBUDDY_CONFIG_DIR="$PWD/target/demo-branches/config" cargo run --locked
 cargo run --locked --example demo_merge_pull
 GITBUDDY_CONFIG_DIR="$PWD/target/demo-merge-pull/config" cargo run --locked
 
+# 创建两个远程、独立来源分支和同名本地 / 远端标签的演示仓库
+cargo run --locked --example demo_remote_operations
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-remote-operations/config" cargo run --locked
+
+# 创建含历史提交的标签演示仓库；可附加 --ssh-test-key 生成仅供演示的临时密钥
+cargo run --locked --example demo_tags
+GITBUDDY_CONFIG_DIR="$PWD/target/demo-tags/config" cargo run --locked
+
 # macOS 打包；添加 --debug 可快速打包开发版本
 python3 scripts/bundle_macos.py --debug
 open dist/GitBuddy.app
@@ -83,9 +91,9 @@ open dist/GitBuddy.app
 | Git LFS | Track / Untrack、原生 SHA-256 缓存及指针暂存、本地对象展开、remote Fetch / Push、普通 Push 前上传、锁列表 / 创建 / 解锁 / 强制解锁、缓存校验 / 隔离清理 / 恢复 / 确认后永久删除 |
 | 分支 | 创建并切换、本地切换、重命名并保留自身配置 / Reflog、带远端 ID 校验的远程分支删除、检出提交 / 标签进入 detached HEAD、远程跟踪分支、合并、中止合并、安全删除已合并分支 |
 | Merge / Pull | 默认快进或合并、no-ff、squash 暂存后提交；Pull 的仅快进 / merge / rebase 策略、冲突继续 / 中止及持久化恢复 |
-| 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、Pull 策略选择、快捷 push、传输进度及取消、领先 / 落后计数 |
+| 远程 | 添加 / 编辑 URL / 重命名 / 删除 remote、设置 / 清除 upstream、独立选择 Fetch / Pull 的 remote 和分支、远端标签查询 / 带对象 ID 校验的删除、选择推送远程 / 本地源分支 / 目标分支、force-with-lease、fetch/prune、Pull 策略选择、快捷 push、传输进度及取消、领先 / 落后计数 |
 | Stash | 按选定文件保存、工作区 / 索引 / 未跟踪文件分组预览、Apply / Pop、恢复索引、从 Stash 建分支、确认后删除 |
-| 标签 | 创建 HEAD 标签、删除本地标签、推送选定标签 / 全部标签（支持已有轻量与附注标签） |
+| 标签 | 在任意提交创建轻量、附注或 OpenPGP / SSH 签名标签，删除本地标签、推送选定标签 / 全部标签 |
 | 大仓库 | 提交、侧栏与文件列表虚拟化，按文件展开 Diff；缓存图与过滤索引，历史加载上限、按条数及估算字节的 LRU 缓存 |
 | 任务日志 | 按仓库 / 全部查看操作、进度、成功 / 失败 / 取消结果，重启保留、复制 JSON、清理已完成记录 |
 | 配置 | 性能上限、20 项快捷键及组合键、热更新、冲突校验；仓库级作者姓名 / 邮箱，SSH agent 或凭据助手认证 |
@@ -112,13 +120,29 @@ open dist/GitBuddy.app
 
 ## 操作约定
 
+### 创建标签
+
+侧栏 **TAGS → +** 默认以 HEAD 为目标，也可输入提交 ID、分支、标签或 `HEAD~2` 等 revision；提交的 **Actions… → Create tag at this commit…** 直接填入所选提交。选择 **Lightweight** 创建指向提交的引用；**Annotated** 保存多行说明和标签作者；**Signed** 创建带签名的附注标签。附注和签名标签需要配置仓库作者姓名、邮箱。预览会固定目标提交并显示作者、说明及签名配置；执行前复核目标、HEAD 和配置，同名标签不会被覆盖。工作区和暂存区的已有修改保留。
+
+签名默认读取有效 Git 配置中的 `tag.gpgsign`、`gpg.format`、`user.signingkey` 和对应的 `gpg.openpgp.program` / `gpg.program` 或 `gpg.ssh.program`，也可在表单中选择 OpenPGP / SSH、指定密钥和签名程序。程序填写可执行文件路径，不附加命令参数；SSH 密钥可使用文件路径或 `key::` 公钥，`~` 和相对路径可用。需要先安装并配置 `gpg` 或 `ssh-keygen`，由相应 agent / pinentry 解锁；应用不收集私钥或口令。当前不支持 X.509 格式，配置为不支持的格式时需明确选择可用格式。
+
+标签对象及引用由 libgit2 写入，签名工具直接启动而不经过 Bash。签名后会验证签名，再发布引用；SSH 验证检查密码学有效性，不建立身份信任，Git 验证 SSH 标签还需要配置 allowed signers。失败、取消或目标过期不会创建标签引用，也不会静默降级为未签名标签；可能留下无引用对象，后续可由 Git 垃圾回收清理。签名任务可取消，最多等待五分钟；说明和工具输出各限 1 MiB。标签表单和确认计划是临时状态，重启不会自动重放。
+
 ### Merge / Pull 策略
+
+工具栏 **Fetch / Pull** 和对应快捷键先打开 **Remote operations**。Fetch 可选 **Fetch all remotes**、指定 remote 的 **Fetch remote**，或 **Query branches → Fetch branch**。指定 remote 沿用其配置的 Fetch refspec 和 prune；指定分支使用唯一匹配的 `refs/remotes/…` 目标，只更新该分支，不 prune 其他分支、不自动取标签。没有 Fetch 映射的分支仍可取对象到 FETCH_HEAD，不创建 tracking ref；多重映射或会写入本地分支 / 标签的显式分支映射会拒绝。普通 Fetch 不修改 HEAD、索引或工作文件。
+
+Pull 可通过 **Use configured upstream…** 保留原流程，也可选择任意配置的 remote，**Query branches → Pull branch…** 后选择仅快进 / merge / rebase。这是本次操作的临时来源，不保存或改写当前分支 upstream；没有 upstream 的本地分支也可以显式 Pull。执行时取本次 Fetch 实际广告并下载的提交，避免使用旧 tracking ref；分支已删除、配置 / HEAD / 工作区变化时拒绝整合。两个 remote 的同名分支、含 `/` 的 remote 名称和自定义 Fetch 映射分别处理。
+
+**Repository → Remote tags…**，或 Remote operations 顶部 **Remote tags…**，选择 remote 后 **Query tags** 查询服务器实际引用，不下载对象或创建本地标签；列表标出 annotated 标签并显示标签对象 ID，保留 peeled 提交信息。**Delete remote tag…** 确认 endpoint 和完整标签对象 ID；执行时按这个对象 ID 校验，标签已移动 / 已删除则拒绝，需重新查询。支持轻量、附注及指向 blob 的标签，删除保留所有本地标签。Fetch / Push URL 不同的 remote 暂不允许从该查询结果删除，避免对另一台服务器误操作；服务器权限与保护规则仍然生效。查询和删除分别作为可取消仓库任务记录；发出最终远端删除后等待结果，不声称回滚服务端写入。列表使用虚拟滚动，远端广告超过 100,000 refs 时明确拒绝；查询结果仅保留于当前运行会话。
+
+当前远端引用列表只支持 UTF-8 名称；遇到其他编码时明确报错。git2 0.21 的 RemoteHead 名称接口内部会对 UTF-8 解码 unwrap，读取时捕获其异常并转为任务错误，避免查询任务丢失；没有伪造替换名称或对部分列表执行删除。
 
 侧栏本地 / 远程分支的 **Merge…** 打开选项页，展示固定的源提交和当前目标分支。默认 **Fast-forward or merge** 可以快进时直接移动分支，否则创建双父提交；**No fast-forward** 即使可以快进也创建双父提交，已完全合并的来源仍返回 Already up to date。**Squash** 合并到索引和工作区但不移动 HEAD，不自动提交；检查暂存内容后填写说明提交，或点击 **Use squash message** 使用建议说明。最终提交只有当前 HEAD 一个父提交，不记录来源分支为父提交。没有净改动时直接结束。
 
 Squash 冲突沿用逐文件 / 逐块解决界面；可通过普通 Commit 提交自定义说明，也可 **Continue Squash merge…** 使用建议说明。待完成状态保存在当前工作树 Git 管理目录的 `gitbuddy-squash.json` / `SQUASH_MSG`，重启后可继续。**Abort squash…** 恢复开始前的索引和 tracked 文件，丢弃期间的 tracked 编辑，保留未跟踪文件；执行前有修改时拒绝开始。若应用过程被中断、尚未确认索引完整，禁用提交，先保存需要的编辑再 Abort / 重试。已准备提交的日志在引用发布前 / 后可恢复，避免重复提交；状态损坏时保留现场并报错。
 
-工具栏 **Pull** 和对应快捷键打开策略选择页，每次默认 **Fast-forward only**；分叉时拒绝移动本地分支。**Merge** 可快进则快进，否则创建双父合并提交；**Rebase** 把本地线性提交重放到本次 Fetch 的 upstream 上，保留作者并改变本地提交 ID。仅有远程更新时直接快进；upstream 已包含在本地历史中时不改写。Pull 使用当前分支配置的 upstream 和唯一 Fetch 映射，只 Fetch 对应 remote；本地 upstream（remote 为 `.`）不联网。仓库、HEAD、工作区及 upstream 配置变化时要求重新审查。
+Pull 选择来源后打开策略页，每次默认 **Fast-forward only**；分叉时拒绝移动本地分支。**Merge** 可快进则快进，否则创建双父合并提交；**Rebase** 把本地线性提交重放到本次 Fetch 的来源上，保留作者并改变本地提交 ID。仅有远程更新时直接快进；来源已包含在本地历史中时不改写。使用配置的 upstream 时只 Fetch 对应 remote；本地 upstream（remote 为 `.`）不联网。仓库、HEAD、工作区及所选远程配置变化时要求重新审查。
 
 Merge 冲突通过现有 Continue / Abort 操作处理。Pull rebase 复用持久化 GitBuddy Rebase，冲突或重启后到 **Rebase progress…** 继续 / 中止；保留原历史备份。它要求共同祖先、线性本地范围且最多 2,000 条，不支持保留合并提交，含合并提交时改用 Pull merge。Pull Fetch 阶段可取消；开始本地合并 / 引用更新 / 重放后等待结果，此时取消不再生效。Fetch 已取得的对象及 tracking 更新不会回滚。Merge 和 Pull 都要求无未提交修改，复用 LFS 原生指针处理与本地展开，不自动下载 LFS 正文。后端旧 `Operation::Pull` 仍默认仅快进，`Operation::Merge` 仍使用默认合并策略；新界面通过带预览的策略操作执行。
 
@@ -256,7 +280,7 @@ Fetch、Pull、Push、Clone 在状态栏提供 **Cancel**。点击后显示 **Ca
 
 ### 通用约定
 
-- 普通仓库操作由 Rust `git2` 在后台调用 `libgit2` 完成；LFS 远程传输与锁管理直接启动官方 `git-lfs`（它自身依赖 Git），不经过 Bash。单文件操作按字面路径匹配，支持空格、换行、通配字符及 Unix 非 UTF-8 文件名；LFS 路径与规则的限制见上文。
+- 普通仓库操作由 Rust `git2` 在后台调用 `libgit2` 完成；标签签名直接启动 `gpg` / `ssh-keygen`，LFS 远程传输与锁管理直接启动官方 `git-lfs`（它自身依赖 Git），不经过 Bash。单文件操作按字面路径匹配，支持空格、换行、通配字符及 Unix 非 UTF-8 文件名；LFS 路径与规则的限制见上文。
 - 丢弃操作只恢复工作区到暂存区版本，不清除已暂存内容；不提供批量删除未跟踪文件的快捷操作。
 - 删除 stash、丢弃修改、合并、revert 等操作需要在应用内确认。Stash 应用及删除按对象 ID 定位，在引用锁内读取当前位置；外部新增 Stash 不会改变已选目标，目标已消失或不唯一时拒绝操作。分支合并菜单使用完整本地 / 远程引用，同名简写有歧义时拒绝合并。删除分支前检查分支是否已合入当前 HEAD，推送不使用 force。
 - 远程操作通过 `libgit2` 使用 SSH agent / Git credential helper。现有仓库的 Fetch、Pull、Push 和子模块操作使用有效仓库配置（包含全局、仓库及 include 配置）；URL 级凭据助手、用户名及 `useHttpPath` 由 git2 解析。首次 Clone 使用全局默认配置。GUI 不提供终端密码输入，首次 SSH 信任及凭据准备应先完成；错误可在状态栏复制。
@@ -302,6 +326,7 @@ Rebase 当前只支持本地分支线性历史，不支持根提交重写或保�
 - `src/git/conflict_blocks.rs`、`src/git/merge_tool.rs`：逐块选择、直接参数启动外部工具、临时结果与取消 / 过期保护。
 - `src/git/rebase.rs`：基于 libgit2 的可编辑提交序列、引用事务、持久化进度、冲突继续与中止。
 - `src/git/integration.rs`、`src/ui/integration.rs`：Merge / Pull 策略、upstream 预检、squash 单父提交与持久化恢复、异步选项页。
+- `src/git/remote_refs.rs`、`src/ui/remote_ops.rs`：远端引用广告、临时 Fetch / Pull 来源、标签对象 lease 删除及查询结果按标签归属，虚拟化引用列表。
 - `src/git/lfs_maintenance.rs`：LFS 锁核验、全历史 / Worktree 对象保护、缓存校验与隔离清理。
 - `src/git/workspaces.rs`：Worktree 与子模块管理、跨工作树分支占用检查。
 - `src/git/lfs.rs`：原生指针暂存 / 本地展开、对象校验，以及可取消的官方 git-lfs 传输进程。
@@ -323,6 +348,7 @@ Rebase 当前只支持本地分支线性历史，不支持根提交重写或保�
 - `src/git/branches.rs`、`src/ui/branches.rs`：固定目标的分支重命名 / detached checkout，以及带标签身份校验的后台操作预览；远程分支删除复用带 lease 的推送计划。
 - `tests/remote_management.rs`：远程配置、推送目标、lease 并发保护与标签推送的 libgit2 隔离回归；`examples/demo_remotes.rs` 提供本地演示仓库。
 - `tests/merge_pull_strategies.rs`、`examples/demo_merge_pull.rs`：no-ff / squash、Pull 三种策略、冲突和重启恢复、取消 / 过期保护及 LFS 回归，独立多仓库演示会话。
+- `tests/remote_operations.rs`、`examples/demo_remote_operations.rs`：选择来源、自定义 / 无 Fetch 映射、远端标签对象 / 删除竞争和取消的隔离回归与双远程演示仓库；网络测试只使用本地 Git daemon 服务端。
 - `tests/p1_regressions.rs`、`tests/p2_regressions.rs`：审查问题的隔离仓库回归，P2 含本地 Basic-auth HTTP 服务验证凭据助手、Push 和子模块克隆；HTTP 夹具通过系统 Git 提供协议，客户端仍使用 libgit2。
 - `tests/partial_staging.rs`：部分暂存 / 取消暂存的隔离仓库回归测试，夹具和受测操作均使用 libgit2。
 - `tests/history_recovery.rs`：历史改写、首次 / 合并 / 分离 HEAD 提交、过期选择、冲突与恢复的 libgit2 隔离仓库测试。

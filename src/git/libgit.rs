@@ -1200,6 +1200,20 @@ impl Repository {
                     control.phase("Fetch: updating repository view…");
                     Ok("Remotes fetched".into())
                 }
+                Operation::FetchFrom(plan) => {
+                    let id = self.fetch_selected(&plan, control.clone())?;
+                    control.cancellation.finish()?;
+                    Ok(format!(
+                        "Fetched {}{}",
+                        plan.remote.name,
+                        id.map(|id| format!(
+                            " / {} @ {id}",
+                            plan.branch.as_deref().unwrap_or_default()
+                        ))
+                        .unwrap_or_default()
+                    ))
+                }
+                Operation::DeleteRemoteTag(plan) => self.delete_remote_tag(&plan, control.clone()),
                 Operation::Pull => {
                     let preview = self.prepare_pull()?;
                     self.pull_with(
@@ -1255,11 +1269,17 @@ impl Repository {
                     Ok("Stash deleted".into())
                 }
                 Operation::Tag(name) => {
-                    validate_branch(&name)?;
-                    let head = repo.head()?.peel(git2::ObjectType::Commit)?;
-                    repo.tag_lightweight(&name, &head, false)?;
-                    Ok(format!("Created tag {name}"))
+                    let target = self.prepare_tag_target("HEAD")?;
+                    let plan = self.prepare_tag(
+                        &target,
+                        super::TagSpec {
+                            name,
+                            ..Default::default()
+                        },
+                    )?;
+                    self.create_tag(&plan, control.clone())
                 }
+                Operation::CreateTag(plan) => self.create_tag(&plan, control.clone()),
                 Operation::DeleteTag(name) => {
                     validate_branch(&name)?;
                     repo.tag_delete(&name)?;

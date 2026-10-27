@@ -11,10 +11,12 @@ mod modals;
 mod patches;
 mod preferences;
 mod recovery;
+mod remote_ops;
 mod remotes;
 mod session;
 mod sidebar;
 mod stash;
+mod tags;
 mod task_log;
 mod tasks;
 mod toolbar;
@@ -63,6 +65,7 @@ gpui_kit::actions!(
         OpenSubmodules,
         OpenLfs,
         OpenRemotes,
+        BrowseRemoteTags,
         OpenPushOptions,
         OpenPreferences,
         OpenTaskLog,
@@ -162,6 +165,7 @@ impl PatchLineSelection {
 #[derive(Clone)]
 enum Modal {
     Integration,
+    RemoteOperations,
     RebaseSetup,
     RebasePlan,
     RebaseMessage(usize),
@@ -232,6 +236,7 @@ struct Loaded {
     open_as_tab: bool,
     retry_modal: Option<Modal>,
     management_result: Option<management::Data>,
+    remote_result: Option<remote_ops::Data>,
     cancelled: bool,
 }
 impl Loaded {
@@ -274,6 +279,7 @@ impl Loaded {
             open_as_tab,
             retry_modal: None,
             management_result: None,
+            remote_result: None,
             cancelled: false,
         })
     }
@@ -289,6 +295,7 @@ pub struct RepoTab {
     task_finished: bool,
     history_retry: Option<(Modal, HistoryData, String)>,
     management_result: Option<management::Data>,
+    remote_result: Option<remote_ops::Data>,
     repo: Option<Repository>,
     snapshot: Snapshot,
     selection: Selection,
@@ -333,6 +340,7 @@ impl Default for RepoTab {
             task_finished: false,
             history_retry: None,
             management_result: None,
+            remote_result: None,
             repo: None,
             snapshot: Snapshot::default(),
             selection: Selection::default(),
@@ -383,7 +391,19 @@ pub struct GitBuddy {
     modal_error: Option<String>,
     history_data: HistoryData,
     history_generation: u64,
+    tag_generation: u64,
+    tag_data: tags::Data,
+    tag_kind: git::TagKind,
+    tag_format: git::TagSigningFormat,
+    tag_format_selected: bool,
+    tag_key: Entity<InputState>,
+    tag_program: Entity<InputState>,
+    tag_message: Entity<TextareaState>,
+    tag_restore: bool,
+    tag_preparing: bool,
     branch_generation: u64,
+    remote_ops_generation: u64,
+    remote_ops_data: remote_ops::Data,
     integration_generation: u64,
     integration_data: integration::Data,
     merge_mode: git::MergeMode,
@@ -444,6 +464,9 @@ impl GitBuddy {
         });
         let form_a = cx.new(|cx| InputState::new(window, cx));
         let form_b = cx.new(|cx| InputState::new(window, cx));
+        let tag_key = cx.new(|cx| InputState::new(window, cx));
+        let tag_program = cx.new(|cx| InputState::new(window, cx));
+        let tag_message = cx.new(|cx| TextareaState::new(window, cx).placeholder("Tag annotation"));
         let amend_message =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Commit message"));
         let preference_fields = (0..(5 + gitbuddy::settings::SHORTCUTS.len()))
@@ -536,7 +559,19 @@ impl GitBuddy {
             modal_error: None,
             history_data: HistoryData::default(),
             history_generation: 0,
+            tag_generation: 0,
+            tag_data: tags::Data::Loading,
+            tag_kind: git::TagKind::Lightweight,
+            tag_format: git::TagSigningFormat::OpenPgp,
+            tag_format_selected: true,
+            tag_key,
+            tag_program,
+            tag_message,
+            tag_restore: false,
+            tag_preparing: false,
             branch_generation: 0,
+            remote_ops_generation: 0,
+            remote_ops_data: remote_ops::Data::Loading,
             integration_generation: 0,
             integration_data: integration::Data::Loading,
             merge_mode: git::MergeMode::Auto,
@@ -654,6 +689,7 @@ impl GitBuddy {
             self.history_data = history;
             self.restore_amend_message = Some(message);
         }
+        self.present_remote_result();
         if let Some(data) = self.active.management_result.take() {
             self.management_data = data;
             self.modal = Some(Modal::LfsReport);
@@ -933,7 +969,7 @@ impl GitBuddy {
         self.modal = None;
         self.dispatch_scoped(
             operation.label(),
-            operation.is_network(),
+            operation.is_cancellable(),
             scopes,
             move |control| {
                 let (notice, error, cancelled) = match repo.execute_with_control(operation, control)
@@ -1074,6 +1110,7 @@ impl GitBuddy {
 impl Render for GitBuddy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.restore_scroll_on_next_frame(window, cx);
+        self.restore_tag_form(window, cx);
         if self.branch_focus {
             self.branch_focus = false;
             if matches!(self.modal, Some(Modal::RenameBranch(_))) {
@@ -1177,15 +1214,18 @@ impl Render for GitBuddy {
                 }
             }))
             .on_action(cx.listener(|this, _: &CancelTask, _, cx| this.cancel_task(cx)))
-            .on_action(cx.listener(|this, _: &Fetch, _, cx| {
+            .on_action(cx.listener(|this, _: &Fetch, w, cx| {
                 if this.modal.is_none() {
-                    this.perform(Operation::Fetch, cx);
+                    this.open_remote_operations(remote_ops::Purpose::Fetch, w, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &Pull, window, cx| {
                 if this.modal.is_none() {
-                    this.open_integration(None, window, cx);
+                    this.open_remote_operations(remote_ops::Purpose::Pull, window, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &BrowseRemoteTags, w, cx| {
+                this.open_remote_operations(remote_ops::Purpose::Tags, w, cx);
             }))
             .on_action(cx.listener(|this, _: &Push, _, cx| {
                 if this.modal.is_none() {

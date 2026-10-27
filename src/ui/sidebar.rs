@@ -122,6 +122,10 @@ impl GitBuddy {
                             self.button(SharedString::from(format!("section-add-{label}")), "+")
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, w, cx| {
+                                    if label == "TAGS" {
+                                        this.open_tag_creator("HEAD".into(), w, cx);
+                                        return;
+                                    }
                                     this.show_modal(
                                         match label {
                                             "BRANCHES" => Modal::Branch,

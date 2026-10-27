@@ -71,6 +71,12 @@ impl GitBuddy {
                                 Box::new(OpenPreferences),
                             )
                             .menu_with_icon("Task log…", IconName::FileText, Box::new(OpenTaskLog))
+                            .menu_with_icon_and_disabled(
+                                "Remote tags…",
+                                IconName::FileText,
+                                Box::new(BrowseRemoteTags),
+                                busy || !has_repo,
+                            )
                             .separator()
                             .menu_with_icon_and_disabled(
                                 "Resolve conflicts…",
@@ -218,22 +224,18 @@ impl GitBuddy {
                             self.button("fetch", "Fetch")
                                 .ghost()
                                 .icon(IconName::RotateCw)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.perform(Operation::Fetch, cx)
-                                    }),
-                                ),
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.open_remote_operations(remote_ops::Purpose::Fetch, w, cx)
+                                })),
                         )
                         .child(div().w(px(1.)).h(px(16.)).bg(rgb(BORDER)))
                         .child(
                             self.button("pull", "Pull")
                                 .ghost()
                                 .icon(IconName::ArrowDown)
-                                .on_click(
-                                    cx.listener(|this, _, w, cx| {
-                                        this.open_integration(None, w, cx)
-                                    }),
-                                ),
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.open_remote_operations(remote_ops::Purpose::Pull, w, cx)
+                                })),
                         )
                         .child(
                             self.button("push", "Push")

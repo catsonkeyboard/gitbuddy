@@ -219,6 +219,8 @@ pub enum Operation {
     ContinueRevert,
     SetIdentity(String, String),
     Fetch,
+    FetchFrom(std::sync::Arc<FetchPlan>),
+    DeleteRemoteTag(std::sync::Arc<RemoteTagDelete>),
     Pull,
     PullWith {
         context: std::sync::Arc<PullPreview>,
@@ -241,6 +243,7 @@ pub enum Operation {
         reinstate_index: bool,
     },
     Tag(String),
+    CreateTag(std::sync::Arc<TagPlan>),
     DeleteTag(String),
     AddRemote(String, String),
     EditRemote {
@@ -317,6 +320,12 @@ pub use branches::{BranchRename, DetachedCheckout};
 #[path = "git/integration.rs"]
 mod integration;
 pub use integration::{MergeMode, MergePreview, PullPreview, PullStrategy};
+#[path = "git/remote_refs.rs"]
+mod remote_refs;
+pub use remote_refs::{FetchPlan, RemoteRef, RemoteRefs, RemoteTagDelete};
+#[path = "git/tags.rs"]
+mod tags;
+pub use tags::{TagDefaults, TagKind, TagPlan, TagSigner, TagSigningFormat, TagSpec, TagTarget};
 #[path = "git/inspect.rs"]
 mod inspect;
 pub use inspect::{
@@ -361,10 +370,15 @@ mod lfs_maintenance;
 pub use lfs_maintenance::{LfsLock, LfsLockOwner, LfsLocks, LfsMaintenance};
 
 impl Operation {
+    pub fn is_cancellable(&self) -> bool {
+        self.is_network() || matches!(self,Self::CreateTag(plan) if plan.kind()==TagKind::Signed)
+    }
     pub fn is_network(&self) -> bool {
         matches!(
             self,
             Self::Fetch
+                | Self::FetchFrom(_)
+                | Self::DeleteRemoteTag(_)
                 | Self::Pull
                 | Self::PullWith { .. }
                 | Self::Push
@@ -386,6 +400,13 @@ impl Operation {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Fetch => "Fetch",
+            Self::CreateTag(plan) => match plan.kind() {
+                TagKind::Lightweight => "Create lightweight tag",
+                TagKind::Annotated => "Create annotated tag",
+                TagKind::Signed => "Create signed tag",
+            },
+            Self::FetchFrom(_) => "Fetch selected source",
+            Self::DeleteRemoteTag(_) => "Delete remote tag",
             Self::Pull => "Pull",
             Self::PullWith { .. } => "Pull",
             Self::MergeWith { .. } => "Merge",

@@ -2,6 +2,28 @@
 
 环境：macOS / Apple Silicon，Rust 1.95.0，Git 2.54.0，GPUI Kit 0.6.6。
 
+## 2026-10-27 任意提交标签与签名
+
+- 使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。侧栏可输入 revision，提交 Actions 预填所选完整提交 ID；支持轻量、附注和 OpenPGP / SSH 签名标签。预览固定目标，执行时再次核验引用、HEAD、仓库配置及标签名，持引用锁发布；不覆盖同名标签，保留索引和工作区。签名直接启动配置的工具，不通过 Bash 或系统 Git 执行标签写入。
+- 新增 `tests/tag_management.rs` 15 项集成回归，覆盖旧提交、revision / 标签解析、无 HEAD、作者、非法名称和说明、同名及引用锁、目标 / 配置变化、失败和取消、签名进程输出限制、恶意字符按参数字面传入、索引和工作文件保留。使用隔离临时密钥分别实测 OpenPGP、SSH 私钥文件和隔离 ssh-agent 的 `key::` 公钥签名，生成标签通过系统 Git 验签；测试工具不存在时对应实测用例跳过，本机两种工具均已执行。
+- 全量 `cargo test --locked --no-fail-fast --quiet` **367 项通过（312 集成 + 55 单元）**；严格 Clippy、格式检查和 `git diff --check` 通过。重建 `dist/GitBuddy.app`，保留既有 block 0.1.6 未来兼容性提示。
+- 原生 GPUI 使用 `examples/demo_tags.rs` 生成的隔离仓库与一次性 SSH 测试密钥：从侧栏填写 `HEAD~2` 创建签名和轻量标签，从旧提交的 Actions 创建附注标签。三个标签均指向原始提交，分别核对 tag / commit 对象类型；签名通过 `git verify-tag`，HEAD 保持原值，工作区干净。测试配置、密钥及仓库位于 `target/tags-ui-20261027`。
+- 边界：原生界面验收使用无口令的隔离 SSH 测试密钥；真实口令交互、用户现有 agent / pinentry 配置、托管平台的 Verified 状态及 Windows / Linux GUI 未验收。SSH 创建时校验签名本身，不判断签名者信任；OpenPGP 真实签名由集成测试验证。
+
+## 2026-10-27 Fetch / Pull 来源与远端标签
+
+本节使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。新增运行时 Git 操作均调用 git2 / libgit2，不调用 Bash 或系统 Git；网络测试仅以系统 Git daemon / receive-pack 作本地测试服务器，含一个模拟标签保护的服务端 hook。
+
+- 工具栏 Fetch / Pull 及对应快捷键打开 Remote operations，可选全部远程、单一远程、服务器查询后的指定分支；Pull 保留 Use configured upstream 入口。指定分支使用匿名 Fetch 和完整源 / 目标 refspec，只更新唯一映射的 `refs/remotes/…`，不自动取标签、不 prune 无关分支；没有映射时下载到 FETCH_HEAD，不新建 tracking ref。单一远程 Fetch 沿用其配置与 prune。自定义映射、remote 名称含斜杠和两个 remote 的同名分支分别解析；歧义 / 本地分支目标映射拒绝。Fetch 保留 HEAD / index / 工作文件。
+- 显式 Pull 绑定仓库、HEAD、指纹和所选 remote 信息，不要求 upstream，不修改 upstream 配置；复用仅快进 / Merge / Rebase 和已有冲突恢复。使用本次 Fetch 实际广告并下载的提交 ID，分支已删除时不回退到旧 tracking 内容；Fetch 后及本地应用前复核 HEAD / 工作区 / remote 配置。已取到的对象和 tracking 更新不回滚，不宣称多个引用原子更新。
+- 远端引用查询使用带仓库凭据配置的 Fetch 连接，读取服务器广告，不下载对象或改写本地引用。区分标签对象 ID 与 peeled ID，支持轻量 / 附注 / blob 标签。引用列表虚拟化，少量行按数量收缩并占满宽度；广告超过 100,000 refs 时拒绝。git2 0.21 的 RemoteHead::name 内部 UTF-8 unwrap 由边界捕获为明确错误；packed-refs 非 UTF-8 名称回归确认查询返回错误而非丢失任务，不用替换名称执行删除。
+- 远端标签删除要求 Fetch / Push URL 相同，确认 endpoint、完整 tag ref 和查询到的标签对象 ID；保留全部本地标签，含与服务器不同对象的同名标签。本地 bare 目标持标准标签引用锁校验 / 删除；网络匿名 Push 在 negotiation 校验旧对象 ID，并由 receive-pack 验证发送旧 ID 后的竞争。服务器拒绝或未明确确认时报告错误，不默认为成功。开始最终写入前可取消，之后等待服务器结果；不承诺撤回已经完成的远端写入。
+- 查询作为独立可取消任务记入日志，结果保留在发起的 RepoTab，切换 / 重排标签不把报告送到别的仓库；用户另开对话框时不抢占其输入，之后回到该标签或重新打开远程页读取。扩展任务路由单元回归检查报告跟随稳定标签身份。查询结果是临时状态，重启不重放任务或恢复过期服务器清单。
+- 新增 `tests/remote_operations.rs` **22 项**集成回归：广告与 annotated peel / blob / 空 remote、无本地写入、指定 remote / branch 的范围和保留内容、prune、自定义与无映射 Fetch、歧义 / 越界 / 非法输入、跨仓库 / 配置过期 / 取消、三种策略与 upstream 保持、无 upstream、分支删除、Fetch 后 HEAD / 工作区 / 配置变化；标签本地 / 网络 lease、删除 / 移动 / 锁、同名本地标签、不同 endpoint、取消封闭、服务器保护与 negotiation 后竞争，以及非 UTF-8 packed 引用。4 项使用临时回环 Git daemon，Drop 清理所属服务端，不接触真实托管服务。
+- 全量 `cargo test --locked --no-fail-fast --quiet` **352 项通过（297 集成 + 55 单元）**；`cargo clippy --locked --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。`python3 scripts/bundle_macos.py --debug` 重建 `dist/GitBuddy.app`；既有 block 0.1.6 未来兼容性提示保持。
+- 原生 GPUI 使用 `examples/demo_remote_operations.rs` 创建的 `target/remote-operations-ui-20261027`，独立 bundle ID / 配置、client / other-client 两个标签。Query origin 后只 Fetch topic/demo，核对 origin/topic/demo 为 `6184997`，HEAD 和 origin/main 仍为 `35e4bc6`，本地标签未增加。选择 team/backup 的 topic/demo 进行仅快进 Pull，HEAD / backup tracking 为 `cad96e2`，branch.main.remote 仍 origin、merge 仍 refs/heads/main，工作区 clean。菜单 Remote tags 查询到远端 annotated 对象 `c096e9a`，确认后服务器只剩 release/light，同名本地 annotated 对象仍为 `218f010`。更新紧凑布局后重启，从 Repository → Remote tags 重新查询仅一行，任务日志保留此前 Delete remote tag 的 Success。测试应用正常退出。
+- 验证边界：真实 SSH / HTTPS 认证、托管服务保护标签规则、断电、Windows / Linux GUI 和 100,000 refs 压力未新增实测；取消与竞争主要由集成回归验证。本次只对隔离夹具进行写入，未删除真实远端标签、未改写本项目历史，也未创建 commit 或推送。
+
 ## 2026-10-26 Merge / Pull 策略
 
 本节使用 Rust 1.98.1、git2 0.21 / libgit2 1.9.7。新增运行时 Git 操作均调用 git2 / libgit2，不调用 Bash 或系统 Git；命令行 Git 仅用于只读核对隔离夹具。

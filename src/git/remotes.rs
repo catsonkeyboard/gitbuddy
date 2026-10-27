@@ -89,7 +89,7 @@ impl PushPlan {
     }
 }
 
-fn remote_info(repo: &git2::Repository, name: &str) -> Result<RemoteInfo> {
+pub(super) fn remote_info(repo: &git2::Repository, name: &str) -> Result<RemoteInfo> {
     let remote = repo.find_remote(name)?;
     Ok(RemoteInfo {
         name: name.into(),
@@ -144,7 +144,10 @@ pub(super) fn tracking_ref(repo: &git2::Repository, remote: &str, target: &str) 
     Ok(mapped[0].clone())
 }
 
-fn local_destination(root: &std::path::Path, url: &str) -> Result<Option<std::path::PathBuf>> {
+pub(super) fn local_destination(
+    root: &std::path::Path,
+    url: &str,
+) -> Result<Option<std::path::PathBuf>> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = path
             .strip_prefix("localhost/")

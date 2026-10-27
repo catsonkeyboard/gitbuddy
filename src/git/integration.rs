@@ -79,6 +79,7 @@ pub struct PullPreview {
     pub remote: Option<RemoteInfo>,
     merge_ref: String,
     fingerprint: u64,
+    fetch: Option<super::FetchPlan>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct SquashState {
@@ -185,6 +186,28 @@ impl Repository {
             fingerprint: self.fingerprint()?,
         })
     }
+    /// One-off Pull source. Branch upstream configuration is not changed.
+    pub fn prepare_pull_from(&self, remote: &RemoteInfo, branch: &str) -> Result<PullPreview> {
+        let repo = raw(self)?;
+        clean(&repo)?;
+        let head = head_state(&repo)?;
+        ensure!(
+            head.reference != "HEAD" && head.id.is_some(),
+            "Check out a local branch before pulling"
+        );
+        let plan = self.prepare_fetch(remote, Some(branch))?;
+        Ok(PullPreview {
+            head,
+            remote: Some(remote.clone()),
+            upstream: plan
+                .tracking
+                .clone()
+                .unwrap_or_else(|| plan.branch.clone().unwrap()),
+            merge_ref: plan.branch.clone().unwrap(),
+            fingerprint: self.fingerprint()?,
+            fetch: Some(plan),
+        })
+    }
     pub fn prepare_pull(&self) -> Result<PullPreview> {
         let repo = raw(self)?;
         clean(&repo)?;
@@ -200,6 +223,7 @@ impl Repository {
             upstream,
             merge_ref,
             fingerprint: self.fingerprint()?,
+            fetch: None,
         })
     }
     fn pull_configuration(
@@ -264,9 +288,14 @@ impl Repository {
             "Repository changed; reopen Pull and review again"
         );
         self.check_pull_configuration(preview)?;
-        if let Some(remote) = &preview.remote {
+        let fetched = if let Some(plan) = &preview.fetch {
+            self.fetch_selected(plan, control.clone())?
+        } else if let Some(remote) = &preview.remote {
             super::libgit::fetch_one(&repo, &remote.name, control.clone())?;
-        }
+            None
+        } else {
+            None
+        };
         control.phase("Pull: reviewing fetched upstream…");
         control.check()?;
         clean(&repo)?;
@@ -275,10 +304,13 @@ impl Repository {
             "HEAD changed during Fetch; upstream was fetched but no local integration was performed"
         );
         self.check_pull_configuration(preview)?;
-        let target = repo
-            .find_reference(&preview.upstream)?
-            .peel_to_commit()?
-            .id();
+        let target = if let Some(id) = fetched {
+            oid(&id)?
+        } else {
+            repo.find_reference(&preview.upstream)?
+                .peel_to_commit()?
+                .id()
+        };
         let annotated = repo.find_annotated_commit(target)?;
         let (analysis, _) = repo.merge_analysis(&[&annotated])?;
         let rebase = if strategy == PullStrategy::Rebase
@@ -316,6 +348,10 @@ impl Repository {
     fn check_pull_configuration(&self, expected: &PullPreview) -> Result<()> {
         let repo = raw(self)?;
         let head = head_state(&repo)?;
+        if let Some(plan) = &expected.fetch {
+            ensure!(head == expected.head, "HEAD changed; review Pull again");
+            return self.check_fetch(plan);
+        }
         let (remote, upstream, merge_ref) = self.pull_configuration(&repo, &head)?;
         ensure!(
             head == expected.head

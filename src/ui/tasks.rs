@@ -537,17 +537,22 @@ impl GitBuddy {
                         let clear_message = loaded.clear_message;
                         let retry = loaded.retry_modal.take();
                         let management = loaded.management_result.take();
+                        let remote_result = loaded.remote_result.take();
                         if let Some(tab) = this.tab_mut(ticket.tab) {
                             tab.apply_loaded(loaded, &requested_selection);
                             tab.history_retry =
                                 retry.map(|modal| (modal, retry_history, retry_message));
                             tab.management_result = management;
+                            if remote_result.is_some() {
+                                tab.remote_result = remote_result;
+                            }
                         }
                         let preferences = this.settings.preferences.clone();
                         if let Some(tab) = this.tab_mut(ticket.tab) {
                             tab.apply_cache_limits(&preferences);
                         }
                         if active {
+                            this.present_remote_result();
                             if this.modal.is_none()
                                 && let Some(data) = this.active.management_result.take()
                             {
@@ -760,6 +765,7 @@ fn canonical_target(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{RepositoryTasks, TabId, scopes_overlap, tab_mut_by_id};
+    use crate::ui::remote_ops;
     use crate::ui::{Loaded, PatchKey, PatchLineSelection, PatchState, RepoTab, Selection};
     use gitbuddy::git::{Repository, Snapshot};
     use std::path::PathBuf;
@@ -880,10 +886,17 @@ mod tests {
         tabs.remove(0);
         tabs.reverse();
         tab_mut_by_id(&mut active, &mut tabs, a_id).unwrap().notice = "A cancelled".into();
+        tab_mut_by_id(&mut active, &mut tabs, a_id)
+            .unwrap()
+            .remote_result = Some(remote_ops::Data::Error("A remote query result".into()));
         assert_eq!(active.notice, "B task");
         assert_eq!(active.message, "B draft");
+        assert!(active.remote_result.is_none());
         let a = tabs[1].take().unwrap();
         tabs[0] = Some(std::mem::replace(&mut active, a));
+        assert!(
+            matches!(&active.remote_result, Some(remote_ops::Data::Error(text)) if text == "A remote query result")
+        );
         assert_eq!(
             tab_mut_by_id(&mut active, &mut tabs, a_id).unwrap().notice,
             "A cancelled"
@@ -919,6 +932,7 @@ mod tests {
             open_as_tab: false,
             retry_modal: None,
             management_result: None,
+            remote_result: None,
             cancelled: false,
         };
         tab.apply_loaded(loaded, &Selection::Work);
@@ -961,6 +975,7 @@ mod tests {
             open_as_tab: false,
             retry_modal: None,
             management_result: None,
+            remote_result: None,
             cancelled: false,
         };
         tab.apply_loaded(loaded, &Selection::Work);

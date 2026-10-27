@@ -63,7 +63,7 @@ impl GitBuddy {
             Modal::BranchAt(target) => {
                 self.perform(Operation::CreateBranchAt { name: a, target }, cx)
             }
-            Modal::Tag => self.perform(Operation::Tag(a), cx),
+            Modal::Tag => self.review_tag(cx),
             Modal::Remote => self.perform(Operation::AddRemote(a, b), cx),
             Modal::EditRemote(expected) => self.perform(
                 Operation::EditRemote {
@@ -97,6 +97,12 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::Tag) {
+            return self.tag_creator_modal(cx);
+        }
+        if matches!(modal, Modal::RemoteOperations) {
+            return self.remote_operations_modal(cx);
+        }
         if matches!(modal, Modal::Integration) {
             return self.integration_modal(cx);
         }
@@ -187,6 +193,7 @@ impl GitBuddy {
             | Modal::Preferences
             | Modal::TaskLog
             | Modal::Integration
+            | Modal::RemoteOperations
             | Modal::RebaseMessage(_) => unreachable!(),
             Modal::Open => ("Open repository", "Local repository path", None, "Open"),
             Modal::Init => (
@@ -227,7 +234,7 @@ impl GitBuddy {
                 "Create branch",
             ),
             Modal::ResetHistory(_) | Modal::CommitSelection => unreachable!(),
-            Modal::Tag => ("Create tag", "Tag name (at HEAD)", None, "Create tag"),
+            Modal::Tag => unreachable!(),
             Modal::Remote => (
                 "Add remote",
                 "Remote name, e.g. origin",
@@ -437,6 +444,13 @@ impl GitBuddy {
                 }
             }
             Modal::CommitActions(id) => {
+                let tag_target = id.clone();
+                card = card.child(
+                    self.button("tag-at-commit", "Create tag at this commit…")
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.open_tag_creator(tag_target.clone(), w, cx)
+                        })),
+                );
                 let detached = id.clone();
                 card = card.child(
                     self.button(
