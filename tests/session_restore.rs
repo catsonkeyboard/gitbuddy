@@ -28,6 +28,7 @@ fn state() -> Session {
                 expanded: vec![PatchKey::Commit("abc123".into(), "src/main.rs".into())],
                 show_commit_body: true,
                 diff_preferences: gitbuddy::git::DiffPreferences {
+                    ignore_whitespace: true,
                     side_by_side: true,
                     word_highlight: false,
                     full_context: true,

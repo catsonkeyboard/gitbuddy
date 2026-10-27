@@ -147,7 +147,17 @@ pub(super) fn diff_for_context<'a>(
     full: bool,
     paths: &[&Path],
 ) -> Result<Diff<'a>> {
+    diff_for_options(repo, staged, full, paths, false)
+}
+pub(super) fn diff_for_options<'a>(
+    repo: &'a RawRepo,
+    staged: bool,
+    full: bool,
+    paths: &[&Path],
+    ignore_whitespace: bool,
+) -> Result<Diff<'a>> {
     let mut opts = DiffOptions::new();
+    opts.ignore_whitespace(ignore_whitespace);
     opts.context_lines(if full { u32::MAX } else { 3 });
     opts.include_typechange(true)
         .include_untracked(true)
@@ -269,6 +279,7 @@ fn fingerprint_of(
         "unborn".hash(&mut hasher);
     }
     format!("{:?}", repo.state()).hash(&mut hasher);
+    super::patch_batch::recovery_pending(repo).hash(&mut hasher);
     for name in [
         "gitbuddy-rebase.json",
         super::integration::SQUASH_STATE,
@@ -663,6 +674,7 @@ impl Repository {
         let merging = repo.state() == RepositoryState::Merge;
         let squash = super::integration::squash_status(&repo)?;
         Ok(Snapshot {
+            patch_recovery: super::patch_batch::recovery_pending(&repo),
             squash_pending: squash.as_ref().is_some_and(|s| !s.0),
             squash_message: squash.as_ref().map(|s| s.1.clone()),
             rebase_editing: self.rebase_status()?.is_some_and(|s| s.editing),
@@ -692,6 +704,15 @@ impl Repository {
         self.diff_context(file, staged, false)
     }
     pub fn diff_context(&self, file: &FileChange, staged: bool, full: bool) -> Result<String> {
+        self.diff_context_options(file, staged, full, false)
+    }
+    pub fn diff_context_options(
+        &self,
+        file: &FileChange,
+        staged: bool,
+        full: bool,
+        ignore_whitespace: bool,
+    ) -> Result<String> {
         if file.index == '?' && !staged {
             let path = self.root.join(&file.path);
             let meta = fs::symlink_metadata(&path)?;
@@ -742,11 +763,12 @@ impl Repository {
                 )?;
             }
         }
-        let mut diff = diff_for_context(
+        let mut diff = diff_for_options(
             &repo,
             staged,
             full,
             &paths.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+            ignore_whitespace,
         )?;
         diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
         patch_text(&diff, Some(&paths))
@@ -828,6 +850,15 @@ impl Repository {
         file: &CommitFile,
         full: bool,
     ) -> Result<String> {
+        self.commit_file_diff_options(id, file, full, false)
+    }
+    pub fn commit_file_diff_options(
+        &self,
+        id: &str,
+        file: &CommitFile,
+        full: bool,
+        ignore_whitespace: bool,
+    ) -> Result<String> {
         let repo = raw(self)?;
         let commit = repo.find_commit(oid(id)?)?;
         let old = if commit.parent_count() > 0 {
@@ -847,7 +878,14 @@ impl Repository {
         let paths = std::iter::once(file.path.as_path())
             .chain(file.original.as_deref())
             .collect::<Vec<_>>();
-        let diff = super::inspect::tree_diff_context(&repo, old.as_ref(), &new, full, &paths)?;
+        let diff = super::inspect::tree_diff_options(
+            &repo,
+            old.as_ref(),
+            &new,
+            full,
+            &paths,
+            ignore_whitespace,
+        )?;
         super::inspect::single_file_patch(&diff, file)
     }
 
@@ -920,6 +958,11 @@ impl Repository {
                 }
         );
         let initial = raw(self)?;
+        ensure!(
+            matches!(&operation, Operation::RecoverPatch)
+                || !super::patch_batch::recovery_pending(&initial),
+            "A patch application was interrupted; use Repository → Recover patch before modifying this repository"
+        );
         let squash = super::integration::squash_active(&initial);
         let checkout = checkout && !squash;
         // A conflict choice may install a complete LFS pointer. Squash
@@ -1039,6 +1082,11 @@ impl Repository {
                 Operation::ApplyPartial { patch, selection } => {
                     self.apply_partial(&patch, &selection)
                 }
+                Operation::DiscardPartial { patch, selection } => {
+                    self.discard_partial(&patch, &selection)
+                }
+                Operation::ApplyPatch(plan) => self.apply_patch_file(&plan),
+                Operation::RecoverPatch => self.recover_patch(),
                 Operation::ResolveConflict {
                     context,
                     resolution,

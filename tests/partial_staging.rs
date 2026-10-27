@@ -64,6 +64,142 @@ fn changed_rows(patch: &FilePatch) -> Vec<usize> {
 }
 
 #[test]
+fn partial_discard_preserves_index_and_unselected_hunk_and_rejects_stale_diff() {
+    let (_dir, repo) = setup();
+    let base = (1..=30).map(|i| format!("line {i}\n")).collect::<String>();
+    write(&repo, "file.txt", &base);
+    commit(&repo);
+    let staged = base.replace("line 10\n", "staged\n");
+    write(&repo, "file.txt", &staged);
+    repo.execute(Operation::StageAll).unwrap();
+    let edited = staged
+        .replace("line 2\n", "first\n")
+        .replace("line 28\n", "last\n");
+    write(&repo, "file.txt", &edited);
+    let p = patch(&repo, "file.txt", false);
+    let hunks = p
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.kind == '@')
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    assert_eq!(hunks.len(), 2);
+    let op = Operation::DiscardPartial {
+        patch: p.partial.clone().unwrap(),
+        selection: PatchSelection::Hunk(hunks[0]),
+    };
+    repo.execute(op.clone()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.root.join("file.txt")).unwrap(),
+        staged.replace("line 28\n", "last\n")
+    );
+    assert_eq!(index_content(&repo, "file.txt").unwrap(), staged.as_bytes());
+    assert!(repo.execute(op).is_err());
+}
+
+#[test]
+fn partial_discard_selected_lines_rejects_untracked_and_changed_files() {
+    let (_dir, repo) = setup();
+    write(&repo, "file.txt", "a\nb\n");
+    commit(&repo);
+    write(&repo, "file.txt", "A\nB\n");
+    let p = patch(&repo, "file.txt", false);
+    let add = p
+        .lines
+        .iter()
+        .position(|l| l.kind == '+' && l.text == "+A")
+        .unwrap();
+    repo.execute(Operation::DiscardPartial {
+        patch: p.partial.clone().unwrap(),
+        selection: PatchSelection::Lines(vec![add]),
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.root.join("file.txt")).unwrap(),
+        "B\n"
+    );
+    let old = patch(&repo, "file.txt", false);
+    write(&repo, "file.txt", "external change\n");
+    assert!(
+        repo.execute(Operation::DiscardPartial {
+            patch: old.partial.clone().unwrap(),
+            selection: PatchSelection::Lines(changed_rows(&old))
+        })
+        .is_err()
+    );
+    write(&repo, "new.txt", "new\n");
+    let new = patch(&repo, "new.txt", false);
+    assert!(
+        repo.execute(Operation::DiscardPartial {
+            patch: new.partial.clone().unwrap(),
+            selection: PatchSelection::Lines(changed_rows(&new))
+        })
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.root.join("new.txt")).unwrap(),
+        "new\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn partial_discard_preserves_extended_attributes() {
+    let (_dir, repo) = setup();
+    write(&repo, "file.txt", "base\n");
+    commit(&repo);
+    write(&repo, "file.txt", "changed\n");
+    let path = repo.root.join("file.txt");
+    assert!(
+        std::process::Command::new("xattr")
+            .args(["-w", "org.gitbuddy.test", "preserve"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let p = patch(&repo, "file.txt", false);
+    repo.execute(Operation::DiscardPartial {
+        patch: p.partial.clone().unwrap(),
+        selection: PatchSelection::Lines(changed_rows(&p)),
+    })
+    .unwrap();
+    let result = std::process::Command::new("xattr")
+        .args(["-p", "org.gitbuddy.test"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "preserve");
+}
+
+#[test]
+fn whitespace_filtered_diff_hides_whitespace_only_but_keeps_content_changes() {
+    let (_dir, repo) = setup();
+    write(&repo, "file.txt", "one two\nold\n");
+    commit(&repo);
+    write(&repo, "file.txt", "one    two\nnew\n");
+    let snapshot = repo.snapshot(20).unwrap();
+    let file = snapshot
+        .files
+        .iter()
+        .find(|f| f.path == Path::new("file.txt"))
+        .unwrap();
+    let normal = repo
+        .diff_context_options(file, false, false, false)
+        .unwrap();
+    let filtered = repo.diff_context_options(file, false, false, true).unwrap();
+    assert!(normal.contains("-one two") && normal.contains("+one    two"));
+    assert!(!filtered.contains("-one two") && !filtered.contains("+one    two"));
+    assert!(filtered.contains("-old") && filtered.contains("+new"));
+    assert_eq!(
+        std::fs::read_to_string(repo.root.join("file.txt")).unwrap(),
+        "one    two\nnew\n"
+    );
+}
+
+#[test]
 fn hunk_stage_and_unstage_preserve_other_hunks_and_worktree() {
     let (_dir, repo) = setup();
     let base = (1..=30).map(|i| format!("line {i}\n")).collect::<String>();

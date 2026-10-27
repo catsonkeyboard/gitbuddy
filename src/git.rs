@@ -80,12 +80,13 @@ pub struct Snapshot {
     /// The sequencer is paused for user-created replacement commits.
     pub rebase_editing: bool,
     pub squash_pending: bool,
+    pub patch_recovery: bool,
     pub squash_message: Option<String>,
 }
 impl Snapshot {
     /// Shared eligibility for the button, keyboard action and backend entry.
     pub fn can_commit(&self) -> bool {
-        if self.squash_pending {
+        if self.squash_pending || self.patch_recovery {
             return false;
         }
         Self::commit_allowed(
@@ -165,6 +166,12 @@ pub enum Operation {
         patch: std::sync::Arc<PartialPatch>,
         selection: PatchSelection,
     },
+    DiscardPartial {
+        patch: std::sync::Arc<PartialPatch>,
+        selection: PatchSelection,
+    },
+    ApplyPatch(std::sync::Arc<ApplyPatchPlan>),
+    RecoverPatch,
     ResolveConflict {
         context: std::sync::Arc<ConflictContext>,
         resolution: ConflictResolution,
@@ -333,6 +340,13 @@ pub use inspect::{
     BlameLine, BlameView, Comparison, FileHistory, FileHistoryEntry, Revision, TreeFiles,
 };
 mod commit_policy;
+mod external_editor;
+pub use external_editor::ExternalEditor;
+mod patch_file;
+pub use patch_file::ApplyPatchPlan;
+mod image_preview;
+mod patch_batch;
+pub use image_preview::{ImageData, ImageKind, ImagePair};
 #[path = "git/conflict_blocks.rs"]
 mod conflict_blocks;
 #[path = "git/conflicts.rs"]
@@ -401,6 +415,8 @@ impl Operation {
     }
     pub fn label(&self) -> &'static str {
         match self {
+            Self::ApplyPatch(_) => "Apply patch",
+            Self::RecoverPatch => "Recover interrupted patch",
             Self::CommitEmpty(_) => "Create empty commit",
             Self::Fetch => "Fetch",
             Self::CreateTag(plan) => match plan.kind() {

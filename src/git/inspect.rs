@@ -121,7 +121,18 @@ pub(super) fn tree_diff_context<'a>(
     full: bool,
     paths: &[&Path],
 ) -> Result<Diff<'a>> {
+    tree_diff_options(repo, old, new, full, paths, false)
+}
+pub(super) fn tree_diff_options<'a>(
+    repo: &'a git2::Repository,
+    old: Option<&Tree<'a>>,
+    new: &Tree<'a>,
+    full: bool,
+    paths: &[&Path],
+    ignore_whitespace: bool,
+) -> Result<Diff<'a>> {
     let mut options = DiffOptions::new();
+    options.ignore_whitespace(ignore_whitespace);
     options.context_lines(if full { u32::MAX } else { 3 });
     options.include_typechange(true);
     if full {
@@ -248,6 +259,15 @@ impl Repository {
         file: &CommitFile,
         full: bool,
     ) -> Result<String> {
+        self.comparison_file_diff_options(comparison, file, full, false)
+    }
+    pub fn comparison_file_diff_options(
+        &self,
+        comparison: &Comparison,
+        file: &CommitFile,
+        full: bool,
+        ignore_whitespace: bool,
+    ) -> Result<String> {
         let repo = raw(self)?;
         let old = repo.find_commit(oid(&comparison.base.id)?)?.tree()?;
         let new = repo.find_commit(oid(&comparison.target.id)?)?.tree()?;
@@ -263,7 +283,7 @@ impl Repository {
             .chain(file.original.as_deref())
             .collect::<Vec<_>>();
         single_file_patch(
-            &tree_diff_context(&repo, Some(&old), &new, full, &paths)?,
+            &tree_diff_options(&repo, Some(&old), &new, full, &paths, ignore_whitespace)?,
             file,
         )
     }

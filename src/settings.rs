@@ -18,6 +18,8 @@ pub struct Settings {
     #[serde(default)]
     pub merge_tool: crate::git::MergeTool,
     #[serde(default)]
+    pub external_editor: crate::git::ExternalEditor,
+    #[serde(default)]
     pub preferences: Preferences,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +149,14 @@ impl Settings {
         tool.validate()?;
         let mut next = self.clone();
         next.merge_tool = tool;
+        next.save_at(&Self::path())?;
+        *self = next;
+        Ok(())
+    }
+    pub fn set_external_editor(&mut self, tool: crate::git::ExternalEditor) -> anyhow::Result<()> {
+        tool.validate()?;
+        let mut next = self.clone();
+        next.external_editor = tool;
         next.save_at(&Self::path())?;
         *self = next;
         Ok(())

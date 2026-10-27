@@ -254,6 +254,15 @@ impl Repository {
         file: &CommitFile,
         full: bool,
     ) -> Result<String> {
+        self.stash_file_diff_options(section, file, full, false)
+    }
+    pub fn stash_file_diff_options(
+        &self,
+        section: &StashSection,
+        file: &CommitFile,
+        full: bool,
+        ignore_whitespace: bool,
+    ) -> Result<String> {
         let repo = raw(self)?;
         let old = section
             .old
@@ -269,7 +278,14 @@ impl Repository {
             super::diff_view::check_full_tree(&repo, Some(&new), &paths)?;
         }
         super::inspect::single_file_patch(
-            &super::inspect::tree_diff_context(&repo, old.as_ref(), &new, full, &paths)?,
+            &super::inspect::tree_diff_options(
+                &repo,
+                old.as_ref(),
+                &new,
+                full,
+                &paths,
+                ignore_whitespace,
+            )?,
             file,
         )
     }

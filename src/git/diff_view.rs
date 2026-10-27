@@ -8,6 +8,7 @@ pub struct DiffPreferences {
     pub side_by_side: bool,
     pub word_highlight: bool,
     pub full_context: bool,
+    pub ignore_whitespace: bool,
 }
 impl Default for DiffPreferences {
     fn default() -> Self {
@@ -15,6 +16,7 @@ impl Default for DiffPreferences {
             side_by_side: false,
             word_highlight: true,
             full_context: false,
+            ignore_whitespace: false,
         }
     }
 }

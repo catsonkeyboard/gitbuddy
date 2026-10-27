@@ -75,6 +75,13 @@ impl GitBuddy {
         v_flex()
             .flex_1()
             .min_h_0()
+            .when(self.snapshot.patch_recovery, |col| {
+                col.child(h_flex().px_3().py_2().gap_2().bg(rgb(0x51432d))
+                    .child(div().flex_1().text_sm().child("An interrupted patch operation needs recovery before repository writes can continue."))
+                    .child(self.button("recover-patch-banner", "Recover…").on_click(cx.listener(|this, _, w, cx| {
+                        this.show_modal(Modal::Confirm("Restore files from the interrupted patch operation? Files changed since the interruption will not be overwritten.".into(), Operation::RecoverPatch), w, cx)
+                    }))))
+            })
             .child(
                 v_flex()
                     .px_3()

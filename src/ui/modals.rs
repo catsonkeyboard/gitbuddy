@@ -19,6 +19,7 @@ impl GitBuddy {
             }
             Modal::CheckoutRevision => self.prepare_branch_action(branches::Request::Detach(a), cx),
             Modal::MergeTool => self.submit_merge_tool(a, b, cx),
+            Modal::ExternalEditor(path) => self.submit_external_editor(path, a, b, cx),
             Modal::RebaseSetup => self.preview_rebase(a, b, cx),
             Modal::WorktreeCreate => self.perform(
                 Operation::CreateWorktree {
@@ -92,11 +93,18 @@ impl GitBuddy {
                 self.perform(Operation::RecoverBranch { target, name: a }, cx)
             }
             Modal::Compare => self.begin_inspection(inspect::InspectRequest::Compare(a, b), cx),
+            Modal::DiffSearch(key) => {
+                self.modal = None;
+                self.search_diff(&key, &literal_a, false, cx);
+            }
             _ => {}
         }
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::ImageLoading | Modal::ImagePreview(_)) {
+            return self.image_preview_modal(modal, cx);
+        }
         if matches!(modal, Modal::Tag) {
             return self.tag_creator_modal(cx);
         }
@@ -150,6 +158,12 @@ impl GitBuddy {
                     "Arguments as JSON array; separate $BASE / $LOCAL / $REMOTE / $MERGED placeholders. Tool must wait until you finish.",
                 ),
                 "Save & launch",
+            ),
+            Modal::ExternalEditor(_) => (
+                "External editor",
+                "Executable path",
+                Some("Arguments as JSON array with a separate $FILE placeholder"),
+                "Save & open",
             ),
             Modal::RebaseSetup => (
                 "Interactive rebase",
@@ -280,6 +294,13 @@ impl GitBuddy {
             ),
             Modal::History(_) => unreachable!(),
             Modal::FileTools => unreachable!(),
+            Modal::ImageLoading | Modal::ImagePreview(_) => unreachable!(),
+            Modal::DiffSearch(_) => (
+                "Find in diff",
+                "Search text (case insensitive)",
+                None,
+                "Find",
+            ),
             Modal::Compare => (
                 "Compare commits / branches",
                 "Base: branch, tag or commit ID",

@@ -91,6 +91,30 @@ impl GitBuddy {
                                 busy || !has_head,
                             )
                             .menu_with_icon_and_disabled(
+                                "Apply patch…",
+                                IconName::FileText,
+                                Box::new(ApplyPatchFile),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Recover interrupted patch…",
+                                IconName::FileText,
+                                Box::new(RecoverPatchFile),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Export unstaged patch…",
+                                IconName::FileText,
+                                Box::new(ExportWorkPatch),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Export staged patch…",
+                                IconName::FileText,
+                                Box::new(ExportStagedPatch),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
                                 "Compare commits / branches…",
                                 IconName::Copy,
                                 Box::new(CompareRevisions),

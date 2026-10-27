@@ -32,6 +32,131 @@ impl gitbuddy::cache::Weight for PatchState {
 }
 
 impl GitBuddy {
+    pub(super) fn export_repo_patch(&mut self, staged: bool, cx: &mut Context<Self>) {
+        if self.busy() || self.modal.is_some() {
+            return;
+        }
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        let tab = self.active.id;
+        let receiver = cx.prompt_for_new_path(
+            &repo.root,
+            Some(if staged {
+                "staged.patch"
+            } else {
+                "unstaged.patch"
+            }),
+        );
+        cx.spawn(async move |this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(p))) => p,
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.active.id == tab {
+                            this.active.error = true;
+                            this.active.notice = format!("{error:#}");
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+                _ => return,
+            };
+            let work = cx.background_executor().spawn(async move {
+                use std::io::Write;
+                let bytes = repo.export_patch(staged)?;
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("Missing destination directory"))?;
+                let mut file = tempfile::NamedTempFile::new_in(parent)?;
+                file.write_all(&bytes)?;
+                file.as_file().sync_all()?;
+                file.persist_noclobber(&path).map_err(|e| e.error)?;
+                Ok::<_, anyhow::Error>(path)
+            });
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.active.id == tab {
+                    match result {
+                        Ok(path) => {
+                            this.active.notice = format!("Patch exported to {}", path.display());
+                            this.active.error = false;
+                        }
+                        Err(error) => {
+                            this.active.notice = format!("Cannot export patch: {error:#}");
+                            this.active.error = true;
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+    pub(super) fn choose_patch_file(&mut self, cx: &mut Context<Self>) {
+        if self.busy() || self.modal.is_some() {
+            return;
+        }
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        let tab = self.active.id;
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a patch file".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(paths))) => match paths.into_iter().next() {
+                    Some(path) => path,
+                    None => return,
+                },
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.active.id == tab {
+                            this.active.notice = format!("{error:#}");
+                            this.active.error = true;
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+                _ => return,
+            };
+            let work = cx.background_executor().spawn(async move {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)?
+                    .take(2 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                repo.prepare_patch_file(bytes)
+            });
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.active.id != tab || this.busy() || this.modal.is_some() {
+                    return;
+                }
+                match result {
+                    Ok(plan) => {
+                        this.modal = Some(Modal::Confirm(
+                            plan.summary(),
+                            Operation::ApplyPatch(Arc::new(plan)),
+                        ));
+                        this.branch_focus = true;
+                    }
+                    Err(error) => {
+                        this.active.notice = format!("{error:#}");
+                        this.active.error = true;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     pub(super) fn toggle_patch(&mut self, source: PatchSource, cx: &mut Context<Self>) {
         let key = source.key();
         if !self.active.expanded.remove(&key) {
@@ -70,6 +195,7 @@ impl GitBuddy {
         };
         let generation = self.patch_generation;
         let full = self.active.diff_preferences.full_context;
+        let ignore_whitespace = self.active.diff_preferences.ignore_whitespace;
         let previous: HashSet<_> = self
             .active
             .patches
@@ -84,15 +210,20 @@ impl GitBuddy {
         let task = cx.background_executor().spawn(async move {
             let _permit = permit;
             let patch = match source {
+                PatchSource::Work(file, staged) if ignore_whitespace => repo.diff_context_options(&file, staged, full, true).and_then(|raw| {
+                    let mut view = git::FilePatch::read_only_context(&raw, full)?;
+                    view.unavailable = Some("Partial actions require the unfiltered diff. Turn off Ignore whitespace to stage, unstage or discard lines.".into());
+                    Ok(view)
+                }),
                 PatchSource::Work(file, staged) => repo.worktree_patch_context(&file, staged, full),
                 PatchSource::Commit(id, file) => repo
-                    .commit_file_diff_context(&id, &file, full)
+                    .commit_file_diff_options(&id, &file, full, ignore_whitespace)
                     .and_then(|raw| git::FilePatch::read_only_context(&raw, full)),
                 PatchSource::Compare(comparison, file) => repo
-                    .comparison_file_diff_context(&comparison, &file, full)
+                    .comparison_file_diff_options(&comparison, &file, full, ignore_whitespace)
                     .and_then(|raw| git::FilePatch::read_only_context(&raw, full)),
                 PatchSource::Stash(section, file) => repo
-                    .stash_file_diff_context(&section, &file, full)
+                    .stash_file_diff_options(&section, &file, full, ignore_whitespace)
                     .and_then(|raw| git::FilePatch::read_only_context(&raw, full)),
             }?;
             anyhow::Ok(Arc::new(patch))
@@ -156,8 +287,13 @@ impl GitBuddy {
                 let key = key.clone();
                 let scroll = self.active.scroll.list(&key.scroll_id());
                 let action_key = key.clone();
+                let controls_key = key.clone();
+                let export_key = key.clone();
+                let discard_key = key.clone();
                 let clear_key = key.clone();
                 let staged = matches!(key, PatchKey::Work(_, true));
+                let worktree = matches!(key, PatchKey::Work(_, false))
+                    && patch.partial.as_ref().is_some_and(|p| p.can_discard());
                 let selected = selection.rows.len();
                 let list = if split {
                     h_flex()
@@ -205,7 +341,7 @@ impl GitBuddy {
                 };
                 v_flex()
                     .id(id)
-                    .child(self.diff_controls(cx))
+                    .child(self.diff_controls(&controls_key, cx))
                     .when(split, |col| {
                         col.child(
                             h_flex()
@@ -236,6 +372,27 @@ impl GitBuddy {
                                             format!("{selected} changed lines selected")
                                         }),
                                 )
+                                .child(self.button("export-file-patch", "Export patch…").ghost().on_click(cx.listener(move |this, _, _, cx| {
+                                    let Some(PatchState::Ready(patch, _)) = this.active.patches.get(&export_key) else { return; };
+                                    let Some(partial) = patch.partial.as_ref() else { return; };
+                                    let bytes = partial.patch_bytes().to_vec();
+                                    let Some(repo) = this.active.repo.as_ref() else { return; };
+                                    let tab = this.active.id;
+                                    let receiver = cx.prompt_for_new_path(&repo.root, Some("changes.patch"));
+                                    cx.spawn(async move |this, cx| {
+                                        let path = match receiver.await { Ok(Ok(Some(path))) => path, Ok(Err(error)) => { let _ = this.update(cx, |this, cx| { if this.active.id == tab { this.active.notice = format!("{error:#}"); this.active.error = true; cx.notify(); } }); return; }, _ => return };
+                                        let result = cx.background_executor().spawn(async move {
+                                            use std::io::Write;
+                                            let parent = path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing destination directory"))?;
+                                            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+                                            file.write_all(&bytes)?;
+                                            file.as_file().sync_all()?;
+                                            file.persist_noclobber(&path).map_err(|e| e.error)?;
+                                            Ok::<_, std::io::Error>(path)
+                                        }).await;
+                                        let _ = this.update(cx, |this, cx| { if this.active.id == tab { match result { Ok(path) => { this.active.notice = format!("Patch exported to {}", path.display()); this.active.error = false; }, Err(error) => { this.active.notice = format!("Cannot export patch: {error}"); this.active.error = true; } } cx.notify(); } });
+                                    }).detach();
+                                })))
                                 .child(
                                     self.button("clear-line-selection", "Clear")
                                         .ghost()
@@ -275,7 +432,16 @@ impl GitBuddy {
                                             }
                                         },
                                     )),
-                                ),
+                                )
+                                .when(worktree, |row| row.child(self.button("discard-line-selection", "Discard selected…")
+                                    .ghost().disabled(self.busy() || selected == 0)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if let Some(PatchState::Ready(patch, selection)) = this.active.patches.get(&discard_key)
+                                            && let Some(partial) = &patch.partial {
+                                            let operation = Operation::DiscardPartial { patch: partial.clone(), selection: git::PatchSelection::Lines(selection.rows.iter().copied().collect()) };
+                                            this.show_modal(Modal::Confirm("Discard the selected unstaged lines? This changes the working file and cannot be undone. Staged content is preserved.".into(), operation), window, cx);
+                                        }
+                                    })))),
                         )
                     })
                     .when_some(patch.unavailable.clone(), |col, reason| {
@@ -301,7 +467,7 @@ impl GitBuddy {
                     _ => ("Loading diff…".into(), MUTED),
                 };
                 v_flex()
-                    .child(self.diff_controls(cx))
+                    .child(self.diff_controls(key, cx))
                     .child(
                         div()
                             .px_3()
@@ -394,6 +560,7 @@ impl GitBuddy {
             && let Some(partial) = &patch.partial
         {
             let partial = partial.clone();
+            let discard_partial = partial.clone();
             let staged = matches!(key, PatchKey::Work(_, true));
             return h_flex()
                 .h(px(20.))
@@ -417,6 +584,13 @@ impl GitBuddy {
                         );
                     })),
                 )
+                .when(matches!(key, PatchKey::Work(_, false)) && discard_partial.can_discard(), |row| row.child(
+                    self.button(("discard-hunk", i), "Discard hunk…").h(px(18.)).ghost()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.show_modal(Modal::Confirm("Discard this unstaged hunk? This changes the working file and cannot be undone. Staged content is preserved.".into(), Operation::DiscardPartial { patch: discard_partial.clone(), selection: git::PatchSelection::Hunk(i) }), window, cx);
+                        }))
+                ))
                 .child(
                     div()
                         .font_family("Menlo")
@@ -432,7 +606,14 @@ impl GitBuddy {
         } else {
             &[]
         };
-        let row = patch_line(line, selected, highlights, side);
+        let matched = self
+            .active
+            .diff_searches
+            .get(key)
+            .is_some_and(|(query, _)| {
+                !query.is_empty() && line.text.to_lowercase().contains(query)
+            });
+        let row = patch_line(line, selected, matched, highlights, side);
         if patch.partial.is_none() || !matches!(line.kind, '+' | '-') {
             return row.into_any_element();
         }
@@ -467,13 +648,61 @@ impl GitBuddy {
         }))
         .into_any_element()
     }
-    fn diff_controls(&self, cx: &mut Context<Self>) -> Div {
+    fn diff_controls(&self, key: &PatchKey, cx: &mut Context<Self>) -> Div {
         let prefs = self.active.diff_preferences;
+        let find_key = key.clone();
+        let next_key = key.clone();
         h_flex()
             .h(px(28.))
             .px_3()
             .gap_2()
             .bg(rgb(PANEL))
+            .child(
+                self.button(
+                    "diff-whitespace",
+                    if prefs.ignore_whitespace {
+                        "Ignore whitespace: on"
+                    } else {
+                        "Ignore whitespace: off"
+                    },
+                )
+                .ghost()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.busy() {
+                        return;
+                    }
+                    this.active.diff_preferences.ignore_whitespace =
+                        !this.active.diff_preferences.ignore_whitespace;
+                    this.patch_generation += 1;
+                    this.active.patches.clear();
+                    this.active.scroll.invalidate_variables();
+                    this.active.restored_lines.clear();
+                    this.resume_expanded(cx);
+                    cx.notify();
+                })),
+            )
+            .child(
+                self.button("diff-find", "Find…")
+                    .ghost()
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        this.show_modal(Modal::DiffSearch(find_key.clone()), w, cx);
+                    })),
+            )
+            .when(self.active.diff_searches.contains_key(key), |row| {
+                row.child(
+                    self.button("diff-next", "Next match")
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let query = this
+                                .active
+                                .diff_searches
+                                .get(&next_key)
+                                .map(|s| s.0.clone())
+                                .unwrap_or_default();
+                            this.search_diff(&next_key, &query, true, cx);
+                        })),
+                )
+            })
             .child(
                 self.button(
                     "diff-layout",
@@ -531,6 +760,74 @@ impl GitBuddy {
                     cx.notify();
                 })),
             )
+    }
+    pub(super) fn search_diff(
+        &mut self,
+        key: &PatchKey,
+        text: &str,
+        next: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let query = text.to_lowercase();
+        if query.is_empty() {
+            self.active.diff_searches.remove(key);
+            cx.notify();
+            return;
+        }
+        let Some(PatchState::Ready(patch, _)) = self.active.patches.get(key) else {
+            return;
+        };
+        let matches = patch
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.text.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            self.active.notice = "No matches in this diff".into();
+            self.active.error = false;
+            self.active.diff_searches.remove(key);
+            cx.notify();
+            return;
+        }
+        let current = self
+            .active
+            .diff_searches
+            .get(key)
+            .filter(|(old, _)| old == &query)
+            .map(|(_, row)| *row);
+        let target = if next {
+            current
+                .and_then(|row| matches.iter().copied().find(|i| *i > row))
+                .unwrap_or(matches[0])
+        } else {
+            matches[0]
+        };
+        let view_row = if self.active.diff_preferences.side_by_side {
+            patch
+                .display
+                .rows
+                .iter()
+                .position(|row| row.left == Some(target) || row.right == Some(target))
+                .unwrap_or(0)
+        } else {
+            target
+        };
+        self.active
+            .scroll
+            .list(&key.scroll_id())
+            .scroll_to_item(view_row, ScrollStrategy::Nearest);
+        self.active
+            .diff_searches
+            .insert(key.clone(), (query, target));
+        self.active.notice = format!(
+            "Match {} of {}",
+            matches.iter().position(|i| *i == target).unwrap_or(0) + 1,
+            matches.len()
+        );
+        self.active.error = false;
+        cx.notify();
     }
 
     pub(super) fn commit_files_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -803,6 +1100,10 @@ impl GitBuddy {
         let expanded = self.active.expanded.contains(&key);
         let action = file.clone();
         let discard = file.clone();
+        let open_path = file.path.clone();
+        let editor_path = file.path.clone();
+        let image_file = file.clone();
+        let reveal_path = file.path.clone();
         let status = if file.conflict() {
             '!'
         } else if staged {
@@ -818,6 +1119,24 @@ impl GitBuddy {
                         .child(Icon::new(if expanded {IconName::ChevronDown} else {IconName::ChevronRight}).size(px(12.)).text_color(rgb(MUTED)))
                         .child(status_badge(status))
                         .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(file.path.display().to_string()))
+                        .child(self.button((if staged {"open-staged-file"} else {"open-work-file"},index),"Open").ghost().on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_work_file(&open_path, false, cx);
+                        })))
+                        .child(self.button((if staged {"edit-staged-file"} else {"edit-work-file"},index),"Editor…").ghost().on_click(cx.listener(move |this, _, w, cx| {
+                            cx.stop_propagation();
+                            this.show_modal(Modal::ExternalEditor(editor_path.clone()), w, cx);
+                            let tool = this.settings.external_editor.clone();
+                            this.form_a.update(cx, |s, cx| s.set_value(tool.program, w, cx));
+                            this.form_b.update(cx, |s, cx| s.set_value(serde_json::to_string(&tool.args).unwrap_or_default(), w, cx));
+                        })))
+                        .when(file.path.extension().and_then(|s| s.to_str()).is_some_and(|s| ["png","jpg","jpeg"].iter().any(|x| s.eq_ignore_ascii_case(x))), |row| row.child(self.button((if staged {"preview-staged-image"} else {"preview-work-image"},index), "Image…").ghost().on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation(); this.open_image_preview(image_file.clone(), staged, cx);
+                        }))))
+                        .child(self.button((if staged {"reveal-staged-file"} else {"reveal-work-file"},index),"Reveal").ghost().on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_work_file(&reveal_path, true, cx);
+                        })))
                         .when_some(self.snapshot.head_id.clone(), |row, revision| {
                             let path = file.original.clone().unwrap_or_else(|| file.path.clone());
                             let blame = if file.index == 'A' || file.index == '?' { None } else { Some((path.clone(), revision.clone())) };
@@ -834,6 +1153,172 @@ impl GitBuddy {
                                 this.perform(if staged {Operation::Unstage(paths)} else {Operation::Stage(paths)},cx);
                             })))))
                     .when(expanded, |col|col.child(self.patch_body(&key,(if staged {"staged-patch"} else {"work-patch"},index),cx)))
+    }
+    fn open_work_file(&mut self, path: &std::path::Path, reveal: bool, cx: &mut Context<Self>) {
+        let Some(repo) = self.active.repo.as_ref() else {
+            return;
+        };
+        if !path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            self.active.notice = "Invalid repository path".into();
+            self.active.error = true;
+        } else {
+            let absolute = repo.root.join(path);
+            if !absolute.exists() {
+                self.active.notice = format!("Working file does not exist: {}", path.display());
+                self.active.error = true;
+            } else if reveal {
+                cx.reveal_path(&absolute);
+            } else {
+                cx.open_with_system(&absolute);
+            }
+        }
+        cx.notify();
+    }
+    pub(super) fn submit_external_editor(
+        &mut self,
+        path: PathBuf,
+        program: String,
+        args: String,
+        cx: &mut Context<Self>,
+    ) {
+        let result = (|| -> anyhow::Result<()> {
+            let tool = git::ExternalEditor {
+                program,
+                args: serde_json::from_str(&args)?,
+            };
+            tool.validate()?;
+            self.settings.set_external_editor(tool.clone())?;
+            self.active
+                .repo
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Repository is not open"))?
+                .launch_editor(&path, &tool)
+        })();
+        match result {
+            Ok(()) => {
+                self.modal = None;
+                self.active.error = false;
+                self.active.notice = "Editor launched".into();
+            }
+            Err(error) => self.modal_error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+    fn open_image_preview(&mut self, file: FileChange, staged: bool, cx: &mut Context<Self>) {
+        if self.busy() || self.modal.is_some() {
+            return;
+        }
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        self.image_generation += 1;
+        let generation = self.image_generation;
+        let tab = self.active.id;
+        self.modal = Some(Modal::ImageLoading);
+        let work = cx
+            .background_executor()
+            .spawn(async move { repo.preview_work_images(&file, staged) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.active.id != tab
+                    || this.image_generation != generation
+                    || !matches!(this.modal, Some(Modal::ImageLoading))
+                {
+                    return;
+                }
+                match result {
+                    Ok(pair) => {
+                        let convert = |data: git::ImageData| {
+                            let format = match data.kind {
+                                git::ImageKind::Png => ImageFormat::Png,
+                                git::ImageKind::Jpeg => ImageFormat::Jpeg,
+                            };
+                            (
+                                Arc::new(Image::from_bytes(format, data.bytes)),
+                                data.width,
+                                data.height,
+                            )
+                        };
+                        this.modal = Some(Modal::ImagePreview(Arc::new(ImageView {
+                            before: pair.before.map(convert),
+                            after: pair.after.map(convert),
+                        })));
+                    }
+                    Err(error) => {
+                        this.modal = None;
+                        this.active.notice = format!("Image preview: {error:#}");
+                        this.active.error = true;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    pub(super) fn image_preview_modal(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        let content = match modal {
+            Modal::ImageLoading => div().child("Loading image preview…").into_any_element(),
+            Modal::ImagePreview(pair) => h_flex()
+                .gap_3()
+                .children(
+                    [
+                        ("Before", pair.before.clone()),
+                        ("After", pair.after.clone()),
+                    ]
+                    .into_iter()
+                    .map(|(label, data)| {
+                        v_flex()
+                            .w(px(320.))
+                            .gap_2()
+                            .child(div().text_sm().child(match &data {
+                                Some((_, w, h)) => format!("{label} · {w} × {h}"),
+                                None => format!("{label} · missing"),
+                            }))
+                            .when_some(data, |view, (image, _, _)| {
+                                view.child(
+                                    img(image)
+                                        .w(px(320.))
+                                        .h(px(280.))
+                                        .object_fit(ObjectFit::Contain),
+                                )
+                            })
+                    }),
+                )
+                .into_any_element(),
+            _ => unreachable!(),
+        };
+        let card = v_flex()
+            .w(px(700.))
+            .p_4()
+            .gap_3()
+            .bg(rgb(PANEL))
+            .rounded_lg()
+            .child(
+                h_flex().child(div().flex_1().child("Image preview")).child(
+                    self.button("close-image-preview", "×")
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.modal = None;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(content);
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(card)
+            .into_any_element()
     }
     pub(super) fn changes_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let projection = self.active.projection();
@@ -901,6 +1386,7 @@ fn patch_stat(state: Option<&PatchState>) -> impl IntoElement {
 fn patch_line(
     line: &DiffLine,
     selected: bool,
+    matched: bool,
     highlights: &[std::ops::Range<usize>],
     side: Option<bool>,
 ) -> Div {
@@ -909,6 +1395,11 @@ fn patch_line(
         '-' => (0x443137, 0xedb5b7, 0x79454d),
         '@' => (0x2d3b4d, 0x9fbfe9, 0x2d3b4d),
         _ => (EDITOR, TEXT, EDITOR),
+    };
+    let background = if matched && !selected {
+        0x5b512d
+    } else {
+        background
     };
     let text = highlighted_text(&line.text, highlights, emphasis);
     h_flex()

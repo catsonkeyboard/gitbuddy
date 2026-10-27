@@ -58,6 +58,10 @@ gpui_kit::actions!(
         UndoCommit,
         OpenReflog,
         OpenFileTools,
+        ApplyPatchFile,
+        RecoverPatchFile,
+        ExportWorkPatch,
+        ExportStagedPatch,
         CompareRevisions,
         OpenConflicts,
         OpenRebase,
@@ -205,10 +209,19 @@ enum Modal {
     History(HistoryKind),
     RecoveryBranch(git::ReflogTarget),
     FileTools,
+    DiffSearch(PatchKey),
     Compare,
     MergeTool,
+    ExternalEditor(PathBuf),
+    ImageLoading,
+    ImagePreview(Arc<ImageView>),
     Preferences,
     TaskLog,
+}
+#[derive(Clone)]
+struct ImageView {
+    before: Option<(Arc<Image>, u32, u32)>,
+    after: Option<(Arc<Image>, u32, u32)>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistoryKind {
@@ -308,6 +321,7 @@ pub struct RepoTab {
     patch_loading: Arc<std::sync::atomic::AtomicUsize>,
     history_projection: std::cell::RefCell<Option<Arc<history::Projection>>>,
     diff_preferences: git::DiffPreferences,
+    diff_searches: HashMap<PatchKey, (String, usize)>,
     show_commit_body: bool,
     inspection: inspect::InspectState,
     comparison_base: Option<String>,
@@ -353,6 +367,7 @@ impl Default for RepoTab {
             patch_loading: Default::default(),
             history_projection: Default::default(),
             diff_preferences: git::DiffPreferences::default(),
+            diff_searches: HashMap::new(),
             show_commit_body: false,
             inspection: inspect::InspectState::default(),
             comparison_base: None,
@@ -379,6 +394,7 @@ pub struct GitBuddy {
     active: RepoTab,
     active_index: Option<usize>,
     patch_generation: u64,
+    image_generation: u64,
     selection_generation: u64,
     restore_message: Option<String>,
     restore_search: Option<String>,
@@ -547,6 +563,7 @@ impl GitBuddy {
             },
             active_index: None,
             patch_generation: 0,
+            image_generation: 0,
             selection_generation: 0,
             restore_message: None,
             restore_search: None,
@@ -1308,6 +1325,18 @@ impl Render for GitBuddy {
                 this.begin_history(HistoryKind::Reflog, w, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenFileTools, w, cx| this.open_file_tools(w, cx)))
+            .on_action(cx.listener(|this, _: &ApplyPatchFile, _, cx| this.choose_patch_file(cx)))
+            .on_action(cx.listener(|this, _: &ExportWorkPatch, _, cx| this.export_repo_patch(false, cx)))
+            .on_action(cx.listener(|this, _: &ExportStagedPatch, _, cx| this.export_repo_patch(true, cx)))
+            .on_action(cx.listener(|this, _: &RecoverPatchFile, w, cx| {
+                if let Some(repo) = this.active.repo.as_ref() {
+                    match repo.has_patch_recovery() {
+                        Ok(true) => this.show_modal(Modal::Confirm("Restore files from the interrupted patch operation? Files changed since the interruption will not be overwritten.".into(), Operation::RecoverPatch), w, cx),
+                        Ok(false) => { this.active.notice = "No interrupted patch operation".into(); this.active.error = false; cx.notify(); }
+                        Err(error) => { this.active.notice = format!("{error:#}"); this.active.error = true; cx.notify(); }
+                    }
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenConflicts, _, cx| this.open_conflicts(None, cx)))
             .on_action(cx.listener(|this, _: &OpenRebase, w, cx| {
                 this.open_management(Modal::RebaseSetup, w, cx)

@@ -156,8 +156,8 @@ impl Repository {
             .tempdir()?;
         let data = dir.path().join("commit.data");
         let sig = dir.path().join("commit.sig");
-        fs::write(&data, content.as_ref())?;
-        fs::write(&sig, signature.as_ref())?;
+        fs::write(&data, &*content)?;
+        fs::write(&sig, &*signature)?;
         let (mut command, label) = if text.starts_with("-----BEGIN PGP SIGNATURE-----") {
             let mut c = Command::new(defaults.openpgp_program);
             c.args(["--no-tty", "--verify"]).arg(&sig).arg(&data);

@@ -129,6 +129,143 @@ pub struct PartialPatch {
 }
 
 impl Repository {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn discard_partial(
+        &self,
+        _patch: &PartialPatch,
+        _selection: &PatchSelection,
+    ) -> Result<String> {
+        anyhow::bail!("Partial discard is currently supported on macOS and Linux only")
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn discard_partial(
+        &self,
+        patch: &PartialPatch,
+        selection: &PatchSelection,
+    ) -> Result<String> {
+        use std::io::Write;
+        ensure!(
+            !patch.staged && patch.index.is_some(),
+            "Partial discard requires an existing tracked worktree file"
+        );
+        let repo = raw(self)?;
+        ensure!(
+            repo.path() == patch.git_dir,
+            "This diff belongs to another repository"
+        );
+        let mut index = repo.index()?;
+        let _index_lock =
+            super::conflicts::IndexLock::acquire(index.path().context("Missing index")?)?;
+        index.read(true)?;
+        ensure!(
+            entry_version(index.get_path(&patch.file.path, 0)) == patch.index
+                && (1..=3).all(|s| index.get_path(&patch.file.path, s).is_none()),
+            "Index changed; refresh the diff"
+        );
+        ensure!(
+            self.worktree_patch_context(&patch.file, false, patch.full_context)?
+                .partial
+                .as_deref()
+                == Some(patch),
+            "Diff changed; refresh and select again"
+        );
+        let mut path = self.root.clone();
+        for component in patch.file.path.components() {
+            let std::path::Component::Normal(part) = component else {
+                anyhow::bail!("Invalid repository path")
+            };
+            path.push(part);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "Partial discard does not follow symbolic links"
+            );
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= super::diff_view::FULL_DIFF_BYTES as u64,
+            "Partial discard requires a regular file no larger than 16 MiB"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ensure!(
+                metadata.nlink() == 1,
+                "Partial discard is unavailable for hard-linked files"
+            );
+            #[cfg(target_os = "linux")]
+            let attributes = {
+                use std::os::unix::ffi::OsStrExt;
+                let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+                unsafe { libc::llistxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) }
+            };
+            #[cfg(target_os = "linux")]
+            ensure!(
+                attributes == 0,
+                "Partial discard is unavailable when extended attributes cannot be safely preserved"
+            );
+        }
+        let selected = patch.selected_rows(selection)?;
+        let all = patch
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter(|l| matches!(l.kind, '+' | '-'))
+            .map(|l| l.row)
+            .collect::<BTreeSet<_>>();
+        let remaining = all.difference(&selected).copied().collect::<BTreeSet<_>>();
+        let base = repo
+            .find_blob(patch.index.as_ref().unwrap().id)?
+            .content()
+            .to_vec();
+        let expected = patch.selected_content(&base, &all)?;
+        let actual = std::fs::read(&path)?;
+        ensure!(
+            actual == expected,
+            "Working file differs from the displayed diff or uses a content filter; refresh or use whole-file discard"
+        );
+        let content = patch.selected_content(&base, &remaining)?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(path.parent().context("Missing parent directory")?)?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let source = std::fs::File::open(&path)?;
+            let copied = unsafe {
+                libc::fcopyfile(
+                    source.as_raw_fd(),
+                    temporary.as_file().as_raw_fd(),
+                    std::ptr::null_mut(),
+                    libc::COPYFILE_METADATA,
+                )
+            };
+            ensure!(
+                copied == 0,
+                "Could not preserve file metadata: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        temporary.write_all(&content)?;
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?;
+        temporary.as_file().sync_all()?;
+        ensure!(
+            std::fs::read(&path)? == actual
+                && self
+                    .worktree_patch_context(&patch.file, false, patch.full_context)?
+                    .partial
+                    .as_deref()
+                    == Some(patch),
+            "Working file changed; discard cancelled"
+        );
+        temporary.persist(&path).map_err(|e| e.error)?;
+        Ok(format!(
+            "Discarded {} selected changed lines",
+            selected.len()
+        ))
+    }
+
     pub fn worktree_patch(&self, file: &FileChange, staged: bool) -> Result<FilePatch> {
         self.worktree_patch_context(file, staged, false)
     }
@@ -386,6 +523,12 @@ impl Repository {
 }
 
 impl PartialPatch {
+    pub fn patch_bytes(&self) -> &[u8] {
+        &self.diff
+    }
+    pub fn can_discard(&self) -> bool {
+        !self.staged && self.index.is_some() && self.file.worktree != 'D'
+    }
     fn selected_rows(&self, selection: &PatchSelection) -> Result<BTreeSet<usize>> {
         let changes: BTreeSet<_> = self
             .hunks
