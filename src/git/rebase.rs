@@ -3,7 +3,9 @@ use super::libgit::{author, oid, raw};
 use super::recovery::head_state;
 use super::{HeadState, Repository};
 use anyhow::{Context, Result, bail, ensure};
-use git2::{CherrypickOptions, Repository as Raw, RepositoryState, build::CheckoutBuilder};
+use git2::{
+    CherrypickOptions, Repository as Raw, RepositoryState, RevertOptions, build::CheckoutBuilder,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs, io::Write};
 
@@ -92,6 +94,8 @@ pub enum RebaseAction {
     Split,
     /// Replay this commit, then pause before the next step.
     Break,
+    /// Used by the recoverable batch revert sequencer.
+    Revert,
 }
 impl RebaseAction {
     pub fn label(self) -> &'static str {
@@ -104,6 +108,7 @@ impl RebaseAction {
             Self::Edit => "Edit",
             Self::Split => "Split",
             Self::Break => "Break",
+            Self::Revert => "Revert",
         }
     }
 }
@@ -119,6 +124,11 @@ pub struct RebasePreview {
     pub onto: String,
     pub base: String,
     pub steps: Vec<RebaseStep>,
+    pub root: bool,
+}
+#[derive(Clone, Debug)]
+pub struct BatchCherryPlan {
+    preview: RebasePreview,
 }
 #[derive(Clone, Debug)]
 pub struct RebaseStatus {
@@ -299,6 +309,73 @@ fn move_head(repo: &Raw, expected: &str, target: &str) -> Result<()> {
     Ok(())
 }
 impl Repository {
+    pub fn prepare_cherry_batch(&self, ids: &[String]) -> Result<BatchCherryPlan> {
+        self.prepare_batch(ids, RebaseAction::Pick)
+    }
+    pub fn prepare_revert_batch(&self, ids: &[String]) -> Result<BatchCherryPlan> {
+        self.prepare_batch(ids, RebaseAction::Revert)
+    }
+    fn prepare_batch(&self, ids: &[String], action: RebaseAction) -> Result<BatchCherryPlan> {
+        let repo = raw(self)?;
+        clean(&repo)?;
+        let head = head_state(&repo)?;
+        ensure!(
+            head.reference != "HEAD",
+            "Check out a branch before starting a batch"
+        );
+        ensure!(
+            !ids.is_empty() && ids.len() <= 2000,
+            "Select 1–2,000 commits"
+        );
+        let mut seen = HashSet::new();
+        let mut steps = Vec::with_capacity(ids.len());
+        for id in ids {
+            let commit = repo.find_commit(oid(id)?)?;
+            ensure!(
+                seen.insert(commit.id()),
+                "A commit was selected more than once"
+            );
+            ensure!(
+                commit.parent_count() == 1,
+                "Batch operations currently support single-parent commits only"
+            );
+            steps.push(RebaseStep {
+                id: commit.id().to_string(),
+                message: commit.message().unwrap_or("Cherry-pick").to_owned(),
+                action,
+            });
+        }
+        let original = head.id.clone().context("No HEAD commit")?;
+        Ok(BatchCherryPlan {
+            preview: RebasePreview {
+                head,
+                onto: original.clone(),
+                base: original,
+                steps,
+                root: false,
+            },
+        })
+    }
+    pub(super) fn start_cherry_batch(&self, plan: &BatchCherryPlan) -> Result<String> {
+        ensure!(
+            plan.preview
+                .steps
+                .iter()
+                .all(|s| s.action == RebaseAction::Pick),
+            "Invalid cherry-pick plan"
+        );
+        self.start_sequence(&plan.preview, plan.preview.steps.clone(), true)
+    }
+    pub(super) fn start_revert_batch(&self, plan: &BatchCherryPlan) -> Result<String> {
+        ensure!(
+            plan.preview
+                .steps
+                .iter()
+                .all(|s| s.action == RebaseAction::Revert),
+            "Invalid revert plan"
+        );
+        self.start_sequence(&plan.preview, plan.preview.steps.clone(), true)
+    }
     /// Restart only an uncommitted replay step. Keep a durable copy before any reset.
     pub(super) fn recover_rebase_step(&self, skip: bool, expected: &str) -> Result<String> {
         let repo = raw(self)?;
@@ -330,7 +407,13 @@ impl Repository {
             repo.workdir().context("No working tree")?,
             &backup.join("worktree"),
         )?;
-        for name in ["index", STATE, "CHERRY_PICK_HEAD", "MERGE_MSG"] {
+        for name in [
+            "index",
+            STATE,
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "MERGE_MSG",
+        ] {
             let path = repo.path().join(name);
             if path.is_file() {
                 fs::copy(path, backup.join(name))?;
@@ -405,6 +488,39 @@ impl Repository {
             "Check out a local branch before rebasing"
         );
         let original = oid(head.id.as_deref().context("No commits to rebase")?)?;
+        if upstream.trim() == "--root" {
+            let target = target
+                .filter(|s| !s.trim().is_empty())
+                .context("Root rebase requires an explicit onto target")?;
+            let onto = repo.revparse_single(target.trim())?.peel_to_commit()?.id();
+            let mut current = original;
+            let mut steps = Vec::new();
+            loop {
+                ensure!(steps.len() < 2000, "Rebase is limited to 2,000 commits");
+                let commit = repo.find_commit(current)?;
+                ensure!(
+                    commit.parent_count() <= 1,
+                    "Root rebase currently supports linear history only"
+                );
+                steps.push(RebaseStep {
+                    id: current.to_string(),
+                    message: commit.message()?.into(),
+                    action: RebaseAction::Pick,
+                });
+                if commit.parent_count() == 0 {
+                    break;
+                }
+                current = commit.parent_id(0)?;
+            }
+            steps.reverse();
+            return Ok(RebasePreview {
+                head,
+                onto: onto.to_string(),
+                base: String::new(),
+                steps,
+                root: true,
+            });
+        }
         let upstream = repo
             .revparse_single(upstream.trim())?
             .peel_to_commit()?
@@ -451,6 +567,7 @@ impl Repository {
             onto: onto.to_string(),
             base: base.to_string(),
             steps,
+            root: false,
         })
     }
     pub fn rebase_status(&self) -> Result<Option<RebaseStatus>> {
@@ -475,13 +592,24 @@ impl Repository {
                     && !s.editing
                     && s.prepared.is_none()
                     && (!s.applied
-                        || fs::read_to_string(repo.path().join("CHERRY_PICK_HEAD"))
-                            .ok()
-                            .is_none_or(|marker| {
-                                s.steps
+                        || fs::read_to_string(
+                            repo.path().join(
+                                if s.steps
                                     .get(s.cursor)
-                                    .is_none_or(|step| marker.trim() != step.id)
-                            }))),
+                                    .is_some_and(|step| step.action == RebaseAction::Revert)
+                                {
+                                    "REVERT_HEAD"
+                                } else {
+                                    "CHERRY_PICK_HEAD"
+                                },
+                            ),
+                        )
+                        .ok()
+                        .is_none_or(|marker| {
+                            s.steps
+                                .get(s.cursor)
+                                .is_none_or(|step| marker.trim() != step.id)
+                        }))),
             recoverable: s.pending && !s.editing && !s.finishing && s.prepared.is_none(),
         }))
     }
@@ -489,6 +617,14 @@ impl Repository {
         &self,
         preview: &RebasePreview,
         steps: Vec<RebaseStep>,
+    ) -> Result<String> {
+        self.start_sequence(preview, steps, false)
+    }
+    fn start_sequence(
+        &self,
+        preview: &RebasePreview,
+        steps: Vec<RebaseStep>,
+        batch: bool,
     ) -> Result<String> {
         let repo = raw(self)?;
         let _lock = Lock::acquire(&repo)?;
@@ -504,19 +640,44 @@ impl Repository {
             "Each original commit must appear exactly once; use Drop to omit a commit"
         );
         let mut first = true;
-        let mut parent = oid(&preview.base)?;
+        let mut parent = if preview.root {
+            None
+        } else {
+            Some(oid(&preview.base)?)
+        };
         for step in &preview.steps {
             let commit = repo.find_commit(oid(&step.id)?)?;
             ensure!(
-                commit.parent_count() == 1 && commit.parent_id(0)? == parent,
+                if batch {
+                    commit.parent_count() == 1
+                } else if let Some(parent) = parent {
+                    commit.parent_count() == 1 && commit.parent_id(0)? == parent
+                } else {
+                    commit.parent_count() == 0
+                },
                 "Original rebase range changed; rebuild the plan"
             );
-            parent = commit.id();
+            parent = Some(commit.id());
         }
-        ensure!(
-            Some(parent.to_string()).as_deref() == preview.head.id.as_deref(),
-            "Plan does not end at the original HEAD"
-        );
+        if batch {
+            ensure!(
+                !preview.root
+                    && preview.onto == preview.base
+                    && Some(preview.onto.as_str()) == preview.head.id.as_deref()
+                    && (steps.iter().all(|s| s.action == RebaseAction::Pick)
+                        || steps.iter().all(|s| s.action == RebaseAction::Revert)),
+                "Invalid batch plan"
+            );
+        } else {
+            ensure!(
+                steps.iter().all(|s| s.action != RebaseAction::Revert),
+                "Revert is only available in batch plans"
+            );
+            ensure!(
+                parent.map(|p| p.to_string()).as_deref() == preview.head.id.as_deref(),
+                "Plan does not end at the original HEAD"
+            );
+        }
         for step in &steps {
             if step.action == RebaseAction::Drop {
                 continue;
@@ -531,6 +692,10 @@ impl Repository {
             );
             if matches!(step.action, RebaseAction::Edit | RebaseAction::Split) {
                 let commit = repo.find_commit(oid(&step.id)?)?;
+                ensure!(
+                    commit.parent_count() == 1,
+                    "Editing or splitting a root commit is not supported"
+                );
                 ensure!(
                     commit.tree_id() != commit.parent(0)?.tree_id(),
                     "Empty commits cannot be split or edited as changes; use Reword or Drop in the plan"
@@ -856,9 +1021,15 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
                 .safe()
                 .allow_conflicts(true)
                 .conflict_style_merge(true);
-            let mut options = CherrypickOptions::new();
-            options.checkout_builder(checkout);
-            repo.cherrypick(&picked, Some(&mut options))?;
+            if step.action == RebaseAction::Revert {
+                let mut options = RevertOptions::new();
+                options.checkout_builder(checkout);
+                repo.revert(&picked, Some(&mut options))?;
+            } else {
+                let mut options = CherrypickOptions::new();
+                options.checkout_builder(checkout);
+                repo.cherrypick(&picked, Some(&mut options))?;
+            }
             state.applied = true;
             save(repo, state)?;
         }
@@ -870,8 +1041,12 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
             !repo.path().join("index.lock").exists(),
             "An index lock exists; verify no Git process is running before recovering the interrupted operation"
         );
-        let marker = fs::read_to_string(repo.path().join("CHERRY_PICK_HEAD"))
-            .context("Interrupted before applying a rebase step; abort and rebuild the plan")?;
+        let marker = fs::read_to_string(repo.path().join(if step.action == RebaseAction::Revert {
+            "REVERT_HEAD"
+        } else {
+            "CHERRY_PICK_HEAD"
+        }))
+        .context("Interrupted before applying a rebase step; abort and rebuild the plan")?;
         ensure!(
             marker.trim() == step.id,
             "The pending cherry-pick changed; refusing to continue"
@@ -915,6 +1090,11 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
             ),
             RebaseAction::Fixup => previous.message()?.into(),
             RebaseAction::Pick => picked.message()?.into(),
+            RebaseAction::Revert => format!(
+                "Revert \"{}\"\n\nThis reverts commit {}.\n",
+                picked.summary().ok().flatten().unwrap_or_default(),
+                step.id
+            ),
             _ => step.message.clone(),
         };
         let parents = if combine {
@@ -923,7 +1103,9 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
             vec![previous.clone()]
         };
         let parents = parents.iter().collect::<Vec<_>>();
-        let original_author = if combine {
+        let original_author = if step.action == RebaseAction::Revert {
+            author(repo)?
+        } else if combine {
             previous.author()
         } else {
             picked.author()

@@ -439,7 +439,7 @@ fn resolving_one_file_keeps_other_conflicts_and_their_open_contexts_valid() {
 }
 
 #[test]
-fn unsupported_index_types_and_changed_branch_are_rejected() {
+fn special_index_edit_and_changed_branch_are_rejected() {
     let (_dir, repo, _, _) = setup(Some(b"base"), Some(b"ours"), Some(b"theirs"), "file");
     let raw = git2::Repository::open(&repo.root).unwrap();
     let mut index = raw.index().unwrap();
@@ -448,13 +448,13 @@ fn unsupported_index_types_and_changed_branch_are_rejected() {
     index.add(&entry).unwrap();
     index.write().unwrap();
     let context = Arc::new(repo.conflict_context(Path::new("file")).unwrap());
-    assert!(!context.file.supported);
+    assert!(context.is_index_only());
     let before = index_bytes(&repo);
     let bytes = std::fs::read(repo.root.join("file")).unwrap();
     assert!(
         repo.execute(Operation::ResolveConflict {
             context,
-            resolution: Resolution::Ours
+            resolution: Resolution::Edited("invalid".into())
         })
         .is_err()
     );
@@ -475,4 +475,199 @@ fn unsupported_index_types_and_changed_branch_are_rejected() {
         .is_err()
     );
     assert_eq!(index_bytes(&repo), before);
+}
+
+#[test]
+fn submodule_conflict_stages_selected_gitlink_without_touching_directory() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.execute(Operation::SetIdentity(
+        "Test".into(),
+        "test@example.invalid".into(),
+    ))
+    .unwrap();
+    write(&repo, "base", Some(b"base"));
+    let ancestor = commit(&repo, "base");
+    write(&repo, "base", Some(b"next"));
+    let ours = commit(&repo, "ours");
+    write(&repo, "base", Some(b"later"));
+    let theirs = commit(&repo, "theirs");
+    std::fs::create_dir(repo.root.join("child")).unwrap();
+    std::fs::write(repo.root.join("child/untracked"), b"preserve").unwrap();
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["update-index", "--index-info"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write!(
+        child.stdin.as_mut().unwrap(),
+        "160000 {ancestor} 1\tchild\n160000 {ours} 2\tchild\n160000 {theirs} 3\tchild\n"
+    )
+    .unwrap();
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    let context = Arc::new(repo.conflict_context(Path::new("child")).unwrap());
+    assert!(context.is_submodule());
+    assert!(
+        repo.execute(Operation::ResolveConflict {
+            context: context.clone(),
+            resolution: Resolution::Worktree
+        })
+        .is_err()
+    );
+    repo.execute(Operation::ResolveConflict {
+        context,
+        resolution: Resolution::Theirs,
+    })
+    .unwrap();
+    let raw = git2::Repository::open(&repo.root).unwrap();
+    let index = raw.index().unwrap();
+    let entry = index.get_path(Path::new("child"), 0).unwrap();
+    assert_eq!(entry.mode, 0o160000);
+    assert_eq!(entry.id.to_string(), theirs);
+    assert_eq!(
+        std::fs::read(repo.root.join("child/untracked")).unwrap(),
+        b"preserve"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_conflict_stages_target_without_following_or_replacing_working_link() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let raw = git2::Repository::open(&repo.root).unwrap();
+    let old = raw.blob(b"old-target").unwrap();
+    let ours = raw.blob(b"ours-target").unwrap();
+    let theirs = raw.blob(b"theirs-target").unwrap();
+    std::os::unix::fs::symlink("user-target", repo.root.join("link")).unwrap();
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["update-index", "--index-info"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write!(
+        child.stdin.as_mut().unwrap(),
+        "120000 {old} 1\tlink\n120000 {ours} 2\tlink\n120000 {theirs} 3\tlink\n"
+    )
+    .unwrap();
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    let context = Arc::new(repo.conflict_context(Path::new("link")).unwrap());
+    assert!(context.is_symlink());
+    repo.execute(Operation::ResolveConflict {
+        context,
+        resolution: Resolution::Ours,
+    })
+    .unwrap();
+    let entry = raw.index().unwrap().get_path(Path::new("link"), 0).unwrap();
+    assert_eq!(entry.mode, 0o120000);
+    assert_eq!(entry.id, ours);
+    assert_eq!(
+        std::fs::read_link(repo.root.join("link")).unwrap(),
+        Path::new("user-target")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_type_change_and_delete_conflicts_update_only_index() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for deletion in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let raw = git2::Repository::open(&repo.root).unwrap();
+        let old = raw.blob(b"old").unwrap();
+        let ours = raw.blob(b"file contents").unwrap();
+        let theirs = raw.blob(b"link-target").unwrap();
+        std::os::unix::fs::symlink("keep-target", repo.root.join("item")).unwrap();
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["update-index", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.as_mut().unwrap(), "120000 {old} 1\titem").unwrap();
+        if !deletion {
+            writeln!(child.stdin.as_mut().unwrap(), "100644 {ours} 2\titem").unwrap();
+        }
+        writeln!(child.stdin.as_mut().unwrap(), "120000 {theirs} 3\titem").unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        let ctx = Arc::new(repo.conflict_context(Path::new("item")).unwrap());
+        assert!(ctx.is_index_only());
+        repo.execute(Operation::ResolveConflict {
+            context: ctx,
+            resolution: Resolution::Ours,
+        })
+        .unwrap();
+        let entry = raw.index().unwrap().get_path(Path::new("item"), 0);
+        if deletion {
+            assert!(entry.is_none());
+        } else {
+            let e = entry.unwrap();
+            assert_eq!(e.mode, 0o100644);
+            assert_eq!(e.id, ours);
+        }
+        assert_eq!(
+            std::fs::read_link(repo.root.join("item")).unwrap(),
+            Path::new("keep-target")
+        );
+    }
+}
+
+#[test]
+fn rename_rename_conflicts_can_be_resolved_per_path_without_worktree_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.execute(Operation::SetIdentity(
+        "Test".into(),
+        "test@example.invalid".into(),
+    ))
+    .unwrap();
+    let contents = (0..30).map(|i| format!("line {i}\n")).collect::<String>();
+    std::fs::write(repo.root.join("old"), &contents).unwrap();
+    commit(&repo, "base");
+    repo.execute(Operation::CreateBranch("feature".into()))
+        .unwrap();
+    std::fs::rename(repo.root.join("old"), repo.root.join("theirs")).unwrap();
+    commit(&repo, "theirs rename");
+    repo.execute(Operation::Checkout("main".into())).unwrap();
+    std::fs::rename(repo.root.join("old"), repo.root.join("ours")).unwrap();
+    commit(&repo, "ours rename");
+    let _ = repo.execute(Operation::Merge("feature".into()));
+    let files = repo.conflict_session().unwrap().files;
+    assert!(!files.is_empty());
+    let before_ours = std::fs::read(repo.root.join("ours")).unwrap();
+    let before_theirs = std::fs::read(repo.root.join("theirs")).ok();
+    for file in files {
+        let context = repo.conflict_context(&file.path).unwrap();
+        repo.execute(Operation::ResolveConflict {
+            context: Arc::new(context),
+            resolution: Resolution::IndexOurs,
+        })
+        .unwrap();
+    }
+    assert!(repo.conflict_session().unwrap().files.is_empty());
+    let raw = git2::Repository::open(&repo.root).unwrap();
+    let index = raw.index().unwrap();
+    let ours = index.get_path(Path::new("ours"), 0).unwrap();
+    assert_eq!(
+        raw.find_blob(ours.id).unwrap().content(),
+        contents.as_bytes()
+    );
+    assert!(index.get_path(Path::new("old"), 0).is_none());
+    assert!(index.get_path(Path::new("theirs"), 0).is_none());
+    assert_eq!(std::fs::read(repo.root.join("ours")).unwrap(), before_ours);
+    assert_eq!(std::fs::read(repo.root.join("theirs")).ok(), before_theirs);
 }

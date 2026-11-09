@@ -56,7 +56,7 @@ pub(super) fn author(repo: &RawRepo) -> Result<git2::Signature<'static>> {
     Ok(git2::Signature::now(&name, &email)?)
 }
 
-fn relative_time(seconds: i64) -> String {
+pub(super) fn relative_time(seconds: i64) -> String {
     let elapsed = Utc::now().timestamp().saturating_sub(seconds).max(0);
     match elapsed {
         0..=59 => "just now".into(),
@@ -242,7 +242,7 @@ pub(super) fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
     Ok(files)
 }
 
-fn refs_by_oid(repo: &RawRepo) -> Result<HashMap<Oid, Vec<String>>> {
+pub(super) fn refs_by_oid(repo: &RawRepo) -> Result<HashMap<Oid, Vec<String>>> {
     let mut refs: HashMap<Oid, Vec<String>> = HashMap::new();
     for item in repo.references()? {
         let reference = item?;
@@ -942,12 +942,16 @@ impl Repository {
                 | Operation::CreateBranch(_)
                 | Operation::Revert(_)
                 | Operation::CherryPick(_)
+                | Operation::RevertMerge { .. }
+                | Operation::CherryPickMerge { .. }
                 | Operation::AbortMerge
                 | Operation::AbortRevert
                 | Operation::AbortCherryPick
                 | Operation::Stash(_)
                 | Operation::ApplyStash(_)
                 | Operation::Rebase { .. }
+                | Operation::CherryPickBatch(_)
+                | Operation::RevertBatch(_)
                 | Operation::ContinueRebase
                 | Operation::AbortRebase
                 | Operation::Discard(_)
@@ -1030,6 +1034,8 @@ impl Repository {
             let mut repo = raw(self)?;
             match operation {
                 Operation::Rebase { context, steps } => self.start_rebase(&context, steps),
+                Operation::CherryPickBatch(plan) => self.start_cherry_batch(&plan),
+                Operation::RevertBatch(plan) => self.start_revert_batch(&plan),
                 Operation::ContinueRebase => self.continue_rebase(),
                 Operation::RecoverRebaseStep { expected, skip } => {
                     self.recover_rebase_step(skip, &expected)
@@ -1256,6 +1262,30 @@ impl Repository {
                     );
                     commit_index(&repo, &message, None, None)
                 }
+                Operation::RevertMerge { id, mainline } => {
+                    ensure!(
+                        file_changes(&repo)?.is_empty(),
+                        "Revert requires a clean working tree and index"
+                    );
+                    let commit = repo.find_commit(oid(&id)?)?;
+                    ensure!(
+                        commit.parent_count() > 1
+                            && mainline > 0
+                            && (mainline as usize) <= commit.parent_count(),
+                        "Invalid merge parent"
+                    );
+                    let mut options = git2::RevertOptions::new();
+                    options.mainline(mainline);
+                    repo.revert(&commit, Some(&mut options))?;
+                    if repo.index()?.has_conflicts() {
+                        bail!("Revert has conflicts; resolve or abort");
+                    }
+                    let message = format!(
+                        "Revert \"{}\"",
+                        commit.summary().ok().flatten().unwrap_or_default()
+                    );
+                    commit_index(&repo, &message, None, None)
+                }
                 Operation::CherryPick(id) => {
                     ensure!(
                         file_changes(&repo)?.is_empty(),
@@ -1263,6 +1293,31 @@ impl Repository {
                     );
                     let commit = repo.find_commit(oid(&id)?)?;
                     repo.cherrypick(&commit, None)?;
+                    if repo.index()?.has_conflicts() {
+                        bail!("Cherry-pick has conflicts; resolve or abort");
+                    }
+                    commit_index(
+                        &repo,
+                        commit.message().ok().unwrap_or("Cherry-pick"),
+                        None,
+                        None,
+                    )
+                }
+                Operation::CherryPickMerge { id, mainline } => {
+                    ensure!(
+                        file_changes(&repo)?.is_empty(),
+                        "Cherry-pick requires a clean working tree and index"
+                    );
+                    let commit = repo.find_commit(oid(&id)?)?;
+                    ensure!(
+                        commit.parent_count() > 1
+                            && mainline > 0
+                            && (mainline as usize) <= commit.parent_count(),
+                        "Invalid merge parent"
+                    );
+                    let mut options = git2::CherrypickOptions::new();
+                    options.mainline(mainline);
+                    repo.cherrypick(&commit, Some(&mut options))?;
                     if repo.index()?.has_conflicts() {
                         bail!("Cherry-pick has conflicts; resolve or abort");
                     }

@@ -959,3 +959,93 @@ fn non_utf8_advertised_names_return_an_error_instead_of_unwinding_the_query() {
     assert!(format!("{error:#}").contains("not valid UTF-8"));
     assert_eq!(head(&f.client), f.base);
 }
+
+#[test]
+#[ignore = "requires network access to the public GitHub repository"]
+fn github_https_read_only_remote_refs_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    raw(&repo)
+        .remote("origin", "https://github.com/catsonkeyboard/gitbuddy.git")
+        .unwrap();
+    let origin = repo
+        .remote_info()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "origin")
+        .unwrap();
+    let refs = repo.remote_refs(&origin, control()).unwrap();
+    assert!(!refs.branches.is_empty());
+}
+
+#[test]
+#[ignore = "requires GitHub SSH access and a configured SSH agent"]
+fn github_ssh_authenticated_remote_refs_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    raw(&repo)
+        .remote("origin", "git@github.com:catsonkeyboard/gitbuddy.git")
+        .unwrap();
+    let origin = repo
+        .remote_info()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "origin")
+        .unwrap();
+    let refs = repo.remote_refs(&origin, control()).unwrap();
+    assert!(!refs.branches.is_empty());
+}
+
+#[test]
+#[ignore = "requires GitHub SSH-over-443 access, trusted host key and configured SSH agent"]
+fn github_ssh_443_remote_refs_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    raw(&repo)
+        .remote(
+            "origin",
+            "ssh://git@ssh.github.com:443/catsonkeyboard/gitbuddy.git",
+        )
+        .unwrap();
+    let origin = repo
+        .remote_info()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "origin")
+        .unwrap();
+    let refs = repo.remote_refs(&origin, control()).unwrap();
+    assert!(!refs.branches.is_empty());
+}
+
+#[test]
+#[ignore = "requires an authenticated private HTTPS remote supplied by GITBUDDY_TEST_PRIVATE_REMOTE"]
+fn github_https_private_authenticated_refs_smoke() {
+    let url =
+        std::env::var("GITBUDDY_TEST_PRIVATE_REMOTE").expect("private test remote URL required");
+    assert!(url.starts_with("https://github.com/"));
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let raw = raw(&repo);
+    let mut cfg = raw.config().unwrap();
+    cfg.set_str(
+        "credential.https://github.com.helper",
+        "!gh auth git-credential",
+    )
+    .unwrap();
+    raw.remote("origin", &url).unwrap();
+    let origin = repo
+        .remote_info()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "origin")
+        .unwrap();
+    let refs = repo.remote_refs(&origin, control()).unwrap();
+    assert!(!refs.branches.is_empty());
+    let branch = &refs.branches[0];
+    let fetch = repo.prepare_fetch(&origin, Some(&branch.name)).unwrap();
+    repo.execute(Operation::FetchFrom(Arc::new(fetch))).unwrap();
+    assert!(
+        raw.find_commit(git2::Oid::from_str(&branch.id).unwrap())
+            .is_ok()
+    );
+}

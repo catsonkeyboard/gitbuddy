@@ -117,6 +117,33 @@ pub struct ConflictContext {
     git_dir: PathBuf,
 }
 impl ConflictContext {
+    pub fn is_index_only(&self) -> bool {
+        self.file.supported
+            && self
+                .file
+                .entries
+                .iter()
+                .flatten()
+                .any(|e| matches!(e.mode, 0o120000 | 0o160000))
+    }
+    pub fn is_submodule(&self) -> bool {
+        self.file
+            .entries
+            .iter()
+            .flatten()
+            .all(|e| e.mode == 0o160000)
+            && self.file.entries[1].is_some()
+            && self.file.entries[2].is_some()
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.file
+            .entries
+            .iter()
+            .flatten()
+            .all(|e| e.mode == 0o120000)
+            && self.file.entries[1].is_some()
+            && self.file.entries[2].is_some()
+    }
     pub fn can_external_merge(&self) -> bool {
         self.file.supported
             && self.editable
@@ -132,6 +159,8 @@ pub enum ConflictResolution {
     Theirs,
     Worktree,
     Delete,
+    IndexOurs,
+    IndexTheirs,
 }
 
 pub fn has_conflict_markers(text: &str) -> bool {
@@ -189,7 +218,13 @@ fn conflict_files(index: &Index) -> Result<Vec<ConflictFile>> {
         let supported = entries
             .iter()
             .flatten()
-            .all(|e| e.path == path && matches!(e.mode, 0o100644 | 0o100755));
+            .all(|e| e.path == path && matches!(e.mode, 0o100644 | 0o100755))
+            || (entries.iter().flatten().all(|e| {
+                e.path == path && matches!(e.mode, 0o100644 | 0o100755 | 0o160000 | 0o120000)
+            }) && entries
+                .iter()
+                .flatten()
+                .any(|e| matches!(e.mode, 0o160000 | 0o120000)));
         let kind = match (&entries[0], &entries[1], &entries[2]) {
             (None, Some(_), Some(_)) => "Both added",
             (_, None, Some(_)) => "Deleted by ours",
@@ -216,7 +251,22 @@ fn side(repo: &git2::Repository, e: &Option<Entry>) -> Result<Option<ConflictSid
                     path: e.path.clone(),
                     mode: e.mode,
                     text: None,
-                    description: "Non-regular file; resolve with an external tool.".into(),
+                    description: if e.mode == 0o160000 {
+                        format!("Submodule commit {}", e.id)
+                    } else if e.mode == 0o120000 {
+                        let (size, _) = repo.odb()?.read_header(e.id)?;
+                        if size > 4096 {
+                            "Symlink target exceeds preview limit".into()
+                        } else {
+                            let blob = repo.find_blob(e.id)?;
+                            format!(
+                                "Symlink target: {}",
+                                String::from_utf8_lossy(blob.content()).escape_debug()
+                            )
+                        }
+                    } else {
+                        "Non-regular file; resolve with an external tool.".into()
+                    },
                     lines: std::sync::Arc::new(Vec::new()),
                 });
             }
@@ -390,14 +440,43 @@ impl Repository {
         let base = side(&repo, &file.entries[0])?;
         let ours = side(&repo, &file.entries[1])?;
         let theirs = side(&repo, &file.entries[2])?;
-        let (work, bytes) = worktree(&self.root, path)?;
+        let submodule = file.entries.iter().flatten().all(|e| e.mode == 0o160000)
+            && file.entries[1].is_some()
+            && file.entries[2].is_some();
+        let symlink = file.entries.iter().flatten().all(|e| e.mode == 0o120000)
+            && file.entries[1].is_some()
+            && file.entries[2].is_some();
+        let index_only = file.supported
+            && file
+                .entries
+                .iter()
+                .flatten()
+                .any(|e| matches!(e.mode, 0o160000 | 0o120000));
+        let (work, bytes) = if index_only {
+            (
+                WorkVersion {
+                    id: None,
+                    mode: 0o160000,
+                },
+                None,
+            )
+        } else {
+            worktree(&self.root, path)?
+        };
         let result = bytes
             .as_ref()
             .filter(|b| b.len() <= EDIT_LIMIT && !b.contains(&0))
             .and_then(|b| std::str::from_utf8(b).ok())
             .map(str::to_owned);
-        let editable = file.supported && bytes.as_ref().is_none_or(|_| result.is_some());
-        let description = if !file.supported {
+        let editable =
+            file.supported && !index_only && bytes.as_ref().is_none_or(|_| result.is_some());
+        let description = if submodule {
+            "Choose a gitlink commit; the submodule working directory will not be changed."
+        } else if symlink {
+            "Choose a link target for the index; the working link will not be changed."
+        } else if index_only {
+            "Choose a side to stage; the working path will not be changed."
+        } else if !file.supported {
             "Renames, symlinks and submodules require an external resolution tool."
         } else if !editable {
             "Binary, non-UTF-8 or large file: choose a complete side or resolve externally."
@@ -412,7 +491,7 @@ impl Repository {
             theirs,
             result,
             editable,
-            worktree_exists: bytes.is_some(),
+            worktree_exists: index_only || bytes.is_some(),
             description,
             token: token(&repo)?,
             work,
@@ -480,6 +559,62 @@ impl Repository {
             actual.as_ref() == Some(&context.file),
             "The index conflict changed. Reopen the conflict."
         );
+        if context.is_index_only()
+            || matches!(
+                resolution,
+                ConflictResolution::IndexOurs | ConflictResolution::IndexTheirs
+            )
+        {
+            let selected = match resolution {
+                ConflictResolution::Ours | ConflictResolution::IndexOurs => {
+                    context.file.entries[1].as_ref()
+                }
+                ConflictResolution::Theirs | ConflictResolution::IndexTheirs => {
+                    context.file.entries[2].as_ref()
+                }
+                _ => anyhow::bail!("Choose ours or theirs for this conflict"),
+            };
+            ensure!(
+                context
+                    .file
+                    .entries
+                    .iter()
+                    .flatten()
+                    .all(|e| e.path == context.file.path),
+                "Conflict contains different paths; resolve each path explicitly"
+            );
+            next.conflict_remove(&context.file.path)?;
+            if let Some(selected) = selected {
+                next.add(&IndexEntry {
+                    ctime: IndexTime::new(0, 0),
+                    mtime: IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: selected.mode,
+                    uid: 0,
+                    gid: 0,
+                    file_size: 0,
+                    id: selected.id,
+                    flags: 0,
+                    flags_extended: 0,
+                    path: selected.bytes.clone(),
+                })?;
+            } else if next.get_path(&context.file.path, 0).is_some() {
+                next.remove_path(&context.file.path)?;
+            }
+            next.write()?;
+            lock.file.write_all(&fs::read(scratch.path())?)?;
+            lock.file.sync_all()?;
+            ensure!(
+                token(&repo)? == context.token,
+                "Repository changed while saving conflict"
+            );
+            lock.install(&index_path)?;
+            return Ok(format!(
+                "Resolved {}; working tree was not changed",
+                context.file.path.display()
+            ));
+        }
         let (version, old_bytes) = worktree(&self.root, &context.file.path)?;
         ensure!(
             version == context.work,
@@ -530,6 +665,9 @@ impl Repository {
                     );
                 }
                 (old_bytes.clone(), version.mode, false)
+            }
+            ConflictResolution::IndexOurs | ConflictResolution::IndexTheirs => {
+                unreachable!("handled above")
             }
         };
         next.conflict_remove(&context.file.path)?;

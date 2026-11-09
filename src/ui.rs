@@ -320,6 +320,9 @@ pub struct RepoTab {
     patches: gitbuddy::cache::Cache<PatchKey, PatchState>,
     patch_loading: Arc<std::sync::atomic::AtomicUsize>,
     history_projection: std::cell::RefCell<Option<Arc<history::Projection>>>,
+    history_search: Option<Arc<git::HistorySearchResult>>,
+    history_search_cancel: Option<git::CancellationToken>,
+    history_search_generation: u64,
     diff_preferences: git::DiffPreferences,
     diff_searches: HashMap<PatchKey, (String, usize)>,
     show_commit_body: bool,
@@ -366,6 +369,9 @@ impl Default for RepoTab {
             patches: gitbuddy::cache::Cache::new(16, 64 * 1024 * 1024),
             patch_loading: Default::default(),
             history_projection: Default::default(),
+            history_search: None,
+            history_search_cancel: None,
+            history_search_generation: 0,
             diff_preferences: git::DiffPreferences::default(),
             diff_searches: HashMap::new(),
             show_commit_body: false,
@@ -476,7 +482,8 @@ impl GitBuddy {
                 .placeholder("Summary of your changes…\n\nOptional description")
         });
         let search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search commits · message, author, hash")
+            InputState::new(window, cx)
+                .placeholder("Search commits · author: path: ref: after: before:")
         });
         let form_a = cx.new(|cx| InputState::new(window, cx));
         let form_b = cx.new(|cx| InputState::new(window, cx));
@@ -524,6 +531,12 @@ impl GitBuddy {
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.active.query = this.search.read(cx).value().to_string();
+                    if let Some(token) = this.active.history_search_cancel.take() {
+                        token.cancel();
+                    }
+                    this.active.history_search_generation += 1;
+                    this.active.history_search = None;
+                    this.active.history_projection.borrow_mut().take();
                     cx.notify();
                 }
             }),
@@ -726,6 +739,15 @@ impl GitBuddy {
         };
         if self.tasks.get(id).is_some() {
             return;
+        }
+        if self.active_index == Some(index) {
+            if let Some(token) = self.active.history_search_cancel.take() {
+                token.cancel();
+            }
+        } else if let Some(tab) = self.tabs[index].as_mut()
+            && let Some(token) = tab.history_search_cancel.take()
+        {
+            token.cancel();
         }
         let was_active = self.active_index == Some(index);
         self.tabs.remove(index);

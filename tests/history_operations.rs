@@ -579,3 +579,336 @@ fn empty_commit_edit_is_rejected_before_rewrite_and_can_be_reworded() {
     assert_eq!(new.message(), Ok("reworded empty"));
     assert_eq!(new.tree_id(), parent.tree_id());
 }
+
+#[test]
+fn merge_commit_actions_use_the_selected_parent_and_reject_invalid_parent() {
+    for revert in [false, true] {
+        let (_dir, repo, base, old, tip) = setup();
+        let r = raw(&repo);
+        let base_commit = r.find_commit(git2::Oid::from_str(&base).unwrap()).unwrap();
+        let old_commit = r.find_commit(git2::Oid::from_str(&old).unwrap()).unwrap();
+        let tip_commit = r.find_commit(git2::Oid::from_str(&tip).unwrap()).unwrap();
+        let sig = r.signature().unwrap();
+        let merge = r
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "test merge",
+                &tip_commit.tree().unwrap(),
+                &[&base_commit, &old_commit],
+            )
+            .unwrap()
+            .to_string();
+        let invalid = if revert {
+            Operation::RevertMerge {
+                id: merge.clone(),
+                mainline: 3,
+            }
+        } else {
+            Operation::CherryPickMerge {
+                id: merge.clone(),
+                mainline: 3,
+            }
+        };
+        assert!(repo.execute(invalid).is_err());
+        assert_eq!(repo.snapshot(20).unwrap().head_id.unwrap(), tip);
+        if !revert {
+            let raw = raw(&repo);
+            let object = raw
+                .find_object(git2::Oid::from_str(&base).unwrap(), None)
+                .unwrap();
+            raw.reset(&object, git2::ResetType::Hard, None).unwrap();
+        }
+        let operation = if revert {
+            Operation::RevertMerge {
+                id: merge,
+                mainline: 2,
+            }
+        } else {
+            Operation::CherryPickMerge {
+                id: merge,
+                mainline: 2,
+            }
+        };
+        repo.execute(operation).unwrap();
+        assert_eq!(repo.root.join("later").exists(), !revert);
+        if !revert {
+            assert!(
+                fs::read_to_string(repo.root.join("file"))
+                    .unwrap()
+                    .contains("line 1\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn history_search_reaches_beyond_loaded_page_and_can_be_cancelled() {
+    let (_dir, repo, base, _, _) = setup();
+    assert!(
+        repo.snapshot(1)
+            .unwrap()
+            .commits
+            .iter()
+            .all(|c| c.id != base)
+    );
+    let token = gitbuddy::git::CancellationToken::default();
+    let result = repo.search_history("base", &token).unwrap();
+    assert!(result.commits.iter().any(|c| c.id == base));
+    assert!(result.scanned >= 3);
+    assert!(!result.truncated);
+    assert!(token.cancel());
+    assert!(repo.search_history("base", &token).is_err());
+    assert!(
+        repo.search_history("   ", &gitbuddy::git::CancellationToken::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn history_search_filters_by_author_path_date_and_revision() {
+    let (_dir, repo, base, old, tip) = setup();
+    let token = gitbuddy::git::CancellationToken::default();
+    let find = |query: &str| {
+        repo.search_history(query, &token)
+            .unwrap()
+            .commits
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        find("author:history@example.invalid path:later"),
+        vec![tip.clone()]
+    );
+    assert_eq!(find(&format!("path:added ref:{old}")), vec![old.clone()]);
+    assert_eq!(find(&format!("path:later ref:{old}")), Vec::<String>::new());
+    assert!(find("after:2100-01-01").is_empty());
+    assert!(find("before:2100-01-01").contains(&base));
+    assert!(repo.search_history("after:bad-date", &token).is_err());
+    assert!(
+        repo.search_history("ref:no-such-reference", &token)
+            .is_err()
+    );
+    assert!(
+        repo.search_history("after:2100-01-01 before:2000-01-01", &token)
+            .is_err()
+    );
+    fs::write(repo.root.join("space name.txt"), "text").unwrap();
+    let spaced = commit(&repo, "path with spaces");
+    assert_eq!(find("path:\"space name.txt\""), vec![spaced]);
+    assert!(repo.search_history("path:\"unterminated", &token).is_err());
+}
+
+#[test]
+fn batch_cherry_pick_replays_in_order_and_rejects_stale_plan() {
+    let (_dir, repo, base, old, tip) = setup();
+    let raw = raw(&repo);
+    let object = raw
+        .find_object(git2::Oid::from_str(&base).unwrap(), None)
+        .unwrap();
+    raw.reset(&object, git2::ResetType::Hard, None).unwrap();
+    let plan = repo
+        .prepare_cherry_batch(&[old.clone(), tip.clone()])
+        .unwrap();
+    repo.execute(Operation::CherryPickBatch(Arc::new(plan)))
+        .unwrap();
+    assert!(
+        fs::read_to_string(repo.root.join("file"))
+            .unwrap()
+            .contains("first change")
+    );
+    assert!(repo.root.join("later").exists());
+    assert!(repo.rebase_status().unwrap().is_none());
+    let history = repo.snapshot(5).unwrap().commits;
+    assert_eq!(history[0].subject, "descendant");
+    assert_eq!(history[1].subject, "old commit");
+    let stale = repo
+        .prepare_cherry_batch(std::slice::from_ref(&old))
+        .unwrap();
+    fs::write(repo.root.join("new"), "new work").unwrap();
+    assert!(
+        repo.execute(Operation::CherryPickBatch(Arc::new(stale)))
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("new")).unwrap(),
+        "new work"
+    );
+}
+
+#[test]
+fn batch_cherry_pick_conflict_can_continue_and_abort() {
+    for abort in [false, true] {
+        let (_dir, repo, base, old, _) = setup();
+        let raw = raw(&repo);
+        let object = raw
+            .find_object(git2::Oid::from_str(&base).unwrap(), None)
+            .unwrap();
+        raw.reset(&object, git2::ResetType::Hard, None).unwrap();
+        let text = fs::read_to_string(repo.root.join("file"))
+            .unwrap()
+            .replace("line 1\n", "other change\n");
+        fs::write(repo.root.join("file"), text).unwrap();
+        let original = commit(&repo, "different change");
+        let plan = repo
+            .prepare_cherry_batch(std::slice::from_ref(&old))
+            .unwrap();
+        let _ = repo.execute(Operation::CherryPickBatch(Arc::new(plan)));
+        assert!(repo.rebase_status().unwrap().is_some());
+        assert!(!repo.conflict_session().unwrap().files.is_empty());
+        if abort {
+            repo.execute(Operation::AbortRebase).unwrap();
+            assert_eq!(repo.snapshot(5).unwrap().head_id.unwrap(), original);
+            assert!(
+                fs::read_to_string(repo.root.join("file"))
+                    .unwrap()
+                    .contains("other change")
+            );
+        } else {
+            let context = repo.conflict_context(std::path::Path::new("file")).unwrap();
+            repo.execute(Operation::ResolveConflict {
+                context: Arc::new(context),
+                resolution: gitbuddy::git::ConflictResolution::Theirs,
+            })
+            .unwrap();
+            repo.execute(Operation::ContinueRebase).unwrap();
+            assert!(repo.rebase_status().unwrap().is_none());
+            assert!(
+                fs::read_to_string(repo.root.join("file"))
+                    .unwrap()
+                    .contains("first change")
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_revert_replays_newest_first_and_can_recover_conflicts() {
+    let (_dir, repo, base, old, tip) = setup();
+    let base_tree = raw(&repo)
+        .find_commit(git2::Oid::from_str(&base).unwrap())
+        .unwrap()
+        .tree_id();
+    let plan = repo.prepare_revert_batch(&[tip, old.clone()]).unwrap();
+    repo.execute(Operation::RevertBatch(Arc::new(plan)))
+        .unwrap();
+    let r = raw(&repo);
+    assert_eq!(
+        r.head().unwrap().peel_to_commit().unwrap().tree_id(),
+        base_tree
+    );
+    assert!(repo.rebase_status().unwrap().is_none());
+    let history = repo.snapshot(4).unwrap().commits;
+    assert!(history[0].subject.starts_with("Revert \"old commit\""));
+
+    let (_dir2, repo2, _, old2, _) = setup();
+    let text = fs::read_to_string(repo2.root.join("file"))
+        .unwrap()
+        .replace("first change\n", "later conflict\n");
+    fs::write(repo2.root.join("file"), text).unwrap();
+    let original = commit(&repo2, "conflicting edit");
+    let plan = repo2
+        .prepare_revert_batch(std::slice::from_ref(&old2))
+        .unwrap();
+    let _ = repo2.execute(Operation::RevertBatch(Arc::new(plan)));
+    assert!(repo2.rebase_status().unwrap().is_some());
+    assert!(!repo2.conflict_session().unwrap().files.is_empty());
+    repo2.execute(Operation::AbortRebase).unwrap();
+    assert_eq!(repo2.snapshot(5).unwrap().head_id.unwrap(), original);
+    assert!(
+        fs::read_to_string(repo2.root.join("file"))
+            .unwrap()
+            .contains("later conflict")
+    );
+}
+
+#[test]
+fn batch_revert_conflict_can_resume_after_resolving() {
+    let (_dir, repo, _, old, _) = setup();
+    let text = fs::read_to_string(repo.root.join("file"))
+        .unwrap()
+        .replace("first change\n", "conflicting change\n");
+    fs::write(repo.root.join("file"), text).unwrap();
+    commit(&repo, "conflicting edit");
+    let plan = repo.prepare_revert_batch(&[old]).unwrap();
+    let _ = repo.execute(Operation::RevertBatch(Arc::new(plan)));
+    assert!(!repo.rebase_status().unwrap().unwrap().interrupted);
+    let ctx = repo.conflict_context(std::path::Path::new("file")).unwrap();
+    repo.execute(Operation::ResolveConflict {
+        context: Arc::new(ctx),
+        resolution: gitbuddy::git::ConflictResolution::Theirs,
+    })
+    .unwrap();
+    repo.execute(Operation::ContinueRebase).unwrap();
+    assert!(repo.rebase_status().unwrap().is_none());
+    assert!(
+        repo.snapshot(1).unwrap().commits[0]
+            .subject
+            .starts_with("Revert")
+    );
+}
+
+#[test]
+fn root_rebase_onto_unrelated_target_replays_root_and_descendants() {
+    let (_dir, repo, base, _, tip) = setup();
+    let raw = raw(&repo);
+    let tree_id = raw.treebuilder(None).unwrap().write().unwrap();
+    let tree = raw.find_tree(tree_id).unwrap();
+    let sig = raw.signature().unwrap();
+    let target = raw
+        .commit(None, &sig, &sig, "new base", &tree, &[])
+        .unwrap()
+        .to_string();
+    let plan = repo.rebase_preview_onto("--root", Some(&target)).unwrap();
+    assert!(plan.root);
+    assert_eq!(plan.steps.len(), 3);
+    assert_eq!(plan.steps[0].id, base);
+    repo.execute(Operation::Rebase {
+        context: Arc::new(plan.clone()),
+        steps: plan.steps,
+    })
+    .unwrap();
+    let head = raw.head().unwrap().peel_to_commit().unwrap();
+    let first = head.parent(0).unwrap().parent(0).unwrap();
+    assert_eq!(first.parent_id(0).unwrap().to_string(), target);
+    assert_eq!(first.message().unwrap(), "base");
+    assert_ne!(head.id().to_string(), tip);
+    assert!(repo.rebase_status().unwrap().is_none());
+}
+
+#[test]
+fn root_rebase_conflict_can_abort_and_root_edit_is_rejected() {
+    let (_dir, repo, _, _, tip) = setup();
+    let raw = raw(&repo);
+    let blob = raw.blob(b"different root content\n").unwrap();
+    let mut builder = raw.treebuilder(None).unwrap();
+    builder.insert("file", blob, 0o100644).unwrap();
+    let tree_id = builder.write().unwrap();
+    let tree = raw.find_tree(tree_id).unwrap();
+    let sig = raw.signature().unwrap();
+    let target = raw
+        .commit(None, &sig, &sig, "conflicting base", &tree, &[])
+        .unwrap()
+        .to_string();
+    let plan = repo.rebase_preview_onto("--root", Some(&target)).unwrap();
+    let mut invalid = plan.steps.clone();
+    invalid[0].action = RebaseAction::Edit;
+    assert!(
+        repo.execute(Operation::Rebase {
+            context: Arc::new(plan.clone()),
+            steps: invalid
+        })
+        .is_err()
+    );
+    assert_eq!(repo.snapshot(5).unwrap().head_id.unwrap(), tip);
+    let _ = repo.execute(Operation::Rebase {
+        context: Arc::new(plan.clone()),
+        steps: plan.steps,
+    });
+    assert!(repo.rebase_status().unwrap().is_some());
+    assert!(!repo.conflict_session().unwrap().files.is_empty());
+    repo.execute(Operation::AbortRebase).unwrap();
+    assert_eq!(repo.snapshot(5).unwrap().head_id.unwrap(), tip);
+}

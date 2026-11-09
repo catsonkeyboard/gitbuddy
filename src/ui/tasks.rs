@@ -133,7 +133,7 @@ impl GitBuddy {
     pub(super) fn busy(&self) -> bool {
         self.tasks.closing() || self.tasks.get(self.active.id).is_some()
     }
-    fn tab_mut(&mut self, id: TabId) -> Option<&mut RepoTab> {
+    pub(super) fn tab_mut(&mut self, id: TabId) -> Option<&mut RepoTab> {
         tab_mut_by_id(&mut self.active, &mut self.tabs, id)
     }
     fn tab_index(&self, id: TabId) -> Option<usize> {
@@ -706,6 +706,13 @@ impl RepoTab {
         if changed || self.snapshot.commits.len() != loaded.snapshot.commits.len() {
             self.history_projection.borrow_mut().take();
             self.scroll.invalidate_variables();
+        }
+        if changed {
+            if let Some(token) = self.history_search_cancel.take() {
+                token.cancel();
+            }
+            self.history_search_generation += 1;
+            self.history_search = None;
         }
         if self.selection != *requested {
             loaded.selection = self.selection.clone();

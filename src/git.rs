@@ -112,6 +112,8 @@ pub enum Operation {
         context: std::sync::Arc<RebasePreview>,
         steps: Vec<RebaseStep>,
     },
+    CherryPickBatch(std::sync::Arc<BatchCherryPlan>),
+    RevertBatch(std::sync::Arc<BatchCherryPlan>),
     ContinueRebase,
     RecoverRebaseStep {
         expected: String,
@@ -220,6 +222,14 @@ pub enum Operation {
     AbortMerge,
     Revert(String),
     CherryPick(String),
+    RevertMerge {
+        id: String,
+        mainline: u32,
+    },
+    CherryPickMerge {
+        id: String,
+        mainline: u32,
+    },
     AbortRevert,
     AbortCherryPick,
     TrackBranch(String),
@@ -346,7 +356,9 @@ mod patch_file;
 pub use patch_file::ApplyPatchPlan;
 mod image_preview;
 mod patch_batch;
+mod search;
 pub use image_preview::{ImageData, ImageKind, ImagePair};
+pub use search::HistorySearchResult;
 #[path = "git/conflict_blocks.rs"]
 mod conflict_blocks;
 #[path = "git/conflicts.rs"]
@@ -374,7 +386,9 @@ pub use remotes::{PushPlan, PushSelection, RemoteInfo, RemoteState};
 
 #[path = "git/rebase.rs"]
 mod rebase;
-pub use rebase::{RebaseAction, RebasePreview, RebaseStatus, RebaseStep, autosquash};
+pub use rebase::{
+    BatchCherryPlan, RebaseAction, RebasePreview, RebaseStatus, RebaseStep, autosquash,
+};
 #[path = "git/workspaces.rs"]
 mod workspaces;
 pub use workspaces::{SubmoduleInfo, WorktreeInfo};
@@ -435,6 +449,8 @@ impl Operation {
             Self::RenameBranch { .. } => "Rename branch",
             Self::CheckoutDetached(_) => "Checkout detached HEAD",
             Self::Rebase { .. } => "Rebase",
+            Self::CherryPickBatch(_) => "Cherry-pick selected commits",
+            Self::RevertBatch(_) => "Revert selected commits",
             Self::ContinueRebase => "Continue rebase",
             Self::AbortRebase => "Abort rebase",
             Self::RecoverRebaseStep { .. } => "Recover rebase step",

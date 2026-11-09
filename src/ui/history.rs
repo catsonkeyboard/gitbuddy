@@ -2,6 +2,7 @@ use super::*;
 pub(super) struct Projection {
     query: String,
     pub commits: Vec<usize>,
+    search_results: bool,
     graph: Vec<graph::GraphRow>,
     width: f32,
     visible: Arc<Vec<String>>,
@@ -16,21 +17,25 @@ impl RepoTab {
         if let Some(projection) = cached.as_ref().filter(|p| p.query == self.query) {
             return projection.clone();
         }
-        let query = self.query.to_lowercase();
-        let commits: Vec<_> = self
-            .snapshot
-            .commits
+        let query = self.query.trim().to_lowercase();
+        let source = self
+            .history_search
+            .as_ref()
+            .map(|r| &r.commits)
+            .unwrap_or(&self.snapshot.commits);
+        let commits: Vec<_> = source
             .iter()
             .enumerate()
             .filter(|(_, c)| {
-                query.is_empty()
+                self.history_search.is_some()
+                    || query.is_empty()
                     || [&c.subject, &c.author, &c.id, &c.refs]
                         .iter()
                         .any(|s| s.to_lowercase().contains(&query))
             })
             .map(|(i, _)| i)
             .collect();
-        let references: Vec<_> = commits.iter().map(|&i| &self.snapshot.commits[i]).collect();
+        let references: Vec<_> = commits.iter().map(|&i| &source[i]).collect();
         let graph = graph::rows(&references, !query.is_empty());
         let width = graph::width(&graph);
         let visible = Arc::new(references.iter().map(|c| c.id.clone()).collect());
@@ -63,6 +68,7 @@ impl RepoTab {
         let projection = Arc::new(Projection {
             query: self.query.clone(),
             commits,
+            search_results: self.history_search.is_some(),
             graph,
             width,
             visible,
@@ -77,6 +83,52 @@ impl RepoTab {
 }
 
 impl GitBuddy {
+    fn search_all_history(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        let query = self.active.query.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        if let Some(old) = self.active.history_search_cancel.take() {
+            old.cancel();
+        }
+        let token = git::CancellationToken::default();
+        self.active.history_search_cancel = Some(token.clone());
+        self.active.history_search_generation += 1;
+        let generation = self.active.history_search_generation;
+        let tab_id = self.active.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { repo.search_history(&query, &token) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(tab) = this.tab_mut(tab_id) else {
+                    return;
+                };
+                if tab.history_search_generation != generation {
+                    return;
+                }
+                tab.history_search_cancel = None;
+                match result {
+                    Ok(result) => {
+                        tab.history_search = Some(Arc::new(result));
+                        tab.error = false;
+                    }
+                    Err(error) => {
+                        tab.notice = format!("History search failed: {error:#}");
+                        tab.error = true;
+                    }
+                }
+                tab.history_projection.borrow_mut().take();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
     pub(super) fn history(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let projection = self.active.projection();
         v_flex()
@@ -124,7 +176,47 @@ impl GitBuddy {
                         })),
                     ),
             )
-            .child(div().px_2().py_1().child(Input::new(&self.search).small()))
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(div().flex_1().child(Input::new(&self.search).small()))
+                    .child(
+                        self.button(
+                            "search-all-history",
+                            if self.active.history_search_cancel.is_some() {
+                                "Cancel search"
+                            } else {
+                                "Search history"
+                            },
+                        )
+                        .ghost()
+                        .disabled(self.active.query.trim().is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(token) = this.active.history_search_cancel.take() {
+                                token.cancel();
+                                this.active.history_search_generation += 1;
+                                cx.notify();
+                            } else {
+                                this.search_all_history(cx);
+                            }
+                        })),
+                    ),
+            )
+            .when_some(self.active.history_search.as_ref(), |col, result| {
+                col.child(div().px_2().text_xs().text_color(rgb(MUTED)).child(format!(
+                    "{} matches · {} scanned{}",
+                    result.commits.len(),
+                    result.scanned,
+                    if result.truncated {
+                        " · limit reached"
+                    } else {
+                        ""
+                    }
+                )))
+            })
+            .when(self.history_tab == 0 && self.active.history_search.is_none(), |col| col.child(div().px_2().text_size(px(10.)).text_color(rgb(MUTED)).child("Search history supports author:, path:, ref:, after: and before: (YYYY-MM-DD).")))
             .child(
                 div()
                     .id("work-summary")
@@ -175,10 +267,18 @@ impl GitBuddy {
                             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                                 range
                                     .map(|i| {
-                                        if let Some(commit) = projection
-                                            .commits
-                                            .get(i)
-                                            .and_then(|&index| this.snapshot.commits.get(index))
+                                        if let Some(commit) =
+                                            projection.commits.get(i).and_then(|&index| {
+                                                if projection.search_results {
+                                                    this.active
+                                                        .history_search
+                                                        .as_ref()?
+                                                        .commits
+                                                        .get(index)
+                                                } else {
+                                                    this.snapshot.commits.get(index)
+                                                }
+                                            })
                                         {
                                             this.commit_row(
                                                 i,
@@ -197,6 +297,8 @@ impl GitBuddy {
                                                 .text_color(rgb(MUTED))
                                                 .child(if this.query.is_empty() {
                                                     "Your first commit starts here."
+                                                } else if projection.search_results {
+                                                    "No matching commits in searched history."
                                                 } else {
                                                     "No matching commits in loaded history."
                                                 })
@@ -219,6 +321,7 @@ impl GitBuddy {
                                 .ghost()
                                 .disabled(
                                     self.busy()
+                                        || self.active.history_search.is_some()
                                         || self.limit >= self.settings.preferences.history_limit
                                         || self.snapshot.commits.len() < self.limit,
                                 )

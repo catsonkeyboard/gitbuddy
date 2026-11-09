@@ -51,6 +51,28 @@ impl ConflictViewState {
     }
 }
 impl GitBuddy {
+    fn navigate_conflict(&mut self, next: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.active.conflicts.session.as_ref() else {
+            return;
+        };
+        let Some(current) = self.active.conflicts.selected.as_ref() else {
+            return;
+        };
+        let Some(index) = session.files.iter().position(|file| &file.path == current) else {
+            return;
+        };
+        let target = if next {
+            index.checked_add(1)
+        } else {
+            index.checked_sub(1)
+        };
+        if let Some(path) = target
+            .and_then(|i| session.files.get(i))
+            .map(|f| f.path.clone())
+        {
+            self.choose_conflict(path, false, cx);
+        }
+    }
     pub(super) fn open_conflicts(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.busy() || self.repo.is_none() {
             return;
@@ -347,7 +369,18 @@ impl GitBuddy {
             || (draft.choice == ResultChoice::Theirs && draft.context.theirs.is_none())
             || (draft.choice == ResultChoice::Worktree && !draft.context.worktree_exists);
         if deletes {
-            self.show_modal(Modal::Confirm(format!("Resolve {} as deleted? The file will be removed from the working tree and index.", path.display()), op), window, cx);
+            let message = if draft.context.is_index_only() {
+                format!(
+                    "Resolve {} as deleted from the index? The working path will be kept.",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "Resolve {} as deleted? The file will be removed from the working tree and index.",
+                    path.display()
+                )
+            };
+            self.show_modal(Modal::Confirm(message, op), window, cx);
         } else {
             self.perform(op, cx);
         }
@@ -359,6 +392,8 @@ impl GitBuddy {
         v_flex().flex_1().min_h_0()
             .child(h_flex().h(px(38.)).px_3().gap_2().bg(rgb(PANEL)).border_b_1().border_color(rgb(BORDER))
                 .child(div().flex_1().text_xs().child(format!("{} · {count} unresolved files", operation.label())))
+                .child(self.button("conflict-previous", "Previous file").ghost().disabled(self.busy() || self.active.conflicts.loading || self.active.conflicts.loading_file || session.as_ref().and_then(|s| s.files.iter().position(|f| Some(&f.path) == self.active.conflicts.selected.as_ref())).is_none_or(|i| i == 0)).on_click(cx.listener(|this,_,_,cx|this.navigate_conflict(false,cx))))
+                .child(self.button("conflict-next", "Next file").ghost().disabled(self.busy() || self.active.conflicts.loading || self.active.conflicts.loading_file || session.as_ref().and_then(|s| s.files.iter().position(|f| Some(&f.path) == self.active.conflicts.selected.as_ref())).is_none_or(|i| i + 1 >= count)).on_click(cx.listener(|this,_,_,cx|this.navigate_conflict(true,cx))))
                 .child(self.button("reload-conflicts","Refresh list").ghost().disabled(self.busy()).on_click(cx.listener(|this,_,_,cx|this.reload_conflicts(None,cx))))
                 .when(operation.can_continue(), |row| row.child(self.button("continue-conflict",format!("Continue {}…", operation.label())).primary().disabled(self.busy() || count != 0 || self.active.conflicts.loading || self.snapshot.squash_pending)
                     .on_click(cx.listener(|this,_,w,cx| { if let Some(session)=this.active.conflicts.session.clone() {this.show_modal(Modal::Confirm(format!("Complete {} using all staged changes?\n\n{}",session.operation.label(),session.message.trim()),Operation::ContinueConflict(session)),w,cx);} }))))
@@ -394,6 +429,8 @@ impl GitBuddy {
     fn conflict_editor_view(&self, draft: &ConflictDraft, cx: &mut Context<Self>) -> AnyElement {
         let context = &draft.context;
         let path = context.file.path.clone();
+        let index_ours = context.clone();
+        let index_theirs = context.clone();
         let scroll_path = path.display().to_string();
         let deletion = draft.choice == ResultChoice::Delete
             || (draft.choice == ResultChoice::Ours && context.ours.is_none())
@@ -407,7 +444,11 @@ impl GitBuddy {
         let description = if has_markers {
             "Result still contains conflict markers.".to_owned()
         } else if deletion {
-            "Result: delete this file.".to_owned()
+            if context.is_index_only() {
+                "Result: remove from index; keep working path.".to_owned()
+            } else {
+                "Result: delete this file.".to_owned()
+            }
         } else if !context.file.supported {
             context.description.clone()
         } else {
@@ -431,8 +472,11 @@ impl GitBuddy {
                 .child(self.button("external-merge-tool","External tool…").ghost().disabled(self.busy()||!context.can_external_merge()).on_click(cx.listener(|this,_,w,cx|this.open_merge_tool(w,cx))))
                 .child(self.button("use-ours",if context.ours.is_some(){"Use ours"}else{"Ours: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Ours,cx))))
                 .child(self.button("use-theirs",if context.theirs.is_some(){"Use theirs"}else{"Theirs: delete"}).ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Theirs,cx))))
-                .child(self.button("use-worktree","Use working file").ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Worktree,cx))))
-                .child(self.button("resolve-deletion","Delete result").ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Delete,cx)))))
+                .child(self.button("use-worktree","Use working file").ghost().disabled(self.busy()||!context.file.supported||context.is_index_only()).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Worktree,cx))))
+                .child(self.button("resolve-deletion","Delete result").ghost().disabled(self.busy()||!context.file.supported||context.is_index_only()).on_click(cx.listener(|this,_,_,cx|this.choose_result(ResultChoice::Delete,cx)))))
+            .child(h_flex().px_3().py_1().gap_1()
+                .child(self.button("index-ours", "Stage ours only…").ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(move|this,_,w,cx| this.show_modal(Modal::Confirm("Resolve this path in the index using ours? If ours is missing, remove it from the index. The working path will not change; any unsaved draft for this path will be discarded.".into(), Operation::ResolveConflict { context: index_ours.clone(), resolution: git::ConflictResolution::IndexOurs }), w, cx))))
+                .child(self.button("index-theirs", "Stage theirs only…").ghost().disabled(self.busy()||!context.file.supported).on_click(cx.listener(move|this,_,w,cx| this.show_modal(Modal::Confirm("Resolve this path in the index using theirs? If theirs is missing, remove it from the index. The working path will not change; any unsaved draft for this path will be discarded.".into(), Operation::ResolveConflict { context: index_theirs.clone(), resolution: git::ConflictResolution::IndexTheirs }), w, cx)))))
             .child(h_flex().px_3().py_1().gap_2()
                 .child(div().flex_1().text_xs().text_color(rgb(if has_markers {0xe9a3a9}else{MUTED})).child(description))
                 .child(self.button("save-conflict","Save & mark resolved").primary().disabled(self.busy()||self.active.conflicts.loading||self.active.conflicts.loading_file||!can_save).on_click(cx.listener(|this,_,w,cx|this.save_conflict(w,cx)))))
@@ -440,7 +484,7 @@ impl GitBuddy {
             .child(if context.editable && !deletion {
                 Editor::new(&self.conflict_editor).aria_label("Conflict result").appearance(false).bordered(false).readonly(self.busy()).h(relative(1.)).flex_1().min_h_0().into_any_element()
             } else {
-                div().flex_1().p_3().text_xs().text_color(rgb(MUTED)).child(if deletion {"The file will be removed when you save."}else{"The selected complete version will be saved without text conversion. You can also edit externally, reload, and choose Use working file."}).into_any_element()
+                div().flex_1().p_3().text_xs().text_color(rgb(MUTED)).child(if context.is_index_only() {"Choose ours or theirs to update the index. The working path will not be changed."} else if deletion {"The file will be removed when you save."}else{"The selected complete version will be saved without text conversion. You can also edit externally, reload, and choose Use working file."}).into_any_element()
             })
             .into_any_element()
     }

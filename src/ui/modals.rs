@@ -167,7 +167,7 @@ impl GitBuddy {
             ),
             Modal::RebaseSetup => (
                 "Interactive rebase",
-                "Upstream / exclusive range boundary: branch, tag or commit",
+                "Upstream / range boundary (or --root)",
                 Some("Optional --onto target (blank uses the upstream common ancestor)"),
                 "Build plan",
             ),
@@ -358,7 +358,7 @@ impl GitBuddy {
             );
         }
         if matches!(modal, Modal::RebaseSetup) {
-            card=card.child(div().text_xs().text_color(rgb(MUTED)).child("The chosen upstream becomes the new base. To edit / squash the last N commits on this branch, use HEAD~N. Start with a clean working tree; merge commits in the range are rejected."));
+            card=card.child(div().text_xs().text_color(rgb(MUTED)).child("Use --root with an explicit --onto target to replay a linear history including its root. Start with a clean working tree; merge commits in the range are rejected."));
         }
         if matches!(modal, Modal::MergeTool) {
             card=card.child(div().text_xs().text_color(rgb(MUTED)).child("Uses temporary copies. Close the tool to import its output as an unsaved draft; review and save separately. Git mergetool.cmd shell configuration is not executed."))
@@ -465,6 +465,20 @@ impl GitBuddy {
                 }
             }
             Modal::CommitActions(id) => {
+                let merge_id = id.clone();
+                let merge_parents = self
+                    .snapshot
+                    .commits
+                    .iter()
+                    .chain(
+                        self.active
+                            .history_search
+                            .iter()
+                            .flat_map(|r| r.commits.iter()),
+                    )
+                    .find(|c| c.id == id)
+                    .map(|c| c.parents.clone())
+                    .unwrap_or_default();
                 let tag_target = id.clone();
                 card = card.child(
                     self.button("tag-at-commit", "Create tag at this commit…")
@@ -576,6 +590,7 @@ impl GitBuddy {
                         )
                         .child(
                             self.button("cherry-pick", "Cherry-pick into current branch…")
+                                .disabled(merge_parents.len() > 1)
                                 .on_click(cx.listener(move |this, _, w, cx| {
                                     this.show_modal(
                                         Modal::Confirm(
@@ -587,18 +602,20 @@ impl GitBuddy {
                                     )
                                 })),
                         )
-                        .child(self.button("revert", "Revert with a new commit…").on_click(
-                            cx.listener(move |this, _, w, cx| {
-                                this.show_modal(
-                                    Modal::Confirm(
-                                        "Create a new commit that reverses this commit?".into(),
-                                        Operation::Revert(revert.clone()),
-                                    ),
-                                    w,
-                                    cx,
-                                )
-                            }),
-                        ))
+                        .child(
+                            self.button("revert", "Revert with a new commit…")
+                                .disabled(merge_parents.len() > 1)
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    this.show_modal(
+                                        Modal::Confirm(
+                                            "Create a new commit that reverses this commit?".into(),
+                                            Operation::Revert(revert.clone()),
+                                        ),
+                                        w,
+                                        cx,
+                                    )
+                                })),
+                        )
                         .child(self.button("abort-cherry", "Abort cherry-pick…").on_click(
                             cx.listener(|this, _, w, cx| {
                                 this.show_modal(
@@ -636,6 +653,25 @@ impl GitBuddy {
                                     )
                                 })),
                         );
+                if merge_parents.len() > 1 {
+                    card = card.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Merge commit: choose the parent whose tree is the baseline."),
+                    );
+                    for (index, parent) in merge_parents.iter().enumerate() {
+                        let mainline = (index + 1) as u32;
+                        let short = parent.chars().take(10).collect::<String>();
+                        let cherry_id = merge_id.clone();
+                        let revert_id = merge_id.clone();
+                        card = card.child(h_flex().gap_1()
+                            .child(self.button(("cherry-mainline", index), format!("Cherry-pick · parent {mainline} ({short})…"))
+                                .on_click(cx.listener(move |this, _, w, cx| this.show_modal(Modal::Confirm(format!("Cherry-pick this merge using parent {mainline} as the baseline?"), Operation::CherryPickMerge { id: cherry_id.clone(), mainline }), w, cx))))
+                            .child(self.button(("revert-mainline", index), format!("Revert · parent {mainline}…"))
+                                .on_click(cx.listener(move |this, _, w, cx| this.show_modal(Modal::Confirm(format!("Revert this merge relative to parent {mainline}?"), Operation::RevertMerge { id: revert_id.clone(), mainline }), w, cx)))));
+                    }
+                }
             }
             Modal::TagActions(name) => {
                 let revision = format!("refs/tags/{name}");

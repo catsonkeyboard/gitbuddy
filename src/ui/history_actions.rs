@@ -36,6 +36,46 @@ impl CommitSelection {
     }
 }
 impl GitBuddy {
+    fn preview_batch(&mut self, mut ids: Vec<String>, revert: bool, cx: &mut Context<Self>) {
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        if !revert {
+            ids.reverse();
+        } // Revert newer commits before older ones.
+        let summary = ids
+            .iter()
+            .map(|id| id.chars().take(10).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" → ");
+        self.modal = None;
+        self.history_generation += 1;
+        let generation = self.history_generation;
+        let tab = self.active.id;
+        let task = cx.background_executor().spawn(async move {
+            if revert {
+                repo.prepare_revert_batch(&ids)
+            } else {
+                repo.prepare_cherry_batch(&ids)
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.active.id != tab || this.history_generation != generation || this.modal.is_some() { return; }
+                match result {
+                    Ok(plan) => {
+                        let label = if revert { "Revert" } else { "Cherry-pick" };
+                        let op = if revert { Operation::RevertBatch(Arc::new(plan)) } else { Operation::CherryPickBatch(Arc::new(plan)) };
+                        this.modal = Some(Modal::Confirm(format!("{label} these commits in this order?\n\n{summary}\n\nThe batch uses the recoverable rebase progress screen. It requires a clean working tree and supports single-parent commits."), op));
+                    },
+                    Err(error) => { this.active.notice = format!("Cannot prepare batch: {error:#}"); this.active.error = true; }
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
     pub(super) fn select_commit(
         &mut self,
         id: String,
@@ -181,9 +221,13 @@ impl GitBuddy {
             }
             Modal::CommitSelection => {
                 // Use displayed history order rather than lexicographic object IDs.
-                let ids: Vec<_> = self
-                    .snapshot
-                    .commits
+                let source = self
+                    .active
+                    .history_search
+                    .as_ref()
+                    .map(|s| &s.commits)
+                    .unwrap_or(&self.snapshot.commits);
+                let ids: Vec<_> = source
                     .iter()
                     .filter(|c| self.commit_selection.ids.contains(&c.id))
                     .map(|c| c.id.clone())
@@ -214,6 +258,22 @@ impl GitBuddy {
                                     cx,
                                 );
                             }
+                        })),
+                );
+                let batch = ids.clone();
+                card = card.child(
+                    self.button("cherry-pick-selected", "Cherry-pick selected commits…")
+                        .disabled(batch.is_empty() || !complete)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.preview_batch(batch.clone(), false, cx)
+                        })),
+                );
+                let batch = ids.clone();
+                card = card.child(
+                    self.button("revert-selected", "Revert selected commits…")
+                        .disabled(batch.is_empty() || !complete)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.preview_batch(batch.clone(), true, cx)
                         })),
                 );
                 for action in [
