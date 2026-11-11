@@ -282,6 +282,79 @@ fn clone_leaves_existing_destination_empty_when_target_cannot_be_encoded() {
 }
 
 #[test]
+fn encoded_submodule_remote_update_leaves_parent_gitlink_unchanged() {
+    let (directory, source, target) = setup();
+    git(&source.root, &["checkout", "-qb", "plain"]);
+    fs::remove_file(source.root.join(".gitattributes")).unwrap();
+    fs::write(source.root.join("file.txt"), BASE).unwrap();
+    git(&source.root, &["add", "."]);
+    git(&source.root, &["commit", "-qm", "plain"]);
+    let parent = Repository::init(&directory.path().join("parent")).unwrap();
+    let raw = git2::Repository::open(&parent.root).unwrap();
+    let mut config = raw.config().unwrap();
+    config.set_bool("commit.gpgsign", false).unwrap();
+    config.set_str("core.hooksPath", "/dev/null").unwrap();
+    config.set_str("core.attributesfile", "").unwrap();
+    parent
+        .execute(Operation::SetIdentity(
+            "Fixture".into(),
+            "fixture@example.invalid".into(),
+        ))
+        .unwrap();
+    fs::write(parent.root.join("README"), "root\n").unwrap();
+    parent.execute(Operation::StageAll).unwrap();
+    parent.execute(Operation::Commit("root".into())).unwrap();
+    parent
+        .execute(Operation::AddSubmodule {
+            url: source.root.to_str().unwrap().to_owned(),
+            path: "module".into(),
+        })
+        .unwrap();
+    parent
+        .execute(Operation::Commit("add module".into()))
+        .unwrap();
+    let previous = parent.submodules().unwrap().remove(0);
+    parent
+        .execute(Operation::UpdateSubmoduleRemote {
+            expected: previous.clone(),
+            branch: "target".into(),
+        })
+        .unwrap();
+    let after = parent.submodules().unwrap().remove(0);
+    assert_eq!(after.index, previous.index);
+    assert_eq!(after.workdir.as_deref(), Some(target.as_str()));
+    let child = Repository::open(parent.root.join("module")).unwrap();
+    assert_eq!(
+        fs::read(child.root.join("file.txt")).unwrap(),
+        encoded(TARGET, false)
+    );
+    assert!(child.snapshot(5).unwrap().files.is_empty());
+}
+
+#[test]
+fn linked_worktree_initialization_uses_its_selected_branch_encoding() {
+    let (directory, repo, target) = setup();
+    let path = directory.path().join("linked");
+    repo.execute(Operation::CreateWorktreeAt {
+        source: "target".into(),
+        path: path.clone(),
+        detached: false,
+    })
+    .unwrap();
+    let linked = Repository::open(&path).unwrap();
+    assert_eq!(linked.resolve_revision("HEAD").unwrap().id, target);
+    assert_eq!(
+        fs::read(path.join("file.txt")).unwrap(),
+        encoded(TARGET, false)
+    );
+    assert_eq!(
+        fs::read(repo.root.join("file.txt")).unwrap(),
+        encoded(BASE, true)
+    );
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
 fn encoded_submodule_initialization_and_recorded_gitlink_update_are_canonical() {
     let (directory, source, target) = setup();
     let parent = Repository::init(&directory.path().join("parent")).unwrap();

@@ -134,6 +134,19 @@ pub enum Operation {
         name: String,
         path: PathBuf,
     },
+    CreateWorktreeAt {
+        source: String,
+        path: PathBuf,
+        detached: bool,
+    },
+    MoveWorktree {
+        expected: WorktreeInfo,
+        path: PathBuf,
+    },
+    RepairWorktree {
+        name: String,
+        path: PathBuf,
+    },
     LockWorktree {
         name: String,
         locked: bool,
@@ -152,6 +165,14 @@ pub enum Operation {
     StageSubmodule(String),
     UpdateSubmoduleAt(SubmoduleInfo),
     StageSubmoduleAt(SubmoduleInfo),
+    UpdateSubmoduleRemote {
+        expected: SubmoduleInfo,
+        branch: String,
+    },
+    DeinitSubmodule {
+        expected: SubmoduleInfo,
+        remove: bool,
+    },
     LfsTrack {
         pattern: String,
         track: bool,
@@ -445,6 +466,7 @@ impl Operation {
                 | Self::LfsPush(_)
                 | Self::PrepareWorktree(_)
                 | Self::UpdateSubmoduleAt(_)
+                | Self::UpdateSubmoduleRemote { .. }
                 | Self::LfsLock { .. }
                 | Self::LfsUnlock { .. }
                 | Self::LfsQuarantine(_)

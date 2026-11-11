@@ -750,6 +750,118 @@ fn lfs_stash_requires_staging_and_hydrates_restored_working_files() {
 }
 
 #[test]
+fn worktree_can_reuse_a_branch_or_detach_at_an_arbitrary_commit() {
+    let (dir, repo) = setup();
+    let (base, _, _) = history(&repo);
+    let r = raw(&repo);
+    r.branch(
+        "existing/topic",
+        &r.find_commit(base.parse().unwrap()).unwrap(),
+        false,
+    )
+    .unwrap();
+    let existing = dir.path().join("existing-tree");
+    repo.execute(Operation::CreateWorktreeAt {
+        source: "existing/topic".into(),
+        path: existing.clone(),
+        detached: false,
+    })
+    .unwrap();
+    assert_eq!(
+        git2::Repository::open(existing)
+            .unwrap()
+            .head()
+            .unwrap()
+            .name()
+            .unwrap(),
+        "refs/heads/existing/topic"
+    );
+    assert!(
+        repo.execute(Operation::CreateWorktreeAt {
+            source: "existing/topic".into(),
+            path: dir.path().join("duplicate"),
+            detached: false
+        })
+        .is_err()
+    );
+    let detached = dir.path().join("detached-tree");
+    repo.execute(Operation::CreateWorktreeAt {
+        source: base.clone(),
+        path: detached.clone(),
+        detached: true,
+    })
+    .unwrap();
+    let d = git2::Repository::open(detached).unwrap();
+    assert!(d.head_detached().unwrap());
+    assert_eq!(d.head().unwrap().target().unwrap().to_string(), base);
+    assert!(r.branches(None).unwrap().all(|b| {
+        !b.unwrap()
+            .0
+            .name()
+            .unwrap()
+            .unwrap()
+            .starts_with("gitbuddy-worktree-")
+    }));
+}
+
+#[test]
+fn worktree_move_and_external_move_repair_preserve_history_and_files() {
+    let (dir, repo) = setup();
+    history(&repo);
+    let old = dir.path().join("tree");
+    repo.execute(Operation::CreateWorktree {
+        name: "moving".into(),
+        path: old.clone(),
+    })
+    .unwrap();
+    let before = git2::Repository::open(&old)
+        .unwrap()
+        .head()
+        .unwrap()
+        .target();
+    let tree = repo
+        .worktrees()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "moving")
+        .unwrap();
+    let new = dir.path().join("moved");
+    repo.execute(Operation::MoveWorktree {
+        expected: tree,
+        path: new.clone(),
+    })
+    .unwrap();
+    assert!(!old.exists());
+    assert_eq!(
+        git2::Repository::open(&new)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target(),
+        before
+    );
+    let external = dir.path().join("external");
+    std::fs::rename(&new, &external).unwrap();
+    repo.execute(Operation::RepairWorktree {
+        name: "moving".into(),
+        path: external.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        repo.worktrees().unwrap()[0].path.canonicalize().unwrap(),
+        external.canonicalize().unwrap()
+    );
+    let elsewhere = dir.path().join("other");
+    assert!(
+        repo.execute(Operation::RepairWorktree {
+            name: "moving".into(),
+            path: elsewhere
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn custom_lfs_storage_supports_relative_and_absolute_paths() {
     for absolute in [false, true] {
         let (dir, repo) = setup();
@@ -790,4 +902,54 @@ fn custom_lfs_storage_supports_relative_and_absolute_paths() {
         );
         assert!(!r.commondir().join("lfs/objects").exists());
     }
+}
+
+#[test]
+fn moving_a_worktree_with_a_relative_git_link_remains_openable() {
+    use std::fs;
+    let (dir, repo) = setup();
+    history(&repo);
+    let old = dir.path().join("linked");
+    repo.execute(Operation::CreateWorktree {
+        name: "relative".into(),
+        path: old.clone(),
+    })
+    .unwrap();
+    let r = raw(&repo);
+    let admin = r
+        .commondir()
+        .join("worktrees/relative")
+        .canonicalize()
+        .unwrap();
+    let parent_name = repo.root.file_name().unwrap().to_str().unwrap();
+    fs::write(
+        old.join(".git"),
+        format!("gitdir: ../{parent_name}/.git/worktrees/relative\n"),
+    )
+    .unwrap();
+    assert!(git2::Repository::open(&old).is_ok());
+    let destination_parent = dir.path().join("deep");
+    fs::create_dir(&destination_parent).unwrap();
+    let destination = destination_parent.join("moved");
+    let expected = repo
+        .worktrees()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "relative")
+        .unwrap();
+    repo.execute(Operation::MoveWorktree {
+        expected,
+        path: destination.clone(),
+    })
+    .unwrap();
+    let moved = git2::Repository::open(&destination).unwrap();
+    assert_eq!(moved.path().canonicalize().unwrap(), admin);
+    assert!(
+        repo.worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "relative")
+            .unwrap()
+            .valid
+    );
 }

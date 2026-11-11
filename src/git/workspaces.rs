@@ -6,6 +6,8 @@ use git2::{
     WorktreeLockStatus, WorktreePruneOptions, build::CheckoutBuilder,
 };
 use std::path::{Component, Path, PathBuf};
+#[path = "workspaces/move_tree.rs"]
+mod move_tree;
 #[path = "workspaces/submodule_manage.rs"]
 mod submodule_manage;
 
@@ -127,6 +129,77 @@ fn clean_for_removal(repo: &git2::Repository, depth: usize) -> Result<()> {
 }
 
 impl Repository {
+    pub(super) fn create_worktree_at(
+        &self,
+        source: &str,
+        path: &Path,
+        detached: bool,
+    ) -> Result<String> {
+        let repo = raw(self)?;
+        ensure!(!super::rebase::active(&repo), "Finish rebase first");
+        ensure!(
+            path.is_absolute() && !path.exists(),
+            "Choose a new absolute destination"
+        );
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("Choose a UTF-8 worktree directory name")?;
+        ensure!(
+            git2::Branch::name_is_valid(name)? && !name.starts_with('.'),
+            "Invalid worktree name"
+        );
+        let temporary = format!(
+            "gitbuddy-worktree-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let branch = if detached {
+            let commit = repo.revparse_single(source.trim())?.peel_to_commit()?;
+            repo.branch(&temporary, &commit, false)?
+        } else {
+            let name = source
+                .trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or(source.trim());
+            let branch = repo.find_branch(name, git2::BranchType::Local)?;
+            branch_available(&repo, branch.get().name()?)?;
+            ensure!(!branch.is_head(), "This branch is already checked out here");
+            branch
+        };
+        let mut options = WorktreeAddOptions::new();
+        options.reference(Some(branch.get()));
+        let result = repo.worktree(name, path, Some(&options));
+        if result.is_err() && detached && !path.exists() {
+            let _ = repo
+                .find_branch(&temporary, git2::BranchType::Local)
+                .and_then(|mut b| b.delete());
+        }
+        result.with_context(|| {
+            format!(
+                "Worktree creation failed; inspect {} before retrying",
+                path.display()
+            )
+        })?;
+        let child = git2::Repository::open(path)?;
+        if detached {
+            let id = child.head()?.peel_to_commit()?.id();
+            child.set_head_detached(id)?;
+            repo.find_branch(&temporary, git2::BranchType::Local)?
+                .delete()?;
+        }
+        super::worktree_conversion::initialize_worktree(&child, &NetworkControl::default())
+            .with_context(|| {
+                format!(
+                    "Worktree was created at {}; open it to inspect the checkout",
+                    path.display()
+                )
+            })?;
+        let missing = super::lfs::hydrate(&child)?;
+        Ok(format!(
+            "Created worktree {}; {missing} LFS objects need fetching",
+            path.display()
+        ))
+    }
     pub fn worktrees(&self) -> Result<Vec<WorktreeInfo>> {
         let repo = raw(self)?;
         let mut trees = Vec::new();
@@ -277,6 +350,84 @@ impl Repository {
     pub(super) fn stage_submodule_at(&self, expected: &SubmoduleInfo) -> Result<String> {
         self.checked_submodule_parent(expected)?
             .stage_submodule(&expected.name)
+    }
+    pub(super) fn update_submodule_remote(
+        &self,
+        expected: &SubmoduleInfo,
+        branch: &str,
+        control: NetworkControl,
+    ) -> Result<String> {
+        let parent = self.checked_submodule_parent(expected)?;
+        let parent_raw = raw(&parent)?;
+        let module = parent_raw.find_submodule(&expected.name)?;
+        let child =
+            checked_child(&parent_raw, &module)?.context("Initialize the submodule first")?;
+        clean_for_removal(&child, 0)?;
+        let previous = super::recovery::head_state(&child)?;
+        ensure!(
+            previous.id == expected.workdir,
+            "Submodule HEAD changed; refresh first"
+        );
+        let child_repo =
+            Repository::open(child.workdir().context("No submodule working directory")?)?;
+        let origin = child_repo
+            .remote_info()?
+            .into_iter()
+            .find(|r| r.name == "origin")
+            .context("Submodule needs an origin remote")?;
+        let fetch = child_repo.prepare_fetch(&origin, Some(branch))?;
+        let tracking = fetch
+            .tracking
+            .clone()
+            .context("Selected branch has no remote-tracking mapping")?;
+        child_repo.execute_with_control(
+            super::Operation::FetchFrom(std::sync::Arc::new(fetch)),
+            control.clone(),
+        )?;
+        let child = raw(&child_repo)?;
+        let _child_writer = WriterLock::acquire(&child)?;
+        clean_for_removal(&child, 0)?;
+        ensure!(
+            super::recovery::head_state(&child)? == previous,
+            "Submodule HEAD changed during fetch"
+        );
+        let parent_index = parent_raw.index()?;
+        let _parent_index_lock = super::conflicts::IndexLock::acquire(
+            parent_index.path().context("Missing parent index")?,
+        )?;
+        self.checked_submodule_parent(expected)?;
+        let commit = child.find_reference(&tracking)?.peel_to_commit()?;
+        control.cancellation.finish()?;
+        let mut refs = child.transaction()?;
+        refs.lock_ref("HEAD")?;
+        refs.lock_ref(&tracking)?;
+        if previous.reference != "HEAD" && previous.reference != tracking {
+            refs.lock_ref(&previous.reference)?;
+        }
+        ensure!(
+            super::recovery::head_state(&child)? == previous
+                && child.find_reference(&tracking)?.peel_to_commit()?.id() == commit.id(),
+            "Submodule checkout target changed; refresh first"
+        );
+        let receipt = super::worktree_conversion::checkout_tree(
+            &child,
+            commit.as_object(),
+            super::CheckoutOptions {
+                publication: Some(super::CheckoutHead {
+                    reference: None,
+                    id: commit.id(),
+                }),
+                ..Default::default()
+            },
+            &control,
+        )?;
+        refs.set_target("HEAD", commit.id(), None, "checkout: update submodule")?;
+        refs.commit()?;
+        let missing = super::worktree_conversion::acknowledge_checkout(&child, &receipt)?;
+        Ok(format!(
+            "Submodule checked out at {}; stage its gitlink in the parent when ready; {missing} LFS objects need fetching",
+            commit.id()
+        ))
     }
     fn checked_submodule_parent(&self, expected: &SubmoduleInfo) -> Result<Repository> {
         let current = self

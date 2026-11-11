@@ -1231,6 +1231,13 @@ impl Repository {
                 Operation::CommitRebase(message) => self.commit_rebase(&message),
                 Operation::AbortRebase => self.abort_rebase(),
                 Operation::CreateWorktree { name, path } => self.create_worktree(&name, &path),
+                Operation::CreateWorktreeAt {
+                    source,
+                    path,
+                    detached,
+                } => self.create_worktree_at(&source, &path, detached),
+                Operation::MoveWorktree { expected, path } => self.move_worktree(&expected, &path),
+                Operation::RepairWorktree { name, path } => self.repair_worktree(&name, &path),
                 Operation::LockWorktree { name, locked } => self.lock_worktree(&name, locked),
                 Operation::RemoveWorktree(expected) => self.remove_worktree(&expected),
                 Operation::PrepareWorktree(expected) => {
@@ -1248,6 +1255,12 @@ impl Repository {
                     self.update_submodule_at(&expected, control.clone())
                 }
                 Operation::StageSubmoduleAt(expected) => self.stage_submodule_at(&expected),
+                Operation::UpdateSubmoduleRemote { expected, branch } => {
+                    self.update_submodule_remote(&expected, &branch, control.clone())
+                }
+                Operation::DeinitSubmodule { expected, remove } => {
+                    self.deinit_submodule(&expected, remove)
+                }
                 Operation::LfsTrack { pattern, track } => self.lfs_track(&pattern, track),
                 Operation::LfsCheckout => self.lfs_checkout(),
                 Operation::SetLfsAutoFetch(enabled) => {

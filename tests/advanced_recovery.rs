@@ -528,3 +528,172 @@ fn submodule_updates_expand_local_lfs_objects_and_report_missing_cache() {
     );
     assert!(child.snapshot(10).unwrap().files.is_empty());
 }
+
+#[test]
+fn submodule_remote_branch_update_preserves_parent_gitlink_and_refuses_dirty_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = init(&dir.path().join("source"));
+    write(&source, "file", "one");
+    let first = commit(&source, "one");
+    let parent = init(&dir.path().join("parent"));
+    write(&parent, "base", "base");
+    commit(&parent, "base");
+    parent
+        .execute(Operation::AddSubmodule {
+            url: source.root.to_string_lossy().into_owned(),
+            path: "child".into(),
+        })
+        .unwrap();
+    commit(&parent, "module");
+    write(&source, "file", "two");
+    let second = commit(&source, "two");
+    let expected = parent.submodules_recursive().unwrap().remove(0);
+    parent
+        .execute(Operation::UpdateSubmoduleRemote {
+            expected,
+            branch: "main".into(),
+        })
+        .unwrap();
+    let module = parent.submodules_recursive().unwrap().remove(0);
+    assert_eq!(module.index.as_deref(), Some(first.as_str()));
+    assert_eq!(module.workdir.as_deref(), Some(second.as_str()));
+    fs::write(parent.root.join("child/file"), "dirty").unwrap();
+    assert!(
+        parent
+            .execute(Operation::UpdateSubmoduleRemote {
+                expected: module,
+                branch: "main".into()
+            })
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(parent.root.join("child/file")).unwrap(),
+        "dirty"
+    );
+}
+
+#[test]
+fn submodule_deinit_and_remove_keep_recovery_copy_and_reject_dirty_files() {
+    for remove in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = init(&dir.path().join("source"));
+        write(&source, "file", "source");
+        commit(&source, "source");
+        let parent = init(&dir.path().join("parent"));
+        write(&parent, "base", "base");
+        commit(&parent, "base");
+        parent
+            .execute(Operation::AddSubmodule {
+                url: source.root.to_string_lossy().into_owned(),
+                path: "child".into(),
+            })
+            .unwrap();
+        commit(&parent, "add module");
+        let expected = parent.submodules_recursive().unwrap().remove(0);
+        fs::write(parent.root.join("child/file"), "dirty").unwrap();
+        assert!(
+            parent
+                .execute(Operation::DeinitSubmodule {
+                    expected: expected.clone(),
+                    remove
+                })
+                .is_err()
+        );
+        fs::write(parent.root.join("child/file"), "source").unwrap();
+        parent
+            .execute(Operation::DeinitSubmodule { expected, remove })
+            .unwrap();
+        assert!(!parent.root.join("child/file").exists());
+        let r = raw(&parent);
+        let backups = r.path().join("gitbuddy-submodule-backups");
+        let backup = fs::read_dir(backups)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read_to_string(backup.join("worktree/file")).unwrap(),
+            "source"
+        );
+        assert_eq!(
+            r.index()
+                .unwrap()
+                .get_path(std::path::Path::new("child"), 0)
+                .is_none(),
+            remove
+        );
+        if remove {
+            parent
+                .execute(Operation::Commit("remove submodule".into()))
+                .unwrap();
+            assert!(parent.submodules().unwrap().is_empty());
+        } else {
+            let expected = parent.submodules_recursive().unwrap().remove(0);
+            parent
+                .execute(Operation::UpdateSubmoduleAt(expected))
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(parent.root.join("child/file")).unwrap(),
+                "source"
+            );
+        }
+    }
+}
+
+#[test]
+fn removing_one_submodule_preserves_a_dotted_name_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = init(&dir.path().join("source"));
+    write(&source, "file", "source");
+    commit(&source, "source");
+    let parent = init(&dir.path().join("parent"));
+    write(&parent, "base", "base");
+    commit(&parent, "base");
+    for path in ["foo", "foo.bar"] {
+        parent
+            .execute(Operation::AddSubmodule {
+                url: source.root.to_string_lossy().into_owned(),
+                path: path.into(),
+            })
+            .unwrap();
+        commit(&parent, "add module");
+    }
+    let r = raw(&parent);
+    let before = r
+        .index()
+        .unwrap()
+        .get_path(std::path::Path::new("foo.bar"), 0)
+        .unwrap()
+        .id;
+    let module = parent
+        .submodules_recursive()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.name == "foo")
+        .unwrap();
+    parent
+        .execute(Operation::DeinitSubmodule {
+            expected: module,
+            remove: true,
+        })
+        .unwrap();
+    let cfg = git2::Config::open(&parent.root.join(".gitmodules")).unwrap();
+    assert_eq!(cfg.get_string("submodule.foo.bar.path").unwrap(), "foo.bar");
+    assert_eq!(
+        cfg.get_string("submodule.foo.bar.url").unwrap(),
+        source.root.to_string_lossy()
+    );
+    assert_eq!(
+        r.index()
+            .unwrap()
+            .get_path(std::path::Path::new("foo.bar"), 0)
+            .unwrap()
+            .id,
+        before
+    );
+    assert_eq!(
+        fs::read_to_string(parent.root.join("foo.bar/file")).unwrap(),
+        "source"
+    );
+}
