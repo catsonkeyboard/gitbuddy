@@ -83,7 +83,63 @@ impl RepoTab {
 }
 
 impl GitBuddy {
-    fn search_all_history(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn go_to_commit(&mut self, revision: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.active.repo.clone() else {
+            return;
+        };
+        self.navigation_generation += 1;
+        if revision.is_empty() {
+            self.modal_error = Some("Enter a branch, tag or commit ID.".into());
+            cx.notify();
+            return;
+        }
+        let generation = self.navigation_generation;
+        let selection = self.selection_generation;
+        let tab = self.active.id;
+        self.modal_error = None;
+        let task = cx
+            .background_executor()
+            .spawn(async move { repo.resolve_revision(&revision) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.active.id != tab
+                    || this.navigation_generation != generation
+                    || this.selection_generation != selection
+                    || !matches!(this.modal, Some(Modal::GoToCommit))
+                    || this.busy()
+                {
+                    return;
+                }
+                match result {
+                    Ok(revision) => {
+                        this.modal = None;
+                        this.tab_focus = true;
+                        this.open_pinned_commit(revision.id, cx);
+                    }
+                    Err(error) => this.modal_error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn open_pinned_commit(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.busy() || self.modal.is_some() {
+            return;
+        }
+        self.active.commit_selection = history_actions::CommitSelection::default();
+        self.select(Selection::Commit(id), cx);
+        cx.notify();
+    }
+
+    fn search_all_history(
+        &mut self,
+        cursor: Option<Arc<git::HistorySearchCursor>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.active.repo.clone() else {
             return;
         };
@@ -99,9 +155,14 @@ impl GitBuddy {
         self.active.history_search_generation += 1;
         let generation = self.active.history_search_generation;
         let tab_id = self.active.id;
-        let task = cx
-            .background_executor()
-            .spawn(async move { repo.search_history(&query, &token) });
+        let next_page = cursor.is_some();
+        let task = cx.background_executor().spawn(async move {
+            if let Some(cursor) = cursor {
+                repo.search_history_next(&cursor, &token)
+            } else {
+                repo.search_history(&query, &token)
+            }
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -114,6 +175,16 @@ impl GitBuddy {
                 tab.history_search_cancel = None;
                 match result {
                     Ok(result) => {
+                        if next_page {
+                            if let Some(previous) = tab.history_search.clone() {
+                                if tab.history_search_previous.len() >= 10 {
+                                    tab.history_search_previous.remove(0);
+                                }
+                                tab.history_search_previous.push(previous);
+                            }
+                        } else {
+                            tab.history_search_previous.clear();
+                        }
                         tab.history_search = Some(Arc::new(result));
                         tab.error = false;
                     }
@@ -132,7 +203,7 @@ impl GitBuddy {
     pub(super) fn history(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let projection = self.active.projection();
         v_flex()
-            .w(px(340.))
+            .w(px(self.settings.preferences.history_width as f32))
             .min_w(px(270.))
             .h_full()
             .bg(rgb(PANEL))
@@ -199,7 +270,7 @@ impl GitBuddy {
                                 this.active.history_search_generation += 1;
                                 cx.notify();
                             } else {
-                                this.search_all_history(cx);
+                                this.search_all_history(None,cx);
                             }
                         })),
                     ),
@@ -216,6 +287,14 @@ impl GitBuddy {
                     }
                 )))
             })
+            .when(self.active.history_search.is_some(), |col| col.child(h_flex().px_2().gap_1()
+                .child(self.button("search-previous-page","Previous results").ghost().disabled(self.active.history_search_previous.is_empty()||self.active.history_search_cancel.is_some()).on_click(cx.listener(|this,_,_,cx|{
+                    if let Some(page)=this.active.history_search_previous.pop(){this.active.history_search=Some(page);this.active.history_projection.borrow_mut().take();cx.notify();}
+                })))
+                .child(self.button("search-next-page","Next results").ghost().disabled(self.active.history_search.as_ref().is_none_or(|s|s.next.is_none())||self.active.history_search_cancel.is_some()).on_click(cx.listener(|this,_,_,cx|{
+                    let cursor=this.active.history_search.as_ref().and_then(|s|s.next.clone());if cursor.is_some(){this.search_all_history(cursor,cx);}
+                }))))
+            )
             .when(self.history_tab == 0 && self.active.history_search.is_none(), |col| col.child(div().px_2().text_size(px(10.)).text_color(rgb(MUTED)).child("Search history supports author:, path:, ref:, after: and before: (YYYY-MM-DD).")))
             .child(
                 div()

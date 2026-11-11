@@ -1,6 +1,58 @@
 use super::*;
+#[derive(Clone)]
+struct DragRepository {
+    id: tasks::TabId,
+    label: String,
+}
+impl Render for DragRepository {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_1()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .text_color(rgb(TEXT))
+            .child(self.label.clone())
+    }
+}
 
 impl GitBuddy {
+    fn reorder_repository(
+        &mut self,
+        source: tasks::TabId,
+        target: tasks::TabId,
+        cx: &mut Context<Self>,
+    ) {
+        if source == target {
+            return;
+        }
+        let id_at = |index: usize| {
+            if self.active_index == Some(index) {
+                Some(self.active.id)
+            } else {
+                self.tabs[index].as_ref().map(|t| t.id)
+            }
+        };
+        let from = (0..self.tabs.len()).find(|&i| id_at(i) == Some(source));
+        let to = (0..self.tabs.len()).find(|&i| id_at(i) == Some(target));
+        let (Some(from), Some(to)) = (from, to) else {
+            return;
+        };
+        let active = self.active.id;
+        self.save_active_tab(cx);
+        self.active_index = None;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|t| t.as_ref().is_some_and(|t| t.id == active))
+        {
+            self.activate_tab(index, cx);
+        }
+        cx.notify();
+    }
     pub(super) fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self
             .repo
@@ -66,6 +118,16 @@ impl GitBuddy {
                             )
                             .separator()
                             .menu_with_icon(
+                                "Command palette…",
+                                IconName::Search,
+                                Box::new(CommandPalette),
+                            )
+                            .menu_with_icon(
+                                "Reopen closed repository",
+                                IconName::RotateCw,
+                                Box::new(ReopenTab),
+                            )
+                            .menu_with_icon(
                                 "Preferences / Shortcuts…",
                                 IconName::Settings,
                                 Box::new(OpenPreferences),
@@ -121,6 +183,12 @@ impl GitBuddy {
                                 busy || !has_head,
                             )
                             .menu_with_icon_and_disabled(
+                                "Go to commit…",
+                                IconName::ArrowLeft,
+                                Box::new(GoToCommit),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
                                 "Checkout commit / tag…",
                                 IconName::ArrowLeft,
                                 Box::new(CheckoutRevision),
@@ -168,6 +236,18 @@ impl GitBuddy {
                                 "Git LFS…",
                                 IconName::FileText,
                                 Box::new(OpenLfs),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "LFS migration recovery…",
+                                IconName::FileText,
+                                Box::new(RecoverLfsMigration),
+                                busy || !has_repo,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Checkout recovery…",
+                                IconName::FileText,
+                                Box::new(RecoverCheckout),
                                 busy || !has_repo,
                             )
                             .separator()
@@ -313,6 +393,15 @@ impl GitBuddy {
                             (self.active_index == Some(index)).then_some(&self.active)
                         })?;
                         let active = self.active_index == Some(index);
+                        let drag = DragRepository {
+                            id: tab.id,
+                            label: tab
+                                .repo
+                                .as_ref()
+                                .map(|r| r.root.display().to_string())
+                                .unwrap_or_default(),
+                        };
+                        let target = tab.id;
                         let name = tab
                             .repo
                             .as_ref()
@@ -331,6 +420,11 @@ impl GitBuddy {
                             .unwrap_or_default();
                         Some(
                             h_flex()
+                                .id(("repo-tab-drop", index))
+                                .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                                .on_drop(cx.listener(move |this, drag: &DragRepository, _, cx| {
+                                    this.reorder_repository(drag.id, target, cx)
+                                }))
                                 .h_full()
                                 .min_w(px(120.))
                                 .max_w(px(220.))

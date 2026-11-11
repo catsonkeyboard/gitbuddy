@@ -50,7 +50,7 @@ impl GitBuddy {
         let projection = self.active.projection();
         let count = projection.sidebar.len();
         v_flex()
-            .w(px(180.))
+            .w(px(self.settings.preferences.sidebar_width as f32))
             .h_full()
             .flex_shrink_0()
             .bg(rgb(BG))

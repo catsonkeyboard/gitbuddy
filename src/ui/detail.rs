@@ -65,9 +65,62 @@ impl GitBuddy {
             } else if matches!(self.selection, Selection::Work) {
                 self.summary(cx).into_any_element()
             } else if matches!(self.selection, Selection::Commit(_)) {
-                self.commit_files_view(cx)
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.commit_navigation(cx))
+                    .child(self.commit_files_view(cx))
+                    .into_any_element()
             } else {
                 self.diff_view(cx).into_any_element()
+            })
+    }
+    fn commit_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .px_3()
+            .py_1()
+            .gap_1()
+            .flex_shrink_0()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .when_some(self.commit_detail.as_ref(), |col, detail| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .font_family("Menlo")
+                        .text_color(rgb(MUTED))
+                        .child(detail.id.clone()),
+                )
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .when(detail.parents.is_empty(), |row| {
+                            row.child(div().text_xs().text_color(rgb(MUTED)).child("Root commit"))
+                        })
+                        .children(detail.parents.iter().enumerate().map(|(index, parent)| {
+                            let id = parent.clone();
+                            self.button(
+                                ("commit-parent", index),
+                                format!(
+                                    "Parent {} · {}",
+                                    index + 1,
+                                    parent.chars().take(10).collect::<String>()
+                                ),
+                            )
+                            .ghost()
+                            .disabled(self.busy())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.open_pinned_commit(id.clone(), cx),
+                            ))
+                        })),
+                )
+                .when(detail.parents.len() > 1, |col| {
+                    col.child(div().text_xs().text_color(rgb(MUTED)).child(
+                        "Changed files compare against parent 1. Open any parent to inspect it.",
+                    ))
+                })
             })
     }
     fn summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -75,6 +128,11 @@ impl GitBuddy {
         v_flex()
             .flex_1()
             .min_h_0()
+            .when(self.snapshot.worktree_recovery, |col| {
+                col.child(h_flex().px_3().py_2().gap_2().bg(rgb(0x51432d))
+                    .child(div().flex_1().text_sm().child("An interrupted checkout needs recovery before repository writes can continue."))
+                    .child(self.button("recover-checkout-banner", "Recover…").on_click(cx.listener(|this, _, w, cx| this.open_management(Modal::CheckoutRecovery, w, cx)))))
+            })
             .when(self.snapshot.patch_recovery, |col| {
                 col.child(h_flex().px_3().py_2().gap_2().bg(rgb(0x51432d))
                     .child(div().flex_1().text_sm().child("An interrupted patch operation needs recovery before repository writes can continue."))
@@ -164,7 +222,7 @@ impl GitBuddy {
                                 .child(self.button("use-squash-message", "Use squash message").ghost().on_click(cx.listener(move |this, _, w, cx| this.message.update(cx, |state, cx| state.set_value(message.clone(), w, cx)))))
                                 .child(self.button("abort-squash", "Abort squash…").ghost().on_click(cx.listener(|this, _, w, cx| this.show_modal(Modal::Confirm("Abort squash and restore the original tracked files and index? Resolutions and tracked edits made during squash will be discarded.".into(), Operation::AbortMerge), w, cx)))))
                             .child(
-                                self.button("resolve-conflicts", if self.snapshot.conflict_operation == git::ConflictOperation::Rebase { "Rebase progress…" } else { "Resolve conflicts…" })
+                                self.button("resolve-conflicts", if self.snapshot.conflict_operation == git::ConflictOperation::Rebase { "History progress…" } else { "Resolve conflicts…" })
                                     .on_click(
                                         cx.listener(|this, _, w, cx| { if this.snapshot.conflict_operation == git::ConflictOperation::Rebase { this.open_management(Modal::RebaseSetup,w,cx); } else { this.open_conflicts(None,cx); } }),
                                     ),

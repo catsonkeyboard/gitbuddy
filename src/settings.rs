@@ -13,6 +13,8 @@ pub fn config_dir() -> PathBuf {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub appearance: Appearance,
     #[serde(default, with = "crate::session::paths_encoding")]
     pub recent: Vec<PathBuf>,
     #[serde(default)]
@@ -22,9 +24,18 @@ pub struct Settings {
     #[serde(default)]
     pub preferences: Preferences,
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Appearance {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Preferences {
+    pub sidebar_width: usize,
+    pub history_width: usize,
     pub history_limit: usize,
     pub commit_cache_entries: usize,
     pub commit_cache_mb: usize,
@@ -36,6 +47,8 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            sidebar_width: 180,
+            history_width: 340,
             history_limit: 10_000,
             commit_cache_entries: 64,
             commit_cache_mb: 16,
@@ -53,7 +66,13 @@ pub const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("commit", "Commit staged changes", "secondary-enter"),
     ("amend", "Amend", ""),
     ("reflog", "Reflog", ""),
+    ("rebase", "Interactive rebase", ""),
+    ("worktrees", "Manage worktrees", ""),
+    ("submodules", "Manage submodules", ""),
+    ("lfs", "Git LFS", ""),
+    ("remotes", "Manage remotes", ""),
     ("compare", "Compare", ""),
+    ("go_to_commit", "Go to commit", "secondary-shift-g"),
     ("conflicts", "Resolve conflicts", ""),
     ("fetch", "Fetch", ""),
     ("pull", "Pull", ""),
@@ -61,6 +80,13 @@ pub const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("next_tab", "Next repository", "ctrl-tab"),
     ("previous_tab", "Previous repository", "ctrl-shift-tab"),
     ("close_tab", "Close repository", "secondary-w"),
+    (
+        "reopen_tab",
+        "Reopen closed repository",
+        "secondary-shift-t",
+    ),
+    ("command_palette", "Command palette", "secondary-shift-p"),
+    ("checkout_recovery", "Checkout recovery", ""),
     (
         "cancel_task",
         "Cancel current task",
@@ -79,6 +105,10 @@ impl Preferences {
             .unwrap_or_else(|| SHORTCUTS.iter().find(|s| s.0 == action).map_or("", |s| s.2))
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (150..=360).contains(&self.sidebar_width) && (270..=650).contains(&self.history_width),
+            "Sidebar width must be 150–360 and history width 270–650 pixels"
+        );
         anyhow::ensure!(
             (300..=100_000).contains(&self.history_limit),
             "History limit must be 300–100,000"
@@ -103,6 +133,13 @@ impl Preferences {
     }
 }
 impl Settings {
+    pub fn set_appearance(&mut self, appearance: Appearance) -> anyhow::Result<()> {
+        let mut next = self.clone();
+        next.appearance = appearance;
+        next.save_at(&Self::path())?;
+        *self = next;
+        Ok(())
+    }
     fn path() -> PathBuf {
         config_dir().join("settings.json")
     }

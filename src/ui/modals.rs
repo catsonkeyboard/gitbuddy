@@ -14,17 +14,44 @@ impl GitBuddy {
             return;
         };
         match modal {
+            Modal::BatchMainline(ids, revert) => {
+                self.preview_batch(ids, revert, self.batch_mainlines.clone(), cx)
+            }
             Modal::RenameBranch(expected) => {
                 self.perform(Operation::RenameBranch { expected, name: a }, cx)
             }
             Modal::CheckoutRevision => self.prepare_branch_action(branches::Request::Detach(a), cx),
+            Modal::GoToCommit => self.go_to_commit(a, cx),
             Modal::MergeTool => self.submit_merge_tool(a, b, cx),
             Modal::ExternalEditor(path) => self.submit_external_editor(path, a, b, cx),
-            Modal::RebaseSetup => self.preview_rebase(a, b, cx),
+            Modal::RebaseSetup => self.preview_rebase(a, b, false, cx),
+            Modal::RebaseGraphSetup => self.preview_rebase(a, b, true, cx),
             Modal::WorktreeCreate => self.perform(
                 Operation::CreateWorktree {
                     name: a,
                     path: expand_path(&b),
+                },
+                cx,
+            ),
+            Modal::WorktreeExisting | Modal::WorktreeDetached => self.perform(
+                Operation::CreateWorktreeAt {
+                    source: a,
+                    path: expand_path(&b),
+                    detached: matches!(modal, Modal::WorktreeDetached),
+                },
+                cx,
+            ),
+            Modal::WorktreeMove(expected) => self.perform(
+                Operation::MoveWorktree {
+                    expected,
+                    path: expand_path(&a),
+                },
+                cx,
+            ),
+            Modal::WorktreeRepair(expected) => self.perform(
+                Operation::RepairWorktree {
+                    name: expected.name,
+                    path: expand_path(&a),
                 },
                 cx,
             ),
@@ -35,7 +62,24 @@ impl GitBuddy {
                 },
                 cx,
             ),
-            Modal::LfsPattern(track) => self.perform(Operation::LfsTrack { pattern: a, track }, cx),
+            Modal::SubmoduleRemote(expected) => self.perform(
+                Operation::UpdateSubmoduleRemote {
+                    expected,
+                    branch: a,
+                },
+                cx,
+            ),
+            Modal::LfsPattern(track) => self.perform(
+                Operation::LfsTrack {
+                    pattern: literal_a,
+                    track,
+                },
+                cx,
+            ),
+            Modal::LfsMigration => self.inspect_lfs(
+                management::Inspection::Migration(a, self.migration_unsigned),
+                cx,
+            ),
             Modal::LfsLock(remote) => self.perform(
                 Operation::LfsLock {
                     remote,
@@ -102,6 +146,81 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if let Modal::BatchMainline(ids, revert) = &modal {
+            return self.batch_mainline_modal(ids, *revert, cx);
+        }
+        if matches!(modal, Modal::CommandPalette) {
+            let query = self.form_a.read(cx).value().to_lowercase();
+            return div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000099))
+                .occlude()
+                .child(
+                    v_flex()
+                        .w(px(540.))
+                        .max_h(px(600.))
+                        .p_3()
+                        .gap_2()
+                        .bg(rgb(PANEL))
+                        .rounded_lg()
+                        .child(
+                            h_flex()
+                                .child(div().flex_1().child("Command palette"))
+                                .child(self.button("close-palette", "Close").ghost().on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.modal = None;
+                                        cx.notify();
+                                    }),
+                                )),
+                        )
+                        .child(Input::new(&self.form_a))
+                        .child(
+                            v_flex()
+                                .id("command-list")
+                                .max_h(px(480.))
+                                .overflow_y_scroll()
+                                .children(
+                                    gitbuddy::settings::SHORTCUTS
+                                        .iter()
+                                        .filter(|(name, label, _)| {
+                                            *name != "command_palette"
+                                                && *name != "close_modal"
+                                                && (query.is_empty()
+                                                    || label
+                                                        .to_lowercase()
+                                                        .contains(query.as_str()))
+                                        })
+                                        .map(|(name, label, _)| {
+                                            let name = *name;
+                                            self.button(
+                                                name,
+                                                format!(
+                                                    "{}    {}",
+                                                    label,
+                                                    self.settings.preferences.binding(name)
+                                                ),
+                                            )
+                                            .ghost()
+                                            .on_click(
+                                                cx.listener(move |this, _, w, cx| {
+                                                    this.modal = None;
+                                                    w.dispatch_action(
+                                                        preferences::action(name),
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            )
+                                        }),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
         if matches!(modal, Modal::ImageLoading | Modal::ImagePreview(_)) {
             return self.image_preview_modal(modal, cx);
         }
@@ -139,6 +258,8 @@ impl GitBuddy {
                 | Modal::Submodules
                 | Modal::Lfs
                 | Modal::LfsReport
+                | Modal::LfsMigrationRecovery
+                | Modal::CheckoutRecovery
                 | Modal::RebaseMessage(_)
         ) {
             return self.management_modal(modal, cx);
@@ -151,6 +272,17 @@ impl GitBuddy {
             return self.history_modal(kind, cx);
         }
         let (title, label_a, label_b, submit) = match &modal {
+            Modal::BatchMainline(_, revert) => (
+                if *revert {
+                    "Batch Revert merge parent"
+                } else {
+                    "Batch Cherry-pick merge parent"
+                },
+                "Parent number for merge commits (1-based; ordinary commits are unchanged)",
+                None,
+                "Review batch",
+            ),
+            Modal::CommandPalette => unreachable!(),
             Modal::MergeTool => (
                 "External merge tool",
                 "Executable path (e.g. code, kdiff3, meld)",
@@ -171,17 +303,53 @@ impl GitBuddy {
                 Some("Optional --onto target (blank uses the upstream common ancestor)"),
                 "Build plan",
             ),
+            Modal::RebaseGraphSetup => (
+                "Rebase preserving merge topology",
+                "Upstream / exclusive boundary",
+                Some("Optional onto target"),
+                "Build plan",
+            ),
             Modal::WorktreeCreate => (
                 "Create worktree",
                 "New branch / worktree name",
                 Some("Absolute destination directory"),
                 "Create",
             ),
+            Modal::WorktreeExisting => (
+                "Worktree on existing branch",
+                "Existing local branch",
+                Some("New absolute destination directory"),
+                "Create",
+            ),
+            Modal::WorktreeDetached => (
+                "Detached worktree",
+                "Commit, branch or tag",
+                Some("New absolute destination directory"),
+                "Create",
+            ),
+            Modal::WorktreeMove(_) => (
+                "Move clean worktree",
+                "New absolute destination directory",
+                None,
+                "Move",
+            ),
+            Modal::WorktreeRepair(_) => (
+                "Repair worktree registration",
+                "Actual absolute worktree directory",
+                None,
+                "Repair",
+            ),
             Modal::SubmoduleAdd => (
                 "Add submodule",
                 "Repository URL",
                 Some("Relative destination path"),
                 "Add",
+            ),
+            Modal::SubmoduleRemote(_) => (
+                "Update submodule from origin",
+                "Remote branch (e.g. main)",
+                None,
+                "Fetch & checkout",
             ),
             Modal::LfsLock(_) => (
                 "Lock LFS file",
@@ -199,11 +367,19 @@ impl GitBuddy {
                 None,
                 "Apply",
             ),
+            Modal::LfsMigration => (
+                "Migrate current branch history to LFS",
+                "Filename patterns, separated by commas (e.g. *.psd,*.bin)",
+                None,
+                "Prepare isolated preview",
+            ),
             Modal::RebasePlan
             | Modal::Worktrees
             | Modal::Submodules
             | Modal::Lfs
             | Modal::LfsReport
+            | Modal::LfsMigrationRecovery
+            | Modal::CheckoutRecovery
             | Modal::Preferences
             | Modal::TaskLog
             | Modal::Integration
@@ -239,6 +415,12 @@ impl GitBuddy {
                 "Commit, tag or revision (e.g. HEAD~2)",
                 None,
                 "Review checkout…",
+            ),
+            Modal::GoToCommit => (
+                "Go to commit",
+                "Commit, branch, tag or revision (e.g. HEAD~2)",
+                None,
+                "Open commit",
             ),
             Modal::BranchPreparing(_) => ("Review branch operation", "", None, ""),
             Modal::BranchAt(_) => (
@@ -358,7 +540,20 @@ impl GitBuddy {
             );
         }
         if matches!(modal, Modal::RebaseSetup) {
+            card = card.child(
+                self.button("preserve-merges", "Preserve merge topology…")
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        this.show_modal(Modal::RebaseGraphSetup, w, cx)
+                    })),
+            );
             card=card.child(div().text_xs().text_color(rgb(MUTED)).child("Use --root with an explicit --onto target to replay a linear history including its root. Start with a clean working tree; merge commits in the range are rejected."));
+        }
+        if matches!(modal, Modal::RebaseGraphSetup) {
+            card = card.child(div().text_xs().text_color(rgb(MUTED)).child("Replays each commit's changes against its rewritten first parent, retaining mapped merge parents and original merge resolutions. Pick / Reword only; original topological order is retained."));
+        }
+        if matches!(modal, Modal::LfsMigration) {
+            card = card.child(div().text_xs().text_color(rgb(MUTED)).child("Rewrites the entire history reachable from the current branch. Start with a clean worktree. Review the candidate before applying it; other branch and tag refs stay on their original history."))
+                .child(self.sidebar_button("migration-unsigned", if self.migration_unsigned { "☑ Allow unsigned rewritten commits" } else { "☐ Allow unsigned rewritten commits" }).ghost().on_click(cx.listener(|this, _, _, cx| { this.migration_unsigned = !this.migration_unsigned; cx.notify(); })));
         }
         if matches!(modal, Modal::MergeTool) {
             card=card.child(div().text_xs().text_color(rgb(MUTED)).child("Uses temporary copies. Close the tool to import its output as an unsaved draft; review and save separately. Git mergetool.cmd shell configuration is not executed."))
@@ -478,6 +673,13 @@ impl GitBuddy {
                     )
                     .find(|c| c.id == id)
                     .map(|c| c.parents.clone())
+                    .or_else(|| {
+                        self.active
+                            .commit_detail
+                            .as_ref()
+                            .filter(|detail| detail.id == id)
+                            .map(|detail| detail.parents.clone())
+                    })
                     .unwrap_or_default();
                 let tag_target = id.clone();
                 card = card.child(
@@ -723,6 +925,7 @@ impl GitBuddy {
                         .child(self.button("cancel", "Cancel").disabled(false).on_click(
                             cx.listener(|this, _, w, cx| {
                                 this.modal = None;
+                                this.discard_lfs_migration_preview();
                                 this.focus.focus(w, cx);
                                 cx.notify();
                             }),

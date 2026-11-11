@@ -17,6 +17,7 @@ impl GitBuddy {
         let root = repo.root.clone();
         self.stash_data = Data::Loading;
         self.stash_restore_index = false;
+        self.stash_keep_index = false;
         self.stash_selected.clear();
         let save = matches!(modal, Modal::Stash);
         let task = cx
@@ -61,14 +62,20 @@ impl GitBuddy {
             cx.notify();
             return;
         }
-        self.perform(
+        let op = if self.stash_keep_index {
+            Operation::SaveStashKeepingIndex {
+                context: context.clone(),
+                paths,
+                message,
+            }
+        } else {
             Operation::SaveStash {
                 context: context.clone(),
                 paths,
                 message,
-            },
-            cx,
-        );
+            }
+        };
+        self.perform(op, cx);
     }
     pub(super) fn stash_modal(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
         let save = matches!(modal, Modal::Stash);
@@ -114,6 +121,7 @@ impl GitBuddy {
             }
             Data::Ready(context) if save => {
                 card = card.child(div().text_xs().text_color(rgb(MUTED)).child("Description (optional)"))
+                    .child(self.sidebar_button("stash-keep-index", format!("{}  Keep staged changes in index and working tree", if self.stash_keep_index {"☑"} else {"☐"})).ghost().on_click(cx.listener(|this,_,_,cx|{this.stash_keep_index = !this.stash_keep_index;cx.notify();})))
                     .child(Input::new(&self.form_a))
                     .child(div().text_xs().text_color(rgb(MUTED)).child("Selected files include their staged, unstaged and untracked contents. Other files keep their current contents and index state."))
                     .child(h_flex().gap_2().child(div().flex_1().text_sm().child(format!("{} / {} files selected", self.stash_selected.len(), context.files.len())))

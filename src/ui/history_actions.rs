@@ -36,7 +36,48 @@ impl CommitSelection {
     }
 }
 impl GitBuddy {
-    fn preview_batch(&mut self, mut ids: Vec<String>, revert: bool, cx: &mut Context<Self>) {
+    pub(super) fn batch_mainline_modal(
+        &self,
+        ids: &[String],
+        revert: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let source = self
+            .active
+            .history_search
+            .as_ref()
+            .map(|s| &s.commits)
+            .unwrap_or(&self.snapshot.commits);
+        let merges = source
+            .iter()
+            .filter(|c| ids.contains(&c.id) && c.parents.len() > 1)
+            .collect::<Vec<_>>();
+        let ready = !merges.is_empty()
+            && merges
+                .iter()
+                .all(|c| self.batch_mainlines.contains_key(&c.id));
+        let submitted = ids.to_vec();
+        div().absolute().inset_0().flex().items_center().justify_center().bg(rgba(0x00000099)).occlude().child(v_flex().w(px(720.)).max_h(px(640.)).p_4().gap_3().bg(rgb(PANEL)).rounded_lg()
+            .child(h_flex().child(div().flex_1().child("Choose each merge commit's mainline")).child(self.button("close-mainlines","Close").ghost().on_click(cx.listener(|this,_,w,cx|{this.modal=None;this.focus.focus(w,cx);cx.notify();}))))
+            .child(div().text_xs().text_color(rgb(MUTED)).child("Changes are computed relative to the parent you choose. Ordinary commits keep their only parent as the baseline."))
+            .child(v_flex().id("batch-mainline-scroll").max_h(px(450.)).overflow_y_scroll().gap_2().children(merges.iter().enumerate().map(|(i,commit)| {
+                v_flex().id(("batch-parent-group",i)).p_2().gap_1().bg(rgb(BG)).child(div().text_sm().child(format!("{} · {}",commit.id.chars().take(10).collect::<String>(),commit.subject)))
+                    .child(h_flex().flex_wrap().gap_1().children(commit.parents.iter().enumerate().map(|(j,parent)|{
+                        let id=commit.id.clone();let number=(j+1) as u32;
+                        self.button(("choose-parent",j),format!("Parent {number} · {}",parent.chars().take(10).collect::<String>())).ghost().when(self.batch_mainlines.get(&id)==Some(&number),|b|b.text_color(rgb(ACCENT)))
+                            .on_click(cx.listener(move|this,_,_,cx|{this.batch_mainlines.insert(id.clone(),number);cx.notify();}))
+                    })))
+            })))
+            .child(self.button("review-batch-mainlines","Review batch…").primary().disabled(!ready).on_click(cx.listener(move|this,_,_,cx|this.preview_batch(submitted.clone(),revert,this.batch_mainlines.clone(),cx)))))
+            .into_any_element()
+    }
+    pub(super) fn preview_batch(
+        &mut self,
+        mut ids: Vec<String>,
+        revert: bool,
+        mainlines: BTreeMap<String, u32>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.active.repo.clone() else {
             return;
         };
@@ -45,7 +86,16 @@ impl GitBuddy {
         } // Revert newer commits before older ones.
         let summary = ids
             .iter()
-            .map(|id| id.chars().take(10).collect::<String>())
+            .map(|id| {
+                format!(
+                    "{}{}",
+                    id.chars().take(10).collect::<String>(),
+                    mainlines
+                        .get(id)
+                        .map(|n| format!(" (parent {n})"))
+                        .unwrap_or_default()
+                )
+            })
             .collect::<Vec<_>>()
             .join(" → ");
         self.modal = None;
@@ -54,9 +104,9 @@ impl GitBuddy {
         let tab = self.active.id;
         let task = cx.background_executor().spawn(async move {
             if revert {
-                repo.prepare_revert_batch(&ids)
+                repo.prepare_revert_batch_with_mainlines(&ids, &mainlines)
             } else {
-                repo.prepare_cherry_batch(&ids)
+                repo.prepare_cherry_batch_with_mainlines(&ids, &mainlines)
             }
         });
         cx.spawn(async move |this, cx| {
@@ -67,7 +117,7 @@ impl GitBuddy {
                     Ok(plan) => {
                         let label = if revert { "Revert" } else { "Cherry-pick" };
                         let op = if revert { Operation::RevertBatch(Arc::new(plan)) } else { Operation::CherryPickBatch(Arc::new(plan)) };
-                        this.modal = Some(Modal::Confirm(format!("{label} these commits in this order?\n\n{summary}\n\nThe batch uses the recoverable rebase progress screen. It requires a clean working tree and supports single-parent commits."), op));
+                        this.modal = Some(Modal::Confirm(format!("{label} these commits in this order?\n\n{summary}\n\nRequires a clean working tree. If interrupted or conflicted, open history progress to continue or abort."), op));
                     },
                     Err(error) => { this.active.notice = format!("Cannot prepare batch: {error:#}"); this.active.error = true; }
                 }
@@ -233,6 +283,9 @@ impl GitBuddy {
                     .map(|c| c.id.clone())
                     .collect();
                 let complete = ids.len() == self.commit_selection.ids.len();
+                let has_merges = source
+                    .iter()
+                    .any(|c| self.commit_selection.ids.contains(&c.id) && c.parents.len() > 1);
                 card=card.child(div().text_sm().child(format!("{} commits selected · {} available in loaded history",self.commit_selection.ids.len(),ids.len())))
                     .child(div().text_xs().text_color(rgb(MUTED)).child("Shift selects a visible range; ⌘ / Ctrl toggles a commit. Rewrite plans replay descendants too and require a clean working tree. Squash requires adjacent commits in the current branch."));
                 let copy = ids.clone();
@@ -264,16 +317,24 @@ impl GitBuddy {
                 card = card.child(
                     self.button("cherry-pick-selected", "Cherry-pick selected commits…")
                         .disabled(batch.is_empty() || !complete)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.preview_batch(batch.clone(), false, cx)
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            if has_merges {
+                                this.show_modal(Modal::BatchMainline(batch.clone(), false), w, cx);
+                            } else {
+                                this.preview_batch(batch.clone(), false, BTreeMap::new(), cx);
+                            }
                         })),
                 );
                 let batch = ids.clone();
                 card = card.child(
                     self.button("revert-selected", "Revert selected commits…")
                         .disabled(batch.is_empty() || !complete)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.preview_batch(batch.clone(), true, cx)
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            if has_merges {
+                                this.show_modal(Modal::BatchMainline(batch.clone(), true), w, cx);
+                            } else {
+                                this.preview_batch(batch.clone(), true, BTreeMap::new(), cx);
+                            }
                         })),
                 );
                 for action in [

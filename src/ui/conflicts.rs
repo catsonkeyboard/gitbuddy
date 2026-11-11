@@ -405,6 +405,13 @@ impl GitBuddy {
             .when(self.active.error, |col| col.child(div().px_3().py_2().text_xs().text_color(rgb(0xe9a3a9)).child(self.active.notice.clone())))
             .child(h_flex().flex_1().min_h_0().items_start()
                 .child(v_flex().id("conflict-files").track_scroll(&self.active.scroll.area("conflict-files")).w(px(170.)).h_full().flex_shrink_0().overflow_y_scroll().bg(rgb(BG)).border_r_1().border_color(rgb(BORDER))
+                    .children(session.iter().flat_map(|s|s.renames.iter()).enumerate().map(|(i,group)| {
+                        let ours=group.clone();let theirs=group.clone();
+                        v_flex().p_2().gap_1().bg(rgb(0x303b49)).child(div().text_xs().child(format!("Rename group {}",i+1)))
+                            .child(div().text_size(px(10.)).child(group.summary()))
+                            .child(self.button(("rename-group-ours",i),"Keep ours…").ghost().disabled(self.busy()).on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::Confirm(format!("Resolve this rename group atomically in the index using ours?\n\n{}\n\nAll working paths are retained. Review leftover paths before continuing.",ours.summary()),Operation::ResolveRenameConflict { context:ours.clone(),ours:true }),w,cx))))
+                            .child(self.button(("rename-group-theirs",i),"Keep theirs…").ghost().disabled(self.busy()).on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::Confirm(format!("Resolve this rename group atomically in the index using theirs?\n\n{}\n\nAll working paths are retained. Review leftover paths before continuing.",theirs.summary()),Operation::ResolveRenameConflict { context:theirs.clone(),ours:false }),w,cx))))
+                    }))
                     .children(session.iter().flat_map(|s| s.files.iter()).enumerate().map(|(i,file)| {
                         let path = file.path.clone();
                         let selected = self.active.conflicts.selected.as_ref() == Some(&path);

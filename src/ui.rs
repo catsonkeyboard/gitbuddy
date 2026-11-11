@@ -19,6 +19,7 @@ mod stash;
 mod tags;
 mod task_log;
 mod tasks;
+mod theme;
 mod toolbar;
 use gitbuddy::session::PatchKey;
 use gitbuddy::{
@@ -39,11 +40,12 @@ use gpui_kit::{
     *,
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
+use theme::rgb;
 gpui_kit::actions!(
     gitbuddy,
     [
@@ -52,6 +54,7 @@ gpui_kit::actions!(
         InitRepository,
         EditIdentity,
         Refresh,
+        GoToCommit,
         CheckoutRevision,
         CommitChanges,
         AmendCommit,
@@ -68,6 +71,8 @@ gpui_kit::actions!(
         OpenWorktrees,
         OpenSubmodules,
         OpenLfs,
+        RecoverLfsMigration,
+        RecoverCheckout,
         OpenRemotes,
         BrowseRemoteTags,
         OpenPushOptions,
@@ -76,6 +81,8 @@ gpui_kit::actions!(
         NextTab,
         PreviousTab,
         CloseTab,
+        ReopenTab,
+        CommandPalette,
         CancelTask,
         Fetch,
         Pull,
@@ -168,29 +175,41 @@ impl PatchLineSelection {
 }
 #[derive(Clone)]
 enum Modal {
+    CommandPalette,
     Integration,
     RemoteOperations,
     RebaseSetup,
+    RebaseGraphSetup,
     RebasePlan,
     RebaseMessage(usize),
     Worktrees,
     WorktreeCreate,
+    WorktreeExisting,
+    WorktreeDetached,
+    WorktreeMove(git::WorktreeInfo),
+    WorktreeRepair(git::WorktreeInfo),
     Submodules,
     SubmoduleAdd,
+    SubmoduleRemote(git::SubmoduleInfo),
     Lfs,
     LfsReport,
     LfsLock(String),
     LfsPattern(bool),
+    LfsMigration,
+    LfsMigrationRecovery,
+    CheckoutRecovery,
     Open,
     Init,
     Clone,
     Branch,
     RenameBranch(Arc<git::BranchRename>),
     CheckoutRevision,
+    GoToCommit,
     BranchPreparing(String),
     BranchAt(String),
     ResetHistory(Option<Arc<git::ResetContext>>),
     CommitSelection,
+    BatchMainline(Vec<String>, bool),
     Tag,
     Remote,
     Remotes,
@@ -321,6 +340,7 @@ pub struct RepoTab {
     patch_loading: Arc<std::sync::atomic::AtomicUsize>,
     history_projection: std::cell::RefCell<Option<Arc<history::Projection>>>,
     history_search: Option<Arc<git::HistorySearchResult>>,
+    history_search_previous: Vec<Arc<git::HistorySearchResult>>,
     history_search_cancel: Option<git::CancellationToken>,
     history_search_generation: u64,
     diff_preferences: git::DiffPreferences,
@@ -370,6 +390,7 @@ impl Default for RepoTab {
             patch_loading: Default::default(),
             history_projection: Default::default(),
             history_search: None,
+            history_search_previous: Vec::new(),
             history_search_cancel: None,
             history_search_generation: 0,
             diff_preferences: git::DiffPreferences::default(),
@@ -397,11 +418,16 @@ pub struct GitBuddy {
     /// Inactive tabs. The slot at `active_index` is `None` because its data
     /// lives in `active`; switching tabs is a `mem::take`, not a field copy.
     tabs: Vec<Option<RepoTab>>,
+    closed_tabs: Vec<gitbuddy::session::Tab>,
+    batch_mainlines: BTreeMap<String, u32>,
+    _appearance_observer: Subscription,
     active: RepoTab,
     active_index: Option<usize>,
+    tab_focus: bool,
     patch_generation: u64,
     image_generation: u64,
     selection_generation: u64,
+    navigation_generation: u64,
     restore_message: Option<String>,
     restore_search: Option<String>,
     message: Entity<TextareaState>,
@@ -440,12 +466,14 @@ pub struct GitBuddy {
     tool_generation: u64,
     management_data: management::Data,
     management_generation: u64,
+    migration_unsigned: bool,
     remote_data: remotes::Data,
     remote_generation: u64,
     stash_data: stash::Data,
     stash_generation: u64,
     stash_selected: HashSet<PathBuf>,
     stash_restore_index: bool,
+    stash_keep_index: bool,
     push_choice: git::PushSelection,
     restore_push_target: Option<String>,
     push_preparing: bool,
@@ -492,7 +520,7 @@ impl GitBuddy {
         let tag_message = cx.new(|cx| TextareaState::new(window, cx).placeholder("Tag annotation"));
         let amend_message =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Commit message"));
-        let preference_fields = (0..(5 + gitbuddy::settings::SHORTCUTS.len()))
+        let preference_fields = (0..(7 + gitbuddy::settings::SHORTCUTS.len()))
             .map(|_| cx.new(|cx| InputState::new(window, cx)))
             .collect();
         let conflict_editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
@@ -536,6 +564,7 @@ impl GitBuddy {
                     }
                     this.active.history_search_generation += 1;
                     this.active.history_search = None;
+                    this.active.history_search_previous.clear();
                     this.active.history_projection.borrow_mut().take();
                     cx.notify();
                 }
@@ -550,13 +579,41 @@ impl GitBuddy {
                     }
                 },
             ),
-            cx.subscribe_in(&form_a, window, |_, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
-            }),
+            cx.subscribe_in(
+                &form_a,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        if matches!(this.modal, Some(Modal::GoToCommit)) {
+                            this.navigation_generation += 1;
+                            this.modal_error = None;
+                        }
+                        cx.notify();
+                    }
+                    if matches!(event, InputEvent::PressEnter { .. })
+                        && matches!(this.modal, Some(Modal::CommandPalette))
+                    {
+                        let query = this.form_a.read(cx).value().to_lowercase();
+                        if let Some((name, _, _)) =
+                            gitbuddy::settings::SHORTCUTS
+                                .iter()
+                                .find(|(name, label, _)| {
+                                    *name != "command_palette"
+                                        && *name != "close_modal"
+                                        && (query.is_empty()
+                                            || label.to_lowercase().contains(query.as_str()))
+                                })
+                        {
+                            this.modal = None;
+                            window.dispatch_action(preferences::action(name), cx);
+                        }
+                    }
+                },
+            ),
         ];
         let settings = Settings::load();
+        theme::apply(settings.appearance, window, cx);
+        let appearance_observer = window.observe_window_appearance(theme::sync_system);
         let session_store =
             gitbuddy::session::Store::new(gitbuddy::settings::config_dir().join("session.json"));
         let saved = session_store.load();
@@ -570,14 +627,19 @@ impl GitBuddy {
         focus.focus(window, cx);
         let mut this = Self {
             tabs: Vec::new(),
+            closed_tabs: Vec::new(),
+            batch_mainlines: BTreeMap::new(),
+            _appearance_observer: appearance_observer,
             active: RepoTab {
                 notice: "Ready".into(),
                 ..RepoTab::default()
             },
             active_index: None,
+            tab_focus: false,
             patch_generation: 0,
             image_generation: 0,
             selection_generation: 0,
+            navigation_generation: 0,
             restore_message: None,
             restore_search: None,
             message,
@@ -616,12 +678,14 @@ impl GitBuddy {
             tool_generation: 0,
             management_data: management::Data::Loading,
             management_generation: 0,
+            migration_unsigned: false,
             remote_data: remotes::Data::Loading,
             remote_generation: 0,
             stash_data: stash::Data::Loading,
             stash_generation: 0,
             stash_selected: HashSet::new(),
             stash_restore_index: false,
+            stash_keep_index: false,
             push_choice: git::PushSelection::default(),
             restore_push_target: None,
             push_preparing: false,
@@ -699,6 +763,7 @@ impl GitBuddy {
             return;
         };
         self.active = tab;
+        self.tab_focus = true;
         self.active.task_finished = false;
         self.active_index = Some(index);
         self.active
@@ -750,6 +815,25 @@ impl GitBuddy {
             token.cancel();
         }
         let was_active = self.active_index == Some(index);
+        if was_active {
+            self.sync_editor_views(cx);
+            self.active.message = self.current_message(cx);
+            self.active.query = self
+                .restore_search
+                .clone()
+                .unwrap_or_else(|| self.search.read(cx).value().to_string());
+        }
+        let closed = if was_active {
+            self.active.session_tab()
+        } else {
+            self.tabs[index].as_ref().and_then(|t| t.session_tab())
+        };
+        if let Some(tab) = closed {
+            if self.closed_tabs.len() >= 10 {
+                self.closed_tabs.remove(0);
+            }
+            self.closed_tabs.push(tab);
+        }
         self.tabs.remove(index);
         if was_active {
             self.active = RepoTab::default();
@@ -932,13 +1016,18 @@ impl GitBuddy {
             return;
         };
         let generation = self.selection_generation;
+        let tab = self.active.id;
+        let requested = id.clone();
         let task = cx
             .background_executor()
             .spawn(async move { repo.commit_detail(&id) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.selection_generation != generation {
+                if this.active.id != tab
+                    || this.selection_generation != generation
+                    || !matches!(&this.active.selection, Selection::Commit(id) if id == &requested)
+                {
                     return;
                 }
                 match result {
@@ -970,6 +1059,9 @@ impl GitBuddy {
         let Some(repo) = self.active.repo.clone() else {
             return;
         };
+        if matches!(&operation, Operation::LfsMigrate(_)) {
+            self.discard_lfs_migration_preview();
+        }
         let clear_message = matches!(
             operation,
             Operation::Commit(_) | Operation::CommitEmpty(_) | Operation::CommitRebase(_)
@@ -1050,6 +1142,18 @@ impl GitBuddy {
         );
     }
     fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(modal, Modal::LfsMigration) {
+            self.migration_unsigned = false;
+        }
+        if matches!(modal, Modal::GoToCommit) {
+            if self.active.repo.is_none() {
+                return;
+            }
+            self.navigation_generation += 1;
+        }
+        if matches!(modal, Modal::BatchMainline(..)) {
+            self.batch_mainlines.clear();
+        }
         if matches!(modal, Modal::Preferences) {
             self.open_preferences(window, cx);
             return;
@@ -1077,9 +1181,48 @@ impl GitBuddy {
         self.modal = Some(modal.clone());
         self.modal_error = None;
         if matches!(modal, Modal::Stash | Modal::StashActions(_)) {
-            self.load_stash_modal(modal, cx);
+            self.load_stash_modal(modal.clone(), cx);
         }
-        self.form_a.read(cx).focus_handle(cx).focus(window, cx);
+        if matches!(
+            modal,
+            Modal::CommandPalette
+                | Modal::Open
+                | Modal::Init
+                | Modal::Clone
+                | Modal::Branch
+                | Modal::RenameBranch(_)
+                | Modal::CheckoutRevision
+                | Modal::GoToCommit
+                | Modal::BranchAt(_)
+                | Modal::Tag
+                | Modal::Remote
+                | Modal::EditRemote(_)
+                | Modal::RenameRemote(_)
+                | Modal::Stash
+                | Modal::StashBranch(..)
+                | Modal::Identity
+                | Modal::RecoveryBranch(_)
+                | Modal::DiffSearch(_)
+                | Modal::Compare
+                | Modal::MergeTool
+                | Modal::ExternalEditor(_)
+                | Modal::RebaseSetup
+                | Modal::RebaseGraphSetup
+                | Modal::WorktreeCreate
+                | Modal::WorktreeExisting
+                | Modal::WorktreeDetached
+                | Modal::WorktreeMove(_)
+                | Modal::WorktreeRepair(_)
+                | Modal::SubmoduleAdd
+                | Modal::SubmoduleRemote(_)
+                | Modal::LfsLock(_)
+                | Modal::LfsPattern(_)
+                | Modal::LfsMigration
+        ) {
+            self.form_a.read(cx).focus_handle(cx).focus(window, cx);
+        } else {
+            self.focus.focus(window, cx);
+        }
         cx.notify();
     }
     fn commit(&mut self, cx: &mut Context<Self>) {
@@ -1213,6 +1356,13 @@ impl GitBuddy {
 }
 impl Render for GitBuddy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.modal.is_none()
+            && (std::mem::take(&mut self.tab_focus)
+                || self.tabs.is_empty()
+                || !self.focus.contains_focused(window, cx))
+        {
+            self.focus.focus(window, cx);
+        }
         self.restore_scroll_on_next_frame(window, cx);
         self.restore_tag_form(window, cx);
         if self.branch_focus {
@@ -1298,6 +1448,9 @@ impl Render for GitBuddy {
             .on_action(cx.listener(|this, _: &CheckoutRevision, w, cx| {
                 this.show_modal(Modal::CheckoutRevision, w, cx)
             }))
+            .on_action(cx.listener(|this, _: &GoToCommit, w, cx| {
+                this.show_modal(Modal::GoToCommit, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 if this.modal.is_some() {
                     return;
@@ -1305,6 +1458,12 @@ impl Render for GitBuddy {
                 this.refresh_with_notice("Refreshed".into(), cx)
             }))
             .on_action(cx.listener(|this, _: &OpenPreferences, w, cx| this.open_preferences(w, cx)))
+            .on_action(cx.listener(|this, _: &CommandPalette, w, cx| this.show_modal(Modal::CommandPalette,w,cx)))
+            .on_action(cx.listener(|this, _: &ReopenTab, _, cx| {
+                if let Some(tab) = this.closed_tabs.pop() {
+                    this.restore_session(gitbuddy::session::Session { tabs: vec![tab], ..Default::default() },cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &OpenTaskLog, w, cx| this.show_modal(Modal::TaskLog, w, cx)),
             )
@@ -1372,6 +1531,12 @@ impl Render for GitBuddy {
             .on_action(
                 cx.listener(|this, _: &OpenLfs, w, cx| this.open_management(Modal::Lfs, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &RecoverLfsMigration, w, cx| {
+                this.open_management(Modal::LfsMigrationRecovery, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RecoverCheckout, w, cx| {
+                this.open_management(Modal::CheckoutRecovery, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenRemotes, w, cx| {
                 this.open_remote_page(Modal::Remotes, w, cx)
             }))
@@ -1394,6 +1559,7 @@ impl Render for GitBuddy {
             }))
             .on_action(cx.listener(|this, _: &CloseModal, window, cx| {
                 if this.modal.take().is_some() {
+                    this.discard_lfs_migration_preview();
                     this.focus.focus(window, cx);
                     cx.notify();
                 }

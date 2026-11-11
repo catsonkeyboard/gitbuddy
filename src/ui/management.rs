@@ -12,12 +12,21 @@ pub(super) enum Data {
     Lfs(git::LfsStatus),
     Locks(String, git::LfsLocks),
     Maintenance(Arc<git::LfsMaintenance>),
+    Migration(Arc<git::LfsMigrationPlan>),
+    MigrationRecovery(Option<git::LfsMigrationStatus>),
+    CheckoutRecovery(Option<git::WorktreeRecoveryStatus>),
 }
 pub(super) enum Inspection {
     Locks(String),
     Maintenance,
+    Migration(String, bool),
 }
 impl GitBuddy {
+    pub(super) fn discard_lfs_migration_preview(&mut self) {
+        if matches!(self.management_data, Data::Migration(_)) {
+            self.management_data = Data::Loading;
+        }
+    }
     pub(super) fn inspect_lfs(&mut self, request: Inspection, cx: &mut Context<Self>) {
         if self.busy() {
             return;
@@ -39,6 +48,9 @@ impl GitBuddy {
                     Inspection::Maintenance => repo
                         .lfs_maintenance(control)
                         .map(|report| Data::Maintenance(Arc::new(report))),
+                    Inspection::Migration(patterns, unsigned) => repo
+                        .prepare_lfs_migration(&patterns, unsigned, control)
+                        .map(|plan| Data::Migration(Arc::new(plan))),
                 };
                 let (data, error, notice) = match result {
                     Ok(data) => (data, false, "LFS inspection complete".to_owned()),
@@ -108,6 +120,12 @@ impl GitBuddy {
                 Modal::Worktrees => repo.worktrees().map(Data::Worktrees),
                 Modal::Submodules => repo.submodules_recursive().map(Data::Submodules),
                 Modal::Lfs => repo.lfs_status().map(Data::Lfs),
+                Modal::LfsMigrationRecovery => {
+                    repo.lfs_migration_status().map(Data::MigrationRecovery)
+                }
+                Modal::CheckoutRecovery => {
+                    repo.worktree_recovery_status().map(Data::CheckoutRecovery)
+                }
                 _ => unreachable!(),
             }
         });
@@ -130,6 +148,7 @@ impl GitBuddy {
         &mut self,
         upstream: String,
         onto: String,
+        preserve_merges: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(repo) = self.repo.clone() else {
@@ -140,9 +159,13 @@ impl GitBuddy {
         self.management_generation += 1;
         let generation = self.management_generation;
         let tab = self.active.id;
-        let task = cx
-            .background_executor()
-            .spawn(async move { repo.rebase_preview_onto(&upstream, Some(&onto)) });
+        let task = cx.background_executor().spawn(async move {
+            if preserve_merges {
+                repo.rebase_preview_preserving_merges(&upstream, Some(&onto))
+            } else {
+                repo.rebase_preview_onto(&upstream, Some(&onto))
+            }
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -163,12 +186,19 @@ impl GitBuddy {
         cx.notify();
     }
     pub(super) fn management_modal(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
-        let title = match modal {
-            Modal::RebasePlan => "Interactive rebase / Squash",
-            Modal::RebaseMessage(_) => "Edit commit message",
-            Modal::Worktrees => "Worktrees",
-            Modal::Submodules => "Submodules",
-            _ => "Git LFS",
+        let title = if let Data::Progress(status) = &self.management_data {
+            format!("{} progress", status.operation)
+        } else {
+            match modal {
+                Modal::RebasePlan => "Interactive rebase / Squash",
+                Modal::RebaseMessage(_) => "Edit commit message",
+                Modal::Worktrees => "Worktrees",
+                Modal::Submodules => "Submodules",
+                Modal::LfsMigrationRecovery => "Recover LFS history migration",
+                Modal::CheckoutRecovery => "Recover interrupted checkout",
+                _ => "Git LFS",
+            }
+            .to_owned()
         };
         let mut card = v_flex()
             .w(px(820.))
@@ -195,6 +225,7 @@ impl GitBuddy {
                             .disabled(false)
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.modal = None;
+                                this.discard_lfs_migration_preview();
                                 this.focus.focus(w, cx);
                                 cx.notify();
                             })),
@@ -262,6 +293,9 @@ impl GitBuddy {
                 Data::Lfs(status) => self.lfs_tools(status, cx),
                 Data::Locks(remote, locks) => self.lfs_locks_view(remote, locks, cx),
                 Data::Maintenance(report) => self.lfs_maintenance_view(report, cx),
+                Data::Migration(plan) => self.lfs_migration_plan(plan, cx),
+                Data::MigrationRecovery(status) => self.lfs_migration_recovery(status.as_ref(), cx),
+                Data::CheckoutRecovery(status) => self.checkout_recovery(status.as_ref(), cx),
             });
         }
         if let Some(error) = &self.modal_error {
@@ -293,14 +327,14 @@ impl GitBuddy {
         let submitted = steps.to_vec();
         v_flex().gap_3().min_h_0()
             .child(div().text_xs().text_color(rgb(MUTED)).child(format!("{} → {} · oldest first · {} commits",preview.head.reference.trim_start_matches("refs/heads/"),&preview.onto[..8],steps.len())))
-            .child(div().text_xs().text_color(rgb(0xe6bc80)).child("Rewrites local history. Original commits remain in a backup reference and reflog. Merge commits are not supported in this plan."))
+            .child(div().text_xs().text_color(rgb(0xe6bc80)).child(if preview.preserve_merges { "Preserves parent topology by replaying first-parent changes and merge resolutions. Keep order; use Pick / Reword." } else { "Rewrites local history. Original commits remain in a backup reference and reflog." }))
             .child(h_flex().gap_2()
-                .child(self.button("autosquash","Autosquash").on_click(cx.listener(|this,_,_,cx| {
+                .child(self.button("autosquash","Autosquash").disabled(preview.preserve_merges).on_click(cx.listener(|this,_,_,cx| {
                     if let Data::Rebase(_,steps)=&mut this.management_data {
                         match git::autosquash(steps) { Ok(plan)=>{*steps=plan;this.modal_error=None;},Err(error)=>this.modal_error=Some(format!("{error:#}")) }
                     } cx.notify();
                 })))
-                .child(self.button("squash-all","Squash all into one").on_click(cx.listener(|this,_,_,cx|{
+                .child(self.button("squash-all","Squash all into one").disabled(preview.preserve_merges).on_click(cx.listener(|this,_,_,cx|{
                     if let Data::Rebase(_,steps)=&mut this.management_data {for (i,step) in steps.iter_mut().enumerate(){step.action=if i==0{git::RebaseAction::Pick}else{git::RebaseAction::Squash};}}
                     cx.notify();
                 })))
@@ -312,13 +346,13 @@ impl GitBuddy {
                         .child(h_flex().gap_2()
                             .child(div().text_xs().text_color(rgb(ACCENT)).child(step.id[..8].to_string()))
                             .child(div().flex_1().truncate().text_sm().child(step.message.lines().next().unwrap_or_default().to_string()))
-                            .child(self.button("up","↑").ghost().disabled(index==0).on_click(cx.listener(move|this,_,_,cx|{if let Data::Rebase(_,steps)=&mut this.management_data {steps.swap(index,index-1);}cx.notify();})))
-                            .child(self.button("down","↓").ghost().disabled(index+1==steps.len()).on_click(cx.listener(move|this,_,_,cx|{if let Data::Rebase(_,steps)=&mut this.management_data{steps.swap(index,index+1);}cx.notify();})))
+                            .child(self.button("up","↑").ghost().disabled(index==0||preview.preserve_merges).on_click(cx.listener(move|this,_,_,cx|{if let Data::Rebase(_,steps)=&mut this.management_data {steps.swap(index,index-1);}cx.notify();})))
+                            .child(self.button("down","↓").ghost().disabled(index+1==steps.len()||preview.preserve_merges).on_click(cx.listener(move|this,_,_,cx|{if let Data::Rebase(_,steps)=&mut this.management_data{steps.swap(index,index+1);}cx.notify();})))
                             .child(self.button("edit","Message…").ghost().on_click(cx.listener(move|this,_,w,cx|{
                                 this.modal=Some(Modal::RebaseMessage(index));this.amend_message.update(cx,|s,cx|s.set_value(message.clone(),w,cx));cx.notify();
                             }))))
                         .child(h_flex().gap_1().children([git::RebaseAction::Pick,git::RebaseAction::Reword,git::RebaseAction::Squash,git::RebaseAction::Fixup,git::RebaseAction::Drop,git::RebaseAction::Edit,git::RebaseAction::Split,git::RebaseAction::Break].into_iter().map(|action|{
-                            self.button(action.label(),action.label()).ghost().when(step.action==action,|b|b.bg(rgb(0x375776)))
+                            self.button(action.label(),action.label()).disabled(preview.preserve_merges&&!matches!(action,git::RebaseAction::Pick|git::RebaseAction::Reword)).ghost().when(step.action==action,|b|b.bg(rgb(0x375776)))
                                 .on_click(cx.listener(move|this,_,_,cx|{if let Data::Rebase(_,steps)=&mut this.management_data{steps[index].action=action;}cx.notify();}))
                         })))
                 })))
@@ -345,18 +379,20 @@ impl GitBuddy {
             .child(h_flex().gap_2()
                 .child(self.button("rebase-resolve",if status.editing {"Edit working files…"}else{"Resolve conflicts…"}).on_click(cx.listener(|this,_,_,cx|{this.modal=None;if this.snapshot.rebase_editing {this.select(Selection::Work,cx);}else{this.open_conflicts(None,cx);}})))
                 .when(status.editing, |v| v.child(self.button("rebase-use-message","Use original message").ghost().on_click(cx.listener({let message=status.current.as_ref().map(|s|s.message.clone()).unwrap_or_default();move |this,_,w,cx|{this.message.update(cx,|s,cx|s.set_value(message.clone(),w,cx));this.modal=None;this.select(Selection::Work,cx);}}))))
-                .child(self.button("rebase-continue","Continue rebase…").primary().disabled(status.interrupted).on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm(if this.snapshot.rebase_editing { "Continue after committing all parts? Remaining commits will be replayed." } else { "Continue rebase using all staged resolutions?" }.into(),Operation::ContinueRebase),w,cx))))
-                .child(self.button("rebase-abort","Abort rebase…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm("Restore the original branch and tracked files? Resolutions and tracked edits made during this rebase will be discarded.".into(),Operation::AbortRebase),w,cx))))).into_any_element()
+                .child(self.button("rebase-continue","Continue…").primary().disabled(status.interrupted).on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm(if this.snapshot.rebase_editing { "Continue after committing all parts? Remaining commits will be replayed." } else { "Continue the history operation using all staged resolutions?" }.into(),Operation::ContinueRebase),w,cx))))
+                .child(self.button("rebase-abort","Abort…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::Confirm("Restore the original branch and tracked files? Resolutions and tracked edits made during this history operation will be discarded.".into(),Operation::AbortRebase),w,cx))))).into_any_element()
     }
     fn worktree_list(&self, trees: &[git::WorktreeInfo], cx: &mut Context<Self>) -> AnyElement {
         v_flex().gap_3()
             .child(div().text_xs().text_color(rgb(MUTED)).child("Linked worktrees share Git history and refs, with independent working files and index. The main checkout is not listed here."))
             .child(h_flex().gap_2()
                 .child(self.button("create-worktree","Create worktree…").primary().on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::WorktreeCreate,w,cx))))
+                .child(self.button("existing-worktree","Existing branch…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::WorktreeExisting,w,cx))))
+                .child(self.button("detached-worktree","Detached…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::WorktreeDetached,w,cx))))
                 .child(self.button("reload-worktrees","Refresh").ghost().on_click(cx.listener(|this,_,w,cx|this.open_management(Modal::Worktrees,w,cx)))))
             .child(v_flex().id("worktrees-scroll").max_h(px(420.)).overflow_y_scroll().gap_2()
                 .children(trees.iter().enumerate().map(|(i,tree)|{
-                    let path=tree.path.clone();let name=tree.name.clone();let locked=tree.locked;let remove=tree.clone();let prepare=tree.clone();
+                    let path=tree.path.clone();let name=tree.name.clone();let locked=tree.locked;let remove=tree.clone();let prepare=tree.clone();let moving=tree.clone();let repair=tree.clone();
                     v_flex().id(("worktree",i)).p_2().gap_1().bg(rgb(BG)).rounded_sm()
                         .child(div().text_sm().child(format!("{} · {}{}{}",tree.name,tree.branch,if locked{" · locked"}else{""},if tree.dirty && tree.valid{" · changes"}else{""})))
                         .child(div().text_xs().text_color(rgb(MUTED)).child(tree.path.display().to_string()))
@@ -364,6 +400,8 @@ impl GitBuddy {
                             .child(self.button("open","Open in tab").ghost().disabled(!tree.valid).on_click(cx.listener(move|this,_,_,cx|this.open(path.clone(),cx))))
                             .child(self.button("prepare","Prepare submodules / LFS").ghost().disabled(!tree.valid||tree.dirty).on_click(cx.listener(move|this,_,_,cx|this.perform(Operation::PrepareWorktree(prepare.clone()),cx))))
                             .child(self.button("lock",if locked{"Unlock"}else{"Lock"}).ghost().on_click(cx.listener(move|this,_,_,cx|this.perform(Operation::LockWorktree {name:name.clone(),locked:!locked},cx))))
+                            .child(self.button("move","Move…").ghost().disabled(locked||tree.dirty||!tree.valid).on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::WorktreeMove(moving.clone()),w,cx))))
+                            .child(self.button("repair","Repair…").ghost().on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::WorktreeRepair(repair.clone()),w,cx))))
                             .child(self.button("remove",if tree.valid{"Remove…"}else{"Prune missing…"}).ghost().disabled(locked||(tree.valid&&tree.dirty)).on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::Confirm(format!("Remove worktree {}? Only a clean, unlocked linked worktree can be removed. The branch is retained.",remove.path.display()),Operation::RemoveWorktree(remove.clone())),w,cx)))))
                 })))
             .when(trees.is_empty(),|v|v.child(div().text_color(rgb(MUTED)).child("No linked worktrees."))).into_any_element()
@@ -379,7 +417,7 @@ impl GitBuddy {
                 .child(self.button("submodule-refresh","Refresh").ghost().on_click(cx.listener(|this,_,w,cx|this.open_management(Modal::Submodules,w,cx)))))
             .child(v_flex().id("submodules-scroll").max_h(px(420.)).overflow_y_scroll().gap_2()
                 .children(modules.iter().enumerate().map(|(i,module)|{
-                    let path=root.join(&module.path);let update=module.clone();let stage=module.clone();
+                    let path=root.join(&module.path);let update=module.clone();let stage=module.clone();let remote=module.clone();let deinit=module.clone();let remove=module.clone();
                     v_flex().id(("submodule",i)).p_2().gap_1().bg(rgb(BG)).rounded_sm()
                         .child(div().text_sm().child(format!("{}{}{}",module.path.display(),if module.initialized{""}else{" · not initialized"},if module.dirty{" · changes"}else{""})))
                         .child(div().truncate().text_xs().text_color(rgb(MUTED)).child(module.url.clone()))
@@ -387,18 +425,25 @@ impl GitBuddy {
                         .child(h_flex().gap_2()
                             .child(self.button("open","Open in tab").ghost().disabled(!module.initialized).on_click(cx.listener(move|this,_,_,cx|this.open(path.clone(),cx))))
                             .child(self.button("update","Initialize / Update").ghost().disabled(module.dirty).on_click(cx.listener(move|this,_,_,cx|this.perform(Operation::UpdateSubmoduleAt(update.clone()),cx))))
+                            .child(self.button("remote-update","Remote branch…").ghost().disabled(module.dirty||!module.initialized).on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::SubmoduleRemote(remote.clone()),w,cx))))
+                            .child(self.button("deinit","Deinitialize…").ghost().disabled(module.dirty||!module.initialized).on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::Confirm(format!("Deinitialize {}? Its clean checkout is retained in the GitBuddy recovery directory; .gitmodules and the parent gitlink remain.",deinit.path.display()),Operation::DeinitSubmodule {expected:deinit.clone(),remove:false}),w,cx))))
+                            .child(self.button("remove-module","Remove…").ghost().disabled(module.dirty).on_click(cx.listener(move|this,_,w,cx|this.show_modal(Modal::Confirm(format!("Remove {} from .gitmodules and the index? Its clean checkout is retained in the recovery directory. Review and commit the parent changes.",remove.path.display()),Operation::DeinitSubmodule {expected:remove.clone(),remove:true}),w,cx))))
                             .child(self.button("stage","Stage current commit").ghost().disabled(!module.initialized).on_click(cx.listener(move|this,_,_,cx|this.perform(Operation::StageSubmoduleAt(stage.clone()),cx)))))
                 })))
             .when(modules.is_empty(),|v|v.child(div().text_color(rgb(MUTED)).child("No submodules."))).into_any_element()
     }
     fn lfs_tools(&self, status: &git::LfsStatus, cx: &mut Context<Self>) -> AnyElement {
         let available = status.tool.is_some();
+        let next_auto = !status.auto_fetch;
         v_flex().gap_3()
+            .child(self.sidebar_button("lfs-auto-fetch",format!("{}  Download LFS automatically after Git fetch",if status.auto_fetch{"☑"}else{"☐"})).ghost().on_click(cx.listener(move|this,_,_,cx|this.perform(Operation::SetLfsAutoFetch(next_auto),cx))))
             .child(div().text_xs().text_color(rgb(MUTED)).child(status.tool.clone().unwrap_or_else(||"git-lfs is not installed. Native local tracking / staging works; install git-lfs for network transfers.".into())))
-            .child(div().text_xs().text_color(rgb(MUTED)).child("Stage stores SHA-256 objects locally and commits LFS pointers. Fetch / Push below transfer LFS objects only; ordinary Push uploads LFS objects before updating Git refs. Existing history is not migrated."))
-            .child(h_flex().gap_2()
+            .child(div().text_xs().text_color(rgb(MUTED)).child("Stage stores SHA-256 objects locally and commits LFS pointers. Fetch / Push below transfer LFS objects only; ordinary Push uploads LFS objects before updating Git refs. Use Migrate history to review a rewrite of this branch."))
+            .child(h_flex().gap_2().flex_wrap()
                 .child(self.button("lfs-track","Track pattern…").primary().on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::LfsPattern(true),w,cx))))
                 .child(self.button("lfs-maintenance","Verify / Prune preview…").ghost().on_click(cx.listener(|this,_,_,cx|this.inspect_lfs(Inspection::Maintenance,cx))))
+                .child(self.button("lfs-migration", "Migrate history…").ghost().disabled(self.snapshot.lfs_migration).on_click(cx.listener(|this, _, w, cx| this.show_modal(Modal::LfsMigration, w, cx))))
+                .child(self.button("lfs-migration-recovery", "Migration recovery…").ghost().on_click(cx.listener(|this, _, w, cx| this.open_management(Modal::LfsMigrationRecovery, w, cx))))
                 .child(self.button("lfs-untrack","Untrack pattern…").on_click(cx.listener(|this,_,w,cx|this.show_modal(Modal::LfsPattern(false),w,cx))))
                 .child(self.button("lfs-checkout","Checkout local objects").ghost().on_click(cx.listener(|this,_,_,cx|this.perform(Operation::LfsCheckout,cx))))
                 .child(self.button("lfs-refresh","Refresh").ghost().on_click(cx.listener(|this,_,w,cx|this.open_management(Modal::Lfs,w,cx)))))
@@ -419,6 +464,81 @@ impl GitBuddy {
             .when(self.snapshot.remotes.is_empty(),|v|v.child(div().text_xs().text_color(rgb(MUTED)).child("Configure a remote such as origin before network transfers.")))
             .into_any_element()
     }
+    fn lfs_migration_plan(
+        &self,
+        plan: &Arc<git::LfsMigrationPlan>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let reviewed = plan.clone();
+        v_flex().gap_3()
+            .child(div().id("lfs-migration-plan").max_h(px(400.)).overflow_y_scroll().text_sm().child(plan.report()))
+            .child(self.button("lfs-migration-apply", "Apply reviewed migration…").primary().disabled(plan.original == plan.target).on_click(cx.listener(move |this, _, w, cx| {
+                this.show_modal(Modal::Confirm(format!("Rewrite this branch to the reviewed LFS candidate?\n{}\nCommitted originals and affected worktree bytes are preserved for recovery. Existing remotes will require a separately reviewed push.", reviewed.report()), Operation::LfsMigrate(reviewed.clone())), w, cx);
+            })))
+            .into_any_element()
+    }
+
+    fn checkout_recovery(
+        &self,
+        status: Option<&git::WorktreeRecoveryStatus>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(status) = status else {
+            return div()
+                .child("No interrupted checkout needs recovery.")
+                .into_any_element();
+        };
+        let is_owner = self
+            .repo
+            .as_ref()
+            .is_some_and(|repo| repo.root == status.owner);
+        let expected_continue = status.expected.clone();
+        let expected_abort = status.expected.clone();
+        let before = status.original_head.clone();
+        let after = status.target_head.clone();
+        let owner = status.owner.clone();
+        let phase = match status.phase.as_str() {
+            "Ready" => "Working files are prepared; reference publication needs confirmation.",
+            "NativeComplete" => {
+                "The native checkout finished; prepared working bytes still need completion."
+            }
+            "Aborting" => "Restoring the original checkout was interrupted.",
+            _ => {
+                "The checkout was interrupted before its result could be verified. Restore the original checkout before retrying."
+            }
+        };
+        v_flex().gap_3()
+            .child(div().text_sm().child(format!("{}\n{} → {}", phase, status.original_head, status.target_head)))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(format!("Owning worktree: {}\nRecovery files: {}", status.owner.display(), status.recovery.display())))
+            .child(div().text_xs().text_color(rgb(MUTED)).child("Recovery uses the saved working bytes. Unknown file or reference changes stop recovery and are kept for inspection."))
+            .when(!is_owner, |view| view.child(self.button("open-checkout-owner", "Open owning worktree").on_click(cx.listener(move |this, _, _, cx| this.open(owner.clone(), cx)))))
+            .child(h_flex().gap_2()
+                .child(self.button("continue-checkout", "Continue checkout…").primary().disabled(!is_owner || !status.can_continue).on_click(cx.listener(move |this, _, w, cx| this.show_modal(Modal::Confirm(format!("Finish the prepared checkout and publish its recorded reference transition?\n\n{before}\n→ {after}"), Operation::ContinueWorktreeCheckout { expected: expected_continue.clone() }), w, cx))))
+                .child(self.button("abort-checkout", "Restore original checkout…").disabled(!is_owner).on_click(cx.listener(move |this, _, w, cx| this.show_modal(Modal::Confirm("Restore the saved original working bytes, index and references? Recovery stops if it finds unknown edits; keep the recovery directory until the result is verified.".into(), Operation::AbortWorktreeCheckout { expected: expected_abort.clone() }), w, cx)))))
+            .into_any_element()
+    }
+
+    fn lfs_migration_recovery(
+        &self,
+        status: Option<&git::LfsMigrationStatus>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(status) = status else {
+            return div()
+                .child("No LFS history migration needs recovery.")
+                .into_any_element();
+        };
+        let continue_expected = status.expected.clone();
+        let abort_expected = status.expected.clone();
+        v_flex().gap_3()
+            .child(div().text_sm().child(format!("{} · {}\n{} → {}\nOwning worktree: {}\nRecovery files: {}", status.branch, status.phase, status.original, status.target, status.owner.display(), status.recovery.display())))
+            .child(div().text_xs().text_color(rgb(MUTED)).child("Continue verifies the recorded completed checkout before publishing. Abort preserves affected current files and the index before restoring the original snapshot."))
+            .child(h_flex().gap_2()
+                .child(self.button("continue-lfs-migration", "Continue migration…").disabled(!status.can_continue).on_click(cx.listener(move |this, _, w, cx| this.show_modal(Modal::Confirm("Verify the completed migration checkout and publish its reviewed branch tip?".into(), Operation::ContinueLfsMigration { expected: continue_expected.clone() }), w, cx))))
+                .child(self.button("abort-lfs-migration", "Abort migration…").on_click(cx.listener(move |this, _, w, cx| this.show_modal(Modal::Confirm("Preserve affected current files and the index, then restore the original branch, index and worktree snapshot?".into(), Operation::AbortLfsMigration { expected: abort_expected.clone() }), w, cx)))))
+            .into_any_element()
+    }
+
     fn lfs_locks_view(
         &self,
         remote: &str,

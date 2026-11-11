@@ -2,7 +2,7 @@ use super::*;
 use gitbuddy::settings::{Preferences, SHORTCUTS};
 
 const KEY_SOURCE: KeyBindingMetaIndex = KeyBindingMetaIndex(0x4742);
-fn action(name: &str) -> Box<dyn Action> {
+pub(super) fn action(name: &str) -> Box<dyn Action> {
     match name {
         "open" => Box::new(OpenRepository),
         "clone" => Box::new(CloneRepository),
@@ -11,7 +11,13 @@ fn action(name: &str) -> Box<dyn Action> {
         "commit" => Box::new(CommitChanges),
         "amend" => Box::new(AmendCommit),
         "reflog" => Box::new(OpenReflog),
+        "rebase" => Box::new(OpenRebase),
+        "worktrees" => Box::new(OpenWorktrees),
+        "submodules" => Box::new(OpenSubmodules),
+        "lfs" => Box::new(OpenLfs),
+        "remotes" => Box::new(OpenRemotes),
         "compare" => Box::new(CompareRevisions),
+        "go_to_commit" => Box::new(GoToCommit),
         "conflicts" => Box::new(OpenConflicts),
         "fetch" => Box::new(Fetch),
         "pull" => Box::new(Pull),
@@ -19,6 +25,9 @@ fn action(name: &str) -> Box<dyn Action> {
         "next_tab" => Box::new(NextTab),
         "previous_tab" => Box::new(PreviousTab),
         "close_tab" => Box::new(CloseTab),
+        "reopen_tab" => Box::new(ReopenTab),
+        "command_palette" => Box::new(CommandPalette),
+        "checkout_recovery" => Box::new(RecoverCheckout),
         "cancel_task" => Box::new(CancelTask),
         "task_log" => Box::new(OpenTaskLog),
         "preferences" => Box::new(OpenPreferences),
@@ -183,6 +192,8 @@ impl GitBuddy {
             preferences.commit_cache_mb.to_string(),
             preferences.patch_cache_entries.to_string(),
             preferences.patch_cache_mb.to_string(),
+            preferences.sidebar_width.to_string(),
+            preferences.history_width.to_string(),
         ];
         values.extend(
             SHORTCUTS
@@ -222,13 +233,15 @@ impl GitBuddy {
                 commit_cache_mb: number(2)?,
                 patch_cache_entries: number(3)?,
                 patch_cache_mb: number(4)?,
+                sidebar_width: number(5)?,
+                history_width: number(6)?,
                 shortcuts: SHORTCUTS
                     .iter()
                     .enumerate()
                     .map(|(i, (name, _, _))| {
                         (
                             name.to_string(),
-                            self.preference_fields[i + 5]
+                            self.preference_fields[i + 7]
                                 .read(cx)
                                 .value()
                                 .trim()
@@ -263,6 +276,8 @@ impl GitBuddy {
             ("Commit cache budget", "1–128 MB"),
             ("Diff cache entries", "1–64 entries"),
             ("Diff cache budget", "16–512 MB"),
+            ("Sidebar width", "150–360 px"),
+            ("History width", "270–650 px"),
         ];
         div().absolute().inset_0().occlude().bg(rgba(0x00000088)).flex().items_center().justify_center()
             .child(v_flex().w(px(720.)).max_h(px(620.)).p_4().gap_2().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).rounded_lg()
@@ -270,6 +285,9 @@ impl GitBuddy {
                     .child(self.button("preferences-close", "×").disabled(false).ghost().on_click(cx.listener(|this, _, w, cx| { this.modal = None; this.focus.focus(w, cx); cx.notify(); }))))
                 .child(div().text_xs().text_color(rgb(MUTED)).child("Limits apply per repository. Active documents and worker allocations are separate."))
                 .child(v_flex().id("preferences-scroll").h(px(430.)).overflow_y_scroll().gap_2()
+                    .child(h_flex().gap_2().children([(gitbuddy::settings::Appearance::Dark,"Dark"),(gitbuddy::settings::Appearance::Light,"Light"),(gitbuddy::settings::Appearance::System,"Follow system")].into_iter().map(|(appearance,label)| self.button(label,label).ghost().when(self.settings.appearance==appearance,|b|b.text_color(rgb(ACCENT))).on_click(cx.listener(move|this,_,w,cx| {
+                        match this.settings.set_appearance(appearance) { Ok(())=>theme::apply(appearance,w,cx),Err(error)=>this.modal_error=Some(format!("{error:#}")) } cx.notify();
+                    })))))
                     .child(section("PERFORMANCE"))
                     .children(performance.iter().enumerate().map(|(i, (label, range))| h_flex().gap_3()
                         .child(div().w(px(185.)).text_xs().child(*label))
@@ -279,7 +297,7 @@ impl GitBuddy {
                     .child(div().text_xs().text_color(rgb(MUTED)).child("secondary = Cmd on macOS / Ctrl elsewhere. Example: secondary-r or ctrl-k ctrl-o. Leave empty to disable."))
                     .children(SHORTCUTS.iter().enumerate().map(|(i, (_, label, _))| h_flex().gap_3()
                         .child(div().w(px(185.)).text_xs().child(*label))
-                        .child(div().flex_1().child(Input::new(&self.preference_fields[i + 5]).small())))))
+                        .child(div().flex_1().child(Input::new(&self.preference_fields[i + 7]).small())))))
                 .when_some(self.modal_error.clone(), |col, error| col.child(div().text_xs().text_color(rgb(0xf0a4aa)).child(error)))
                 .child(h_flex().gap_2()
                     .child(self.button("reset-preferences", "Load defaults").disabled(false).on_click(cx.listener(|this, _, w, cx| {

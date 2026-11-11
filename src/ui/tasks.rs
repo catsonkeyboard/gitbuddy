@@ -713,6 +713,7 @@ impl RepoTab {
             }
             self.history_search_generation += 1;
             self.history_search = None;
+            self.history_search_previous.clear();
         }
         if self.selection != *requested {
             loaded.selection = self.selection.clone();

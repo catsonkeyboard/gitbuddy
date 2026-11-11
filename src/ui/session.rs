@@ -140,7 +140,7 @@ impl ViewScroll {
     }
 }
 impl RepoTab {
-    fn session_tab(&self) -> Option<disk::Tab> {
+    pub(super) fn session_tab(&self) -> Option<disk::Tab> {
         let path = self
             .repo
             .as_ref()
