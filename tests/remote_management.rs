@@ -646,3 +646,43 @@ fn file_url_lease_and_configuration_changes_are_checked() {
     assert!(f.repo.execute(Operation::PushTo(Arc::new(plan))).is_err());
     assert_eq!(f.target("refs/heads/main"), Some(f.base));
 }
+
+#[cfg(unix)]
+#[test]
+fn pre_push_hook_receives_pinned_updates_and_can_block_push() {
+    use std::os::unix::fs::PermissionsExt;
+    for lease in [false, true] {
+        let f = Fixture::new();
+        let id = commit(&f.repo, "new commit");
+        let r = raw(&f.repo);
+        let hooks = f.repo.root.join("hooks-for-test");
+        fs::create_dir(&hooks).unwrap();
+        r.config()
+            .unwrap()
+            .set_str("core.hooksPath", hooks.to_str().unwrap())
+            .unwrap();
+        let hook = hooks.join("pre-push");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > hook-remote\ncat > hook-input\nexit 7\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let plan = f.repo.prepare_push(f.selection(lease)).unwrap();
+        assert!(f.repo.execute(Operation::PushTo(Arc::new(plan))).is_err());
+        assert_eq!(f.target("refs/heads/main"), Some(f.base));
+        assert_eq!(
+            fs::read_to_string(f.repo.root.join("hook-remote")).unwrap(),
+            "origin\n"
+        );
+        let input = fs::read_to_string(f.repo.root.join("hook-input")).unwrap();
+        assert_eq!(
+            input,
+            format!("refs/heads/main {id} refs/heads/main {}\n", f.base)
+        );
+        fs::write(&hook, "#!/bin/sh\ncat > hook-input\nexit 0\n").unwrap();
+        let plan = f.repo.prepare_push(f.selection(lease)).unwrap();
+        f.repo.execute(Operation::PushTo(Arc::new(plan))).unwrap();
+        assert_eq!(f.target("refs/heads/main"), Some(id));
+    }
+}

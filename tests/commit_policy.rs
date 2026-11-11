@@ -253,3 +253,192 @@ fn isolated_openpgp_commit_verifies_with_git() {
         String::from_utf8_lossy(&verify.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn post_checkout_and_rewrite_hooks_receive_arguments_and_mapping() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, repo) = setup();
+    fs::write(repo.root.join("base"), "base").unwrap();
+    repo.execute(Operation::StageAll).unwrap();
+    repo.execute(Operation::Commit("base".into())).unwrap();
+    let r = git2::Repository::open(&repo.root).unwrap();
+    let old = r.head().unwrap().target().unwrap();
+    let hooks = r.path().join("test-hooks");
+    fs::create_dir(&hooks).unwrap();
+    r.config()
+        .unwrap()
+        .set_str("core.hooksPath", hooks.to_str().unwrap())
+        .unwrap();
+    let checkout = hooks.join("post-checkout");
+    fs::write(
+        &checkout,
+        "#!/bin/sh\nprintf '%s %s %s' \"$1\" \"$2\" \"$3\" > checkout-args\n",
+    )
+    .unwrap();
+    fs::set_permissions(&checkout, fs::Permissions::from_mode(0o755)).unwrap();
+    repo.execute(Operation::CreateBranch("topic".into()))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.root.join("checkout-args")).unwrap(),
+        format!("{old} {old} 1")
+    );
+    let rewrite = hooks.join("post-rewrite");
+    fs::write(
+        &rewrite,
+        "#!/bin/sh\nprintf '%s' \"$1\" > rewrite-kind\ncat > rewrite-map\n",
+    )
+    .unwrap();
+    fs::set_permissions(&rewrite, fs::Permissions::from_mode(0o755)).unwrap();
+    let edit = repo.commit_edit().unwrap();
+    repo.execute(Operation::Amend {
+        context: std::sync::Arc::new(edit),
+        message: "amended".into(),
+    })
+    .unwrap();
+    let new = r.head().unwrap().target().unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.root.join("rewrite-kind")).unwrap(),
+        "amend"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("rewrite-map")).unwrap(),
+        format!("{old} {new}\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn x509_signed_commit_and_tag_are_accepted_by_system_git() {
+    use std::os::unix::fs::PermissionsExt;
+    for tool in ["gpgsm", "openssl"] {
+        if Command::new(tool).arg("--version").output().is_err() {
+            eprintln!("{tool} unavailable; skipping X.509 fixture");
+            return;
+        }
+    }
+    let home = tempfile::Builder::new()
+        .prefix("gb-x509-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    struct Agent(std::path::PathBuf);
+    impl Drop for Agent {
+        fn drop(&mut self) {
+            let _ = Command::new("gpgconf")
+                .arg("--homedir")
+                .arg(&self.0)
+                .args(["--kill", "all"])
+                .output();
+        }
+    }
+    let _agent = Agent(home.path().into());
+    let run = |cmd: &mut Command| {
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let key = home.path().join("key.pem");
+    let cert = home.path().join("cert.pem");
+    let bundle = home.path().join("fixture.p12");
+    run(Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=GitBuddy Test/emailAddress=tester@example.invalid",
+            "-days",
+            "1",
+            "-keyout",
+        ])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert));
+    run(Command::new("openssl")
+        .args(["pkcs12", "-export", "-legacy", "-inkey"])
+        .arg(&key)
+        .arg("-in")
+        .arg(&cert)
+        .arg("-out")
+        .arg(&bundle)
+        .args(["-passout", "pass:"]));
+    run(Command::new("gpgsm")
+        .arg("--homedir")
+        .arg(home.path())
+        .args([
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--import",
+        ])
+        .arg(&bundle));
+    let output = run(Command::new("gpgsm")
+        .arg("--homedir")
+        .arg(home.path())
+        .args(["--with-colons", "--list-secret-keys"]));
+    let listing = String::from_utf8(output.stdout).unwrap();
+    let fingerprint = listing
+        .lines()
+        .find(|l| l.starts_with("fpr:"))
+        .unwrap()
+        .split(':')
+        .nth(9)
+        .unwrap();
+    fs::write(
+        home.path().join("trustlist.txt"),
+        format!("{fingerprint} S\n"),
+    )
+    .unwrap();
+    let (dir, repo) = setup();
+    let program = dir.path().join("fixture-gpgsm.py");
+    // GnuPG 2.5 on this host reads detached payloads reliably from named files.
+    // Materialize Git's stdin argument only in the isolated fixture wrapper.
+    fs::write(&program,format!("#!/usr/bin/env python3\nimport os,sys,tempfile,subprocess\nbase=['gpgsm','--homedir',{:?},'--batch','--pinentry-mode','loopback','--passphrase','','--disable-crl-checks']\nargs=sys.argv[1:]\nif '-' in args:\n with tempfile.NamedTemporaryFile() as f:\n  f.write(sys.stdin.buffer.read());f.flush()\n  sys.exit(subprocess.run(base+[f.name if arg=='-' else arg for arg in args]).returncode)\nelse:\n os.execvp('gpgsm',base+args)\n",home.path().to_str().unwrap())).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let r = git2::Repository::open(&repo.root).unwrap();
+    let mut cfg = r.config().unwrap();
+    cfg.set_str("gpg.format", "x509").unwrap();
+    cfg.set_str("gpg.x509.program", program.to_str().unwrap())
+        .unwrap();
+    cfg.set_str("user.signingkey", fingerprint).unwrap();
+    cfg.set_bool("commit.gpgsign", true).unwrap();
+    repo.execute(Operation::CommitEmpty("X.509 fixture".into()))
+        .unwrap();
+    let id = r.head().unwrap().target().unwrap().to_string();
+    assert!(repo.verify_commit_signature(&id).unwrap().contains("X.509"));
+    run(Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["verify-commit", &id]));
+    let target = repo.prepare_tag_target("HEAD").unwrap();
+    let plan = repo
+        .prepare_tag(
+            &target,
+            gitbuddy::git::TagSpec {
+                name: "x509-fixture".into(),
+                kind: gitbuddy::git::TagKind::Signed,
+                message: "fixture".into(),
+                signer: Some(gitbuddy::git::TagSigner {
+                    format: gitbuddy::git::TagSigningFormat::X509,
+                    key: fingerprint.into(),
+                    program: program.to_string_lossy().into_owned(),
+                }),
+            },
+        )
+        .unwrap();
+    repo.execute(Operation::CreateTag(std::sync::Arc::new(plan)))
+        .unwrap();
+    run(Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["verify-tag", "x509-fixture"]));
+}

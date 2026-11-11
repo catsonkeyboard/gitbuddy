@@ -88,7 +88,7 @@ impl GitBuddy {
         let kind = self.tag_kind;
         if kind == git::TagKind::Signed && !self.tag_format_selected {
             self.modal_error = Some(
-                "Configured signature format is unsupported. Explicitly choose OpenPGP or SSH."
+                "Configured signature format is unsupported. Explicitly choose OpenPGP, SSH or X.509."
                     .into(),
             );
             cx.notify();
@@ -235,10 +235,10 @@ impl GitBuddy {
                         .child(Textarea::new(&self.tag_message).h(px(115.)));
                 }
                 if self.tag_kind == git::TagKind::Signed {
-                    card=card.child(h_flex().gap_2().children([git::TagSigningFormat::OpenPgp,git::TagSigningFormat::Ssh].into_iter().enumerate().map(|(i,format)|self.button(("tag-sign-format",i),format.label()).disabled(self.tag_preparing).when(self.tag_format==format,|b|b.bg(rgb(0x354151)).text_color(rgb(ACCENT))).on_click(cx.listener(move|this,_,w,cx|{
+                    card=card.child(h_flex().gap_2().children([git::TagSigningFormat::OpenPgp,git::TagSigningFormat::Ssh,git::TagSigningFormat::X509].into_iter().enumerate().map(|(i,format)|self.button(("tag-sign-format",i),format.label()).disabled(self.tag_preparing).when(self.tag_format==format,|b|b.bg(rgb(0x354151)).text_color(rgb(ACCENT))).on_click(cx.listener(move|this,_,w,cx|{
                         this.tag_format=format;this.tag_format_selected=true;if let Data::Ready(defaults,_)=&this.tag_data {this.tag_program.update(cx,|s,cx|s.set_value(defaults.program(format),w,cx));}cx.notify();
                     })))))
-                        .child(div().text_xs().text_color(rgb(MUTED)).child("Signing key: OpenPGP ID / identity, or SSH key path / key::public-key"))
+                        .child(div().text_xs().text_color(rgb(MUTED)).child("Signing key: OpenPGP / X.509 identity, or SSH key path / key::public-key"))
                         .child(Input::new(&self.tag_key).disabled(self.tag_preparing))
                         .child(div().text_xs().text_color(rgb(MUTED)).child("Signing executable (path only; uses agent / pinentry for unlocking)"))
                         .child(Input::new(&self.tag_program).disabled(self.tag_preparing))

@@ -183,6 +183,54 @@ pub(super) fn local_destination(
     Ok(Some(root.join(path)))
 }
 
+fn run_pre_push<'a>(
+    repo: &git2::Repository,
+    plan: &PushPlan,
+    remote_ids: impl Iterator<Item = (&'a str, Oid)>,
+    control: &NetworkControl,
+) -> Result<()> {
+    let ids: std::collections::BTreeMap<_, _> = remote_ids.collect();
+    let mut input = String::new();
+    for update in &plan.updates {
+        let old = ids
+            .get(update.target.as_str())
+            .context("Hook target missing from negotiation")?;
+        input.push_str(&format!(
+            "{} {} {} {}\n",
+            if update.id.is_zero() {
+                "(delete)"
+            } else {
+                update.source.as_str()
+            },
+            update.id,
+            update.target,
+            old
+        ));
+    }
+    super::commit_policy::run_hook_input(
+        repo,
+        "pre-push",
+        &[
+            std::ffi::OsStr::new(&plan.remote.name),
+            std::ffi::OsStr::new(plan.remote.destination()),
+        ],
+        input.as_bytes(),
+        control,
+    )?;
+    check_remote(repo, &plan.remote)?;
+    for update in &plan.updates {
+        ensure!(
+            repo.find_reference(&update.source)?.target()
+                == Some(if update.id.is_zero() {
+                    update.lease.context("Missing delete lease")?
+                } else {
+                    update.id
+                }),
+            "Hook changed a push source; review and push again"
+        );
+    }
+    Ok(())
+}
 fn push_local_leased(
     source: &git2::Repository,
     path: &std::path::Path,
@@ -230,6 +278,15 @@ fn push_local_leased(
         }
         old_ids.push(old);
     }
+    run_pre_push(
+        source,
+        plan,
+        ordered
+            .iter()
+            .zip(old_ids.iter())
+            .map(|(update, old)| (update.target.as_str(), *old)),
+        control,
+    )?;
     if plan.is_deletion() {
         let update = ordered[0];
         ensure!(
@@ -714,6 +771,8 @@ impl Repository {
         let updates = plan.updates.clone();
         let deleting = plan.is_deletion();
         let negotiation = control.clone();
+        let hook_plan = plan.clone();
+        let hook_repo = super::libgit::raw(self)?;
         callbacks.push_negotiation(move |proposed| {
             negotiation.check_git()?;
             for update in &updates {
@@ -734,6 +793,7 @@ impl Repository {
                     }
                 }
             }
+            run_pre_push(&hook_repo,&hook_plan,proposed.iter().map(|p| (p.dst_refname().unwrap_or_default(),p.src())),&negotiation).map_err(|e|git2::Error::from_str(&format!("pre-push hook: {e:#}")))?;
             negotiation.phase(if deleting { "Delete remote branch: preparing deletion…" } else { "Push: preparing upload…" });
             negotiation.cancellation.finish().map_err(|_| git2::Error::from_str("Operation cancelled"))?;
             negotiation.phase(if deleting { "Delete remote branch: waiting for remote confirmation…" } else { "Push: uploading; waiting for remote confirmation…" });

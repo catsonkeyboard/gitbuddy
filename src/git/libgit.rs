@@ -962,6 +962,33 @@ impl Repository {
                 }
         );
         let initial = raw(self)?;
+        let checkout_hook = matches!(
+            &operation,
+            Operation::Checkout(_)
+                | Operation::TrackBranch(_)
+                | Operation::CreateBranch(_)
+                | Operation::CheckoutDetached(_)
+        );
+        let merge_hook = match &operation {
+            Operation::MergeWith { mode, .. } => Some(matches!(mode, super::MergeMode::Squash)),
+            Operation::Merge(_)
+            | Operation::Pull
+            | Operation::PullWith {
+                strategy: super::PullStrategy::Merge | super::PullStrategy::FastForwardOnly,
+                ..
+            } => Some(false),
+            _ => None,
+        };
+        let hook_head = initial
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .unwrap_or(Oid::ZERO_SHA1);
+        let hook_index = if merge_hook.is_some() {
+            initial.index()?.path().map(fs::read).transpose()?
+        } else {
+            None
+        };
         ensure!(
             matches!(&operation, Operation::RecoverPatch)
                 || !super::patch_batch::recovery_pending(&initial),
@@ -1472,6 +1499,57 @@ impl Repository {
         } else {
             result
         };
+        let result = result.map(|mut message| {
+            let repo = raw(self);
+            if let Ok(repo) = repo {
+                let head = repo
+                    .head()
+                    .ok()
+                    .and_then(|h| h.target())
+                    .unwrap_or(Oid::ZERO_SHA1);
+                let report = if checkout_hook {
+                    let old = hook_head.to_string();
+                    let new = head.to_string();
+                    Some(super::commit_policy::run_hook_input(
+                        &repo,
+                        "post-checkout",
+                        &[
+                            std::ffi::OsStr::new(&old),
+                            std::ffi::OsStr::new(&new),
+                            std::ffi::OsStr::new("1"),
+                        ],
+                        b"",
+                        &NetworkControl::default(),
+                    ))
+                } else if let Some(squash) = merge_hook {
+                    let changed = head != hook_head
+                        || repo
+                            .index()
+                            .ok()
+                            .and_then(|i| i.path().map(fs::read).and_then(Result::ok))
+                            != hook_index;
+                    if changed {
+                        Some(super::commit_policy::run_hook_input(
+                            &repo,
+                            "post-merge",
+                            &[std::ffi::OsStr::new(if squash { "1" } else { "0" })],
+                            b"",
+                            &NetworkControl::default(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(Err(error)) = report {
+                    message.push_str(&format!(
+                        "; operation completed but post-operation hook failed: {error:#}"
+                    ));
+                }
+            }
+            message
+        });
         control.normalize(result)
     }
 }

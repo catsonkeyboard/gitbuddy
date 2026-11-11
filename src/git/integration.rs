@@ -442,11 +442,31 @@ impl Repository {
                 return Ok("Squash result staged; review and commit to create a single-parent commit (HEAD unchanged)".into());
             }
             let mut index = repo.index()?;
-            ensure!(!index.has_conflicts(), "Merge has conflicts; resolve or abort");
+            ensure!(
+                !index.has_conflicts(),
+                "Merge has conflicts; resolve or abort"
+            );
+            let message = super::commit_policy::prepare_merge_message(
+                &repo,
+                &format!("Merge branch '{name}'"),
+            )?;
+            let _index_lock =
+                super::conflicts::IndexLock::acquire(index.path().context("Missing index")?)?;
+            index.read(true)?;
+            ensure!(
+                !index.has_conflicts(),
+                "A hook introduced conflicts; resolve before committing"
+            );
             let tree = repo.find_tree(index.write_tree()?)?;
             let other = repo.find_commit(target)?;
-            let message = format!("Merge branch '{name}'");
-            let id = super::commit_policy::create_object(&repo, &signature, &signature, &message, &tree, &[&head, &other])?;
+            let id = super::commit_policy::create_object(
+                &repo,
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                &[&head, &other],
+            )?;
             refs.set_target(&original.reference, id, Some(&signature), "gitbuddy: merge")?;
             refs.commit()?;
             repo.cleanup_state()?;

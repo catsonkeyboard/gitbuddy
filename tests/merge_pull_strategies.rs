@@ -881,3 +881,49 @@ fn lfs_conflicts_can_be_resolved_or_aborted_for_merge_and_squash() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn merge_specific_hooks_can_block_merge_and_report_completed_merge() {
+    use std::os::unix::fs::PermissionsExt;
+    for reject in [false, true] {
+        let f = MergeFixture::new(true, false);
+        let r = raw(&f.repo);
+        let hooks = r.path().join("integration-hooks");
+        fs::create_dir(&hooks).unwrap();
+        r.config()
+            .unwrap()
+            .set_str("core.hooksPath", hooks.to_str().unwrap())
+            .unwrap();
+        let pre = hooks.join("pre-merge-commit");
+        fs::write(
+            &pre,
+            if reject {
+                "#!/bin/sh\nexit 3\n"
+            } else {
+                "#!/bin/sh\nexit 0\n"
+            },
+        )
+        .unwrap();
+        fs::set_permissions(&pre, fs::Permissions::from_mode(0o755)).unwrap();
+        let post = hooks.join("post-merge");
+        fs::write(
+            &post,
+            "#!/bin/sh\nprintf '%s' \"$1\" > \"$GIT_DIR/merge-hook-result\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&post, fs::Permissions::from_mode(0o755)).unwrap();
+        let result = merge(&f.repo, MergeMode::Auto);
+        if reject {
+            assert!(result.is_err());
+            assert_eq!(head(&f.repo), f.original);
+            assert!(!r.path().join("merge-hook-result").exists());
+        } else {
+            result.unwrap();
+            assert_eq!(
+                fs::read_to_string(r.path().join("merge-hook-result")).unwrap(),
+                "0"
+            );
+        }
+    }
+}

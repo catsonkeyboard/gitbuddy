@@ -231,6 +231,26 @@ impl Repository {
                 "; post-commit hook failed after commit: {error:#}"
             ));
         }
+        let input = format!(
+            "{} {}\n",
+            context
+                .head
+                .id
+                .as_deref()
+                .context("Missing original commit")?,
+            repo.head()?.peel_to_commit()?.id()
+        );
+        if let Err(error) = super::commit_policy::run_hook_input(
+            &repo,
+            "post-rewrite",
+            &[std::ffi::OsStr::new("amend")],
+            input.as_bytes(),
+            &super::NetworkControl::default(),
+        ) {
+            outcome.push_str(&format!(
+                "; post-rewrite hook failed after amend: {error:#}"
+            ));
+        }
         Ok(outcome)
     }
 

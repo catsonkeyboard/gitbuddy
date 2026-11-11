@@ -362,6 +362,11 @@ fn signing_defaults_read_effective_config_and_unsupported_formats_are_reported()
     assert_eq!(defaults.program(TagSigningFormat::OpenPgp), "preferred-gpg");
     assert_eq!(defaults.program(TagSigningFormat::Ssh), "custom-ssh");
     c.set_str("gpg.format", "x509").unwrap();
+    assert_eq!(
+        f.repo.tag_defaults().unwrap().format,
+        TagSigningFormat::X509
+    );
+    c.set_str("gpg.format", "unsupported-format").unwrap();
     assert!(
         f.repo
             .tag_defaults()

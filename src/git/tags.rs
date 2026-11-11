@@ -35,18 +35,21 @@ pub enum TagSigningFormat {
     #[default]
     OpenPgp,
     Ssh,
+    X509,
 }
 impl TagSigningFormat {
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenPgp => "OpenPGP",
             Self::Ssh => "SSH",
+            Self::X509 => "X.509",
         }
     }
     pub fn program(self) -> &'static str {
         match self {
             Self::OpenPgp => "gpg",
             Self::Ssh => "ssh-keygen",
+            Self::X509 => "gpgsm",
         }
     }
     fn markers(self) -> (&'static str, &'static str) {
@@ -58,6 +61,10 @@ impl TagSigningFormat {
             Self::Ssh => (
                 "-----BEGIN SSH SIGNATURE-----",
                 "-----END SSH SIGNATURE-----",
+            ),
+            Self::X509 => (
+                "-----BEGIN SIGNED MESSAGE-----",
+                "-----END SIGNED MESSAGE-----",
             ),
         }
     }
@@ -82,6 +89,7 @@ pub struct TagDefaults {
     pub key: String,
     pub openpgp_program: String,
     pub ssh_program: String,
+    pub x509_program: String,
     pub notice: Option<String>,
 }
 impl TagDefaults {
@@ -89,6 +97,7 @@ impl TagDefaults {
         match format {
             TagSigningFormat::OpenPgp => self.openpgp_program.clone(),
             TagSigningFormat::Ssh => self.ssh_program.clone(),
+            TagSigningFormat::X509 => self.x509_program.clone(),
         }
     }
 }
@@ -213,7 +222,9 @@ impl Repository {
         let repo = raw(self)?;
         let config = repo.config()?.snapshot()?;
         let configured = config_string(&config, "gpg.format")?.unwrap_or_else(|| "openpgp".into());
-        let format = if configured == "ssh" {
+        let format = if configured == "x509" {
+            TagSigningFormat::X509
+        } else if configured == "ssh" {
             TagSigningFormat::Ssh
         } else {
             TagSigningFormat::OpenPgp
@@ -223,10 +234,11 @@ impl Repository {
             Err(e) if e.code() == ErrorCode::NotFound => false,
             Err(e) => return Err(e.into()),
         };
-        Ok(TagDefaults {signed,format,key:config_string(&config,"user.signingkey")?.unwrap_or_else(||if format==TagSigningFormat::OpenPgp {config_string(&config,"user.email").ok().flatten().unwrap_or_default()}else{String::new()}),
+        Ok(TagDefaults {signed,format,key:config_string(&config,"user.signingkey")?.unwrap_or_else(||if format!=TagSigningFormat::Ssh {config_string(&config,"user.email").ok().flatten().unwrap_or_default()}else{String::new()}),
             openpgp_program:config_string(&config,"gpg.openpgp.program")?.or(config_string(&config,"gpg.program")?).unwrap_or_else(||"gpg".into()),
             ssh_program:config_string(&config,"gpg.ssh.program")?.unwrap_or_else(||"ssh-keygen".into()),
-            notice:(!["ssh","openpgp"].contains(&configured.as_str())).then(||format!("Configured signing format {configured} is unsupported here. Explicitly choose OpenPGP or SSH to sign.")),})
+            x509_program:config_string(&config,"gpg.x509.program")?.unwrap_or_else(||"gpgsm".into()),
+            notice:(!["ssh","openpgp","x509"].contains(&configured.as_str())).then(||format!("Configured signing format {configured} is unsupported here. Explicitly choose OpenPGP, SSH or X.509 to sign.")),})
     }
     pub fn prepare_tag_target(&self, revision: &str) -> Result<TagTarget> {
         let repo = raw(self)?;
@@ -397,6 +409,12 @@ pub(super) fn sign_and_verify(
     control.check()?;
     let mut command = Command::new(&signer.program);
     match signer.format {
+        TagSigningFormat::X509 => {
+            command
+                .args(["--no-tty", "--status-fd=2", "-bsau"])
+                .arg(&signer.key)
+                .arg(&input);
+        }
         TagSigningFormat::OpenPgp => {
             command
                 .args([
@@ -444,6 +462,12 @@ pub(super) fn sign_and_verify(
     control.check()?;
     let mut verify = Command::new(&signer.program);
     match signer.format {
+        TagSigningFormat::X509 => {
+            verify
+                .args(["--no-tty", "--verify"])
+                .arg(&signature_path)
+                .arg(&input);
+        }
         TagSigningFormat::OpenPgp => {
             verify
                 .args(["--no-tty", "--verify"])

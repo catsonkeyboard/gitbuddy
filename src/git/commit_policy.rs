@@ -18,7 +18,7 @@ fn hook_path(repo: &RawRepo, name: &str) -> Result<std::path::PathBuf> {
     Ok(path.join(name))
 }
 
-fn run_hook(repo: &RawRepo, name: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
+fn executable_hook(repo: &RawRepo, name: &str) -> Result<Option<std::path::PathBuf>> {
     let path = hook_path(repo, name)?;
     let metadata = match fs::metadata(&path) {
         Ok(m) => m,
@@ -28,7 +28,7 @@ fn run_hook(repo: &RawRepo, name: &str, args: &[&std::ffi::OsStr]) -> Result<()>
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            return Ok(());
+            return Ok(None);
         }
         Err(e) => return Err(e.into()),
     };
@@ -36,44 +36,71 @@ fn run_hook(repo: &RawRepo, name: &str, args: &[&std::ffi::OsStr]) -> Result<()>
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o111 == 0 {
-            return Ok(());
+            return Ok(None);
         }
     }
     ensure!(metadata.is_file(), "Hook {name} is not a file");
+    Ok(Some(path))
+}
+
+fn run_hook(repo: &RawRepo, name: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
+    run_hook_input(repo, name, args, b"", &NetworkControl::default())
+}
+pub(super) fn run_hook_input(
+    repo: &RawRepo,
+    name: &str,
+    args: &[&std::ffi::OsStr],
+    input: &[u8],
+    control: &NetworkControl,
+) -> Result<()> {
+    let Some(path) = executable_hook(repo, name)? else {
+        return Ok(());
+    };
     let root = repo
         .workdir()
         .context("Hooks require a working directory")?;
     let tmp = tempfile::Builder::new()
         .prefix("gitbuddy-hook-")
         .tempdir()?;
-    let input = tmp.path().join("stdin");
-    fs::write(&input, "")?;
+    let input_path = tmp.path().join("stdin");
+    fs::write(&input_path, input)?;
     let mut command = Command::new(&path);
     command
         .args(args)
         .env("GIT_DIR", repo.path())
         .env("GIT_WORK_TREE", root)
         .env("GIT_EDITOR", ":");
-    super::tags::run_tool(
-        root,
-        &mut command,
-        &input,
-        tmp.path(),
-        &NetworkControl::default(),
-    )
-    .with_context(|| format!("{name} hook failed"))?;
+    super::tags::run_tool(root, &mut command, &input_path, tmp.path(), control)
+        .with_context(|| format!("{name} hook failed"))?;
     Ok(())
 }
 
 pub(super) fn prepare_message(repo: &RawRepo, message: &str, amend: bool) -> Result<String> {
-    run_hook(repo, "pre-commit", &[])?;
+    prepare_message_for(repo, message, amend, "pre-commit")
+}
+pub(super) fn prepare_merge_message(repo: &RawRepo, message: &str) -> Result<String> {
+    prepare_message_for(repo, message, false, "pre-merge-commit")
+}
+fn prepare_message_for(
+    repo: &RawRepo,
+    message: &str,
+    amend: bool,
+    pre_hook: &str,
+) -> Result<String> {
+    run_hook(repo, pre_hook, &[])?;
     let file = tempfile::Builder::new()
         .prefix("gitbuddy-commit-message-")
         .tempfile_in(repo.path())?;
     fs::write(file.path(), message)?;
     let mut args = vec![
         file.path().as_os_str(),
-        std::ffi::OsStr::new(if amend { "commit" } else { "message" }),
+        std::ffi::OsStr::new(if amend {
+            "commit"
+        } else if pre_hook == "pre-merge-commit" {
+            "merge"
+        } else {
+            "message"
+        }),
     ];
     if amend {
         args.push(std::ffi::OsStr::new("HEAD"));
@@ -167,6 +194,10 @@ impl Repository {
             c.args(["-Y", "check-novalidate", "-n", "git", "-s"])
                 .arg(&sig);
             (c, "SSH")
+        } else if text.starts_with("-----BEGIN SIGNED MESSAGE-----") {
+            let mut c = Command::new(defaults.x509_program);
+            c.args(["--no-tty", "--verify"]).arg(&sig).arg(&data);
+            (c, "X.509")
         } else {
             anyhow::bail!("Unsupported commit signature format")
         };
