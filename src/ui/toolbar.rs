@@ -133,6 +133,11 @@ impl GitBuddy {
                                 Box::new(OpenPreferences),
                             )
                             .menu_with_icon("Task log…", IconName::FileText, Box::new(OpenTaskLog))
+                            .menu_with_icon(
+                                "Check for updates…",
+                                IconName::RotateCw,
+                                Box::new(CheckUpdates),
+                            )
                             .menu_with_icon_and_disabled(
                                 "Remote tags…",
                                 IconName::FileText,

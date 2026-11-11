@@ -86,6 +86,7 @@ pub const SHORTCUTS: &[(&str, &str, &str)] = &[
         "secondary-shift-t",
     ),
     ("command_palette", "Command palette", "secondary-shift-p"),
+    ("updates", "Check for updates", ""),
     ("checkout_recovery", "Checkout recovery", ""),
     (
         "cancel_task",

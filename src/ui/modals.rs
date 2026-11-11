@@ -146,6 +146,9 @@ impl GitBuddy {
     }
 
     pub(super) fn modal_view(&self, modal: Modal, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(modal, Modal::Updates) {
+            return self.updates_modal(cx);
+        }
         if let Modal::BatchMainline(ids, revert) = &modal {
             return self.batch_mainline_modal(ids, *revert, cx);
         }
@@ -272,6 +275,7 @@ impl GitBuddy {
             return self.history_modal(kind, cx);
         }
         let (title, label_a, label_b, submit) = match &modal {
+            Modal::Updates => unreachable!(),
             Modal::BatchMainline(_, revert) => (
                 if *revert {
                     "Batch Revert merge parent"

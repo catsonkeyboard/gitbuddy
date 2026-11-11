@@ -21,6 +21,7 @@ mod task_log;
 mod tasks;
 mod theme;
 mod toolbar;
+mod updates;
 use gitbuddy::session::PatchKey;
 use gitbuddy::{
     git::{
@@ -55,6 +56,7 @@ gpui_kit::actions!(
         EditIdentity,
         Refresh,
         GoToCommit,
+        CheckUpdates,
         CheckoutRevision,
         CommitChanges,
         AmendCommit,
@@ -175,6 +177,7 @@ impl PatchLineSelection {
 }
 #[derive(Clone)]
 enum Modal {
+    Updates,
     CommandPalette,
     Integration,
     RemoteOperations,
@@ -415,6 +418,8 @@ impl Default for RepoTab {
     }
 }
 pub struct GitBuddy {
+    update_state: updates::State,
+    update_generation: u64,
     /// Inactive tabs. The slot at `active_index` is `None` because its data
     /// lives in `active`; switching tabs is a `mem::take`, not a field copy.
     tabs: Vec<Option<RepoTab>>,
@@ -526,11 +531,13 @@ impl GitBuddy {
         let conflict_editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
+                this.cancel_update_download();
                 this.tasks.shutdown_and_wait();
                 this.flush_session(cx);
                 async {}
             }),
             cx.on_release(|this, cx| {
+                this.cancel_update_download();
                 this.tasks.shutdown_and_wait();
                 this.flush_session(cx);
             }),
@@ -626,6 +633,8 @@ impl GitBuddy {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut this = Self {
+            update_state: updates::State::Loading,
+            update_generation: 0,
             tabs: Vec::new(),
             closed_tabs: Vec::new(),
             batch_mainlines: BTreeMap::new(),
@@ -1356,6 +1365,9 @@ impl GitBuddy {
 }
 impl Render for GitBuddy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !matches!(self.modal, Some(Modal::Updates)) {
+            self.cancel_update_download();
+        }
         if self.modal.is_none()
             && (std::mem::take(&mut self.tab_focus)
                 || self.tabs.is_empty()
@@ -1458,6 +1470,7 @@ impl Render for GitBuddy {
                 this.refresh_with_notice("Refreshed".into(), cx)
             }))
             .on_action(cx.listener(|this, _: &OpenPreferences, w, cx| this.open_preferences(w, cx)))
+            .on_action(cx.listener(|this, _: &CheckUpdates, w, cx| this.open_updates(w,cx)))
             .on_action(cx.listener(|this, _: &CommandPalette, w, cx| this.show_modal(Modal::CommandPalette,w,cx)))
             .on_action(cx.listener(|this, _: &ReopenTab, _, cx| {
                 if let Some(tab) = this.closed_tabs.pop() {
@@ -1559,6 +1572,7 @@ impl Render for GitBuddy {
             }))
             .on_action(cx.listener(|this, _: &CloseModal, window, cx| {
                 if this.modal.take().is_some() {
+                    this.cancel_update_download();
                     this.discard_lfs_migration_preview();
                     this.focus.focus(window, cx);
                     cx.notify();

@@ -27,6 +27,7 @@ pub(super) fn action(name: &str) -> Box<dyn Action> {
         "close_tab" => Box::new(CloseTab),
         "reopen_tab" => Box::new(ReopenTab),
         "command_palette" => Box::new(CommandPalette),
+        "updates" => Box::new(CheckUpdates),
         "checkout_recovery" => Box::new(RecoverCheckout),
         "cancel_task" => Box::new(CancelTask),
         "task_log" => Box::new(OpenTaskLog),
