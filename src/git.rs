@@ -83,13 +83,18 @@ pub struct Snapshot {
     pub rebase_editing: bool,
     pub squash_pending: bool,
     pub patch_recovery: bool,
+    pub lfs_migration: bool,
     pub worktree_recovery: bool,
     pub squash_message: Option<String>,
 }
 impl Snapshot {
     /// Shared eligibility for the button, keyboard action and backend entry.
     pub fn can_commit(&self) -> bool {
-        if self.squash_pending || self.patch_recovery || self.worktree_recovery {
+        if self.squash_pending
+            || self.patch_recovery
+            || self.lfs_migration
+            || self.worktree_recovery
+        {
             return false;
         }
         Self::commit_allowed(
@@ -178,6 +183,13 @@ pub enum Operation {
         track: bool,
     },
     LfsCheckout,
+    LfsMigrate(std::sync::Arc<LfsMigrationPlan>),
+    ContinueLfsMigration {
+        expected: String,
+    },
+    AbortLfsMigration {
+        expected: String,
+    },
     SetLfsAutoFetch(bool),
     LfsFetch(String),
     LfsPush(String),
@@ -439,6 +451,9 @@ pub use lfs::{LfsFile, LfsStatus};
 #[path = "git/lfs_maintenance.rs"]
 mod lfs_maintenance;
 pub use lfs_maintenance::{LfsLock, LfsLockOwner, LfsLocks, LfsMaintenance};
+#[path = "git/lfs_migration.rs"]
+mod lfs_migration;
+pub use lfs_migration::{LfsMigrationPlan, LfsMigrationStatus};
 #[path = "git/worktree_conversion.rs"]
 pub(in crate::git) mod worktree_conversion;
 pub use worktree_conversion::{
@@ -447,7 +462,9 @@ pub use worktree_conversion::{
 
 impl Operation {
     pub fn is_cancellable(&self) -> bool {
-        self.is_network() || matches!(self,Self::CreateTag(plan) if plan.kind()==TagKind::Signed)
+        self.is_network()
+            || matches!(self,Self::CreateTag(plan) if plan.kind()==TagKind::Signed)
+            || matches!(self, Self::LfsMigrate(_))
     }
     pub fn is_network(&self) -> bool {
         matches!(
@@ -506,6 +523,9 @@ impl Operation {
             Self::CreateWorktree { .. } => "Create worktree",
             Self::AddSubmodule { .. } | Self::UpdateSubmodules { .. } => "Update submodules",
             Self::LfsFetch(_) => "LFS fetch",
+            Self::LfsMigrate(_) => "Migrate branch history to LFS",
+            Self::ContinueLfsMigration { .. } => "Continue LFS migration",
+            Self::AbortLfsMigration { .. } => "Abort LFS migration",
             Self::LfsPush(_) => "LFS push",
             Self::PrepareWorktree(_) => "Prepare worktree",
             Self::UpdateSubmoduleAt(_) => "Update nested submodule",

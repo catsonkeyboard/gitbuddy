@@ -7,6 +7,7 @@ use anyhow::{Context, Result, ensure};
 pub(in crate::git) use attributes::DirectoryView as AttributeDirectoryView;
 pub(in crate::git) use attributes::{
     AttributeQuery, AttributeState, Lookup as AttributeLookup, query as query_attributes,
+    query_from_tree as query_attributes_from_tree,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -482,7 +483,6 @@ pub(super) fn local_smudge_content_at(
     Ok(bytes)
 }
 
-#[cfg(test)]
 pub(super) fn validate_extension_configuration(repo: &git2::Repository) -> Result<()> {
     let fresh = git2::Repository::open(repo.path())?;
     validate_repository_format(&fresh.config()?)?;
@@ -490,6 +490,16 @@ pub(super) fn validate_extension_configuration(repo: &git2::Repository) -> Resul
         require_extension_processors(&fresh, None)?;
     }
     Ok(())
+}
+
+/// Preflight a future checkout without materializing an unbounded Vec or
+/// changing working files. Missing objects intentionally remain placeholders.
+pub(super) fn validate_local_checkout(
+    repo: &git2::Repository,
+    bytes: &[u8],
+    path: &Path,
+) -> Result<bool> {
+    Ok(prepare_checkout_payload(repo, path, bytes, repo.commondir())?.is_some())
 }
 
 /// Prepare an owned working payload on disk, without modifying the worktree

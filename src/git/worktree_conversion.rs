@@ -2654,7 +2654,8 @@ impl Repository {
             repo.state() == git2::RepositoryState::Clean
                 && !super::integration::squash_active(&repo)
                 && !super::rebase::active(&repo)
-                && !super::patch_batch::recovery_pending(&repo),
+                && !super::patch_batch::recovery_pending(&repo)
+                && !super::lfs_migration::pending(&repo),
             "Finish or recover the active repository operation before checking out the worktree"
         );
         let object = repo.revparse_single(target)?;

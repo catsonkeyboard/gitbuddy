@@ -383,6 +383,7 @@ fn fingerprint_of(
     }
     format!("{:?}", repo.state()).hash(&mut hasher);
     super::patch_batch::recovery_pending(repo).hash(&mut hasher);
+    super::lfs_migration::pending(repo).hash(&mut hasher);
     super::worktree_conversion::pending(repo).hash(&mut hasher);
     for name in [
         "gitbuddy-rebase.json",
@@ -786,6 +787,7 @@ impl Repository {
         let squash = super::integration::squash_status(&repo)?;
         Ok(Snapshot {
             patch_recovery: super::patch_batch::recovery_pending(&repo),
+            lfs_migration: super::lfs_migration::pending(&repo),
             worktree_recovery: super::worktree_conversion::pending(&repo),
             squash_pending: squash.as_ref().is_some_and(|s| !s.0),
             squash_message: squash.as_ref().map(|s| s.1.clone()),
@@ -1123,6 +1125,17 @@ impl Repository {
             !super::worktree_conversion::pending(&initial) || checkout_recovery,
             "An interrupted checkout needs recovery; open Repository → Checkout recovery before repository writes"
         );
+        ensure!(
+            !super::lfs_migration::pending(&initial)
+                || matches!(
+                    &operation,
+                    Operation::ContinueLfsMigration { .. }
+                        | Operation::AbortLfsMigration { .. }
+                        | Operation::ContinueWorktreeCheckout { .. }
+                        | Operation::AbortWorktreeCheckout { .. }
+                ),
+            "An LFS migration needs recovery; open LFS migration recovery before modifying this repository"
+        );
         if super::integration::squash_active(&initial) {
             ensure!(
                 matches!(
@@ -1263,6 +1276,13 @@ impl Repository {
                 }
                 Operation::LfsTrack { pattern, track } => self.lfs_track(&pattern, track),
                 Operation::LfsCheckout => self.lfs_checkout(),
+                Operation::LfsMigrate(plan) => self.migrate_lfs(&plan, control.clone()),
+                Operation::ContinueLfsMigration { expected } => {
+                    self.continue_lfs_migration(&expected)
+                }
+                Operation::AbortLfsMigration { expected } => {
+                    self.abort_lfs_migration(&expected, &control)
+                }
                 Operation::SetLfsAutoFetch(enabled) => {
                     repo.config()?.set_bool("gitbuddy.lfsAutoFetch", enabled)?;
                     Ok("LFS auto-fetch preference saved for this repository".into())

@@ -58,6 +58,22 @@ pub(in crate::git) fn query(
     Ok(query_result(&snapshot, values))
 }
 
+/// Source configuration/overrides remain local to `source`; only immutable
+/// repository attribute blobs are read from `objects` (which may be bare).
+pub(in crate::git) fn query_from_tree(
+    source: &git2::Repository,
+    objects: &git2::Repository,
+    tree: git2::Oid,
+    path: &Path,
+    selected: &[&str],
+) -> Result<AttributeQuery> {
+    let snapshot =
+        Snapshot::capture_from(source, objects, path, Lookup::TargetTree(tree), selected)?;
+    let values = snapshot.evaluate()?;
+    snapshot.verify_from(source, objects)?;
+    Ok(query_result(&snapshot, values))
+}
+
 fn query_result(snapshot: &Snapshot, values: BTreeMap<String, AttributeState>) -> AttributeQuery {
     let mut digest = Sha256::new();
     field(&mut digest, b"domain", b"gitbuddy.attribute-query.v1");
@@ -1472,6 +1488,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.values["filter"], AttributeState::Unspecified);
+    }
+
+    #[test]
+    fn foreign_tree_objects_keep_source_case_and_overrides_without_importing_objects() {
+        let (_source_directory, source) = repository();
+        source
+            .config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let objects = git2::Repository::init_bare(directory.path()).unwrap();
+        let blob = objects.blob(b"ASSET.BIN filter=lfs\n").unwrap();
+        let mut builder = objects.treebuilder(None).unwrap();
+        builder.insert(".gitattributes", blob, 0o100644).unwrap();
+        let tree = builder.write().unwrap();
+        assert!(!source.odb().unwrap().exists(tree));
+        let first =
+            query_from_tree(&source, &objects, tree, Path::new("asset.bin"), &["filter"]).unwrap();
+        assert_eq!(
+            first.values["filter"],
+            AttributeState::Value(b"lfs".to_vec())
+        );
+        fs::create_dir_all(source.commondir().join("info")).unwrap();
+        fs::write(
+            source.commondir().join("info/attributes"),
+            b"*.bin -filter\n",
+        )
+        .unwrap();
+        let overridden =
+            query_from_tree(&source, &objects, tree, Path::new("asset.bin"), &["filter"]).unwrap();
+        assert_eq!(overridden.values["filter"], AttributeState::Unset);
+        assert!(!source.odb().unwrap().exists(tree));
+        assert!(!source.odb().unwrap().exists(blob));
     }
 
     #[test]
