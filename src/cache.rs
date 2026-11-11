@@ -105,6 +105,8 @@ impl Weight for crate::git::CommitDetail {
     fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.id.capacity()
+            + self.parents.capacity() * std::mem::size_of::<String>()
+            + self.parents.iter().map(String::capacity).sum::<usize>()
             + self.subject.capacity()
             + self.body.capacity()
             + self.author.capacity()

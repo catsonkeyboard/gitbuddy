@@ -340,7 +340,9 @@ fn history_selection_validates_ancestry_contiguity_and_clean_state() {
     let (_dir, repo, base, old, tip) = setup();
     assert!(
         repo.history_rewrite_preview(std::slice::from_ref(&base), RebaseAction::Edit)
-            .is_err()
+            .unwrap()
+            .0
+            .empty_base
     );
     assert!(
         repo.history_rewrite_preview(&[old.clone(), old.clone()], RebaseAction::Split)
@@ -813,9 +815,22 @@ fn batch_revert_replays_newest_first_and_can_recover_conflicts() {
         .prepare_revert_batch(std::slice::from_ref(&old2))
         .unwrap();
     let _ = repo2.execute(Operation::RevertBatch(Arc::new(plan)));
-    assert!(repo2.rebase_status().unwrap().is_some());
+    assert_eq!(
+        Repository::open(&repo2.root)
+            .unwrap()
+            .rebase_status()
+            .unwrap()
+            .unwrap()
+            .operation,
+        "Revert batch"
+    );
     assert!(!repo2.conflict_session().unwrap().files.is_empty());
-    repo2.execute(Operation::AbortRebase).unwrap();
+    assert!(
+        repo2
+            .execute(Operation::AbortRebase)
+            .unwrap()
+            .starts_with("Revert batch aborted")
+    );
     assert_eq!(repo2.snapshot(5).unwrap().head_id.unwrap(), original);
     assert!(
         fs::read_to_string(repo2.root.join("file"))
@@ -879,7 +894,7 @@ fn root_rebase_onto_unrelated_target_replays_root_and_descendants() {
 }
 
 #[test]
-fn root_rebase_conflict_can_abort_and_root_edit_is_rejected() {
+fn root_rebase_conflict_can_abort() {
     let (_dir, repo, _, _, tip) = setup();
     let raw = raw(&repo);
     let blob = raw.blob(b"different root content\n").unwrap();
@@ -893,16 +908,6 @@ fn root_rebase_conflict_can_abort_and_root_edit_is_rejected() {
         .unwrap()
         .to_string();
     let plan = repo.rebase_preview_onto("--root", Some(&target)).unwrap();
-    let mut invalid = plan.steps.clone();
-    invalid[0].action = RebaseAction::Edit;
-    assert!(
-        repo.execute(Operation::Rebase {
-            context: Arc::new(plan.clone()),
-            steps: invalid
-        })
-        .is_err()
-    );
-    assert_eq!(repo.snapshot(5).unwrap().head_id.unwrap(), tip);
     let _ = repo.execute(Operation::Rebase {
         context: Arc::new(plan.clone()),
         steps: plan.steps,
@@ -911,4 +916,476 @@ fn root_rebase_conflict_can_abort_and_root_edit_is_rejected() {
     assert!(!repo.conflict_session().unwrap().files.is_empty());
     repo.execute(Operation::AbortRebase).unwrap();
     assert_eq!(repo.snapshot(5).unwrap().head_id.unwrap(), tip);
+}
+
+#[test]
+fn root_rewrite_without_onto_keeps_a_real_root_and_supports_split() {
+    let (_dir, repo, base, _, _) = setup();
+    let (preview, mut steps) = repo
+        .history_rewrite_preview(&[base], RebaseAction::Split)
+        .unwrap();
+    assert!(preview.empty_base);
+    steps[0].action = RebaseAction::Split;
+    repo.execute(Operation::Rebase {
+        context: Arc::new(preview),
+        steps,
+    })
+    .unwrap();
+    assert!(repo.rebase_status().unwrap().unwrap().editing);
+    repo.execute(Operation::StageAll).unwrap();
+    repo.execute(Operation::CommitRebase("new root".into()))
+        .unwrap();
+    let reopened = Repository::open(&repo.root).unwrap();
+    reopened.execute(Operation::ContinueRebase).unwrap();
+    let r = raw(&repo);
+    let tip = r.head().unwrap().peel_to_commit().unwrap();
+    let root = tip.parent(0).unwrap().parent(0).unwrap();
+    assert_eq!(root.parent_count(), 0);
+    assert_eq!(root.message().unwrap(), "new root");
+    assert!(repo.root.join("later").exists());
+}
+
+#[test]
+fn root_reword_without_onto_has_no_synthetic_parent() {
+    let (_dir, repo, _, _, _) = setup();
+    let preview = repo.rebase_preview("--root").unwrap();
+    let mut steps = preview.steps.clone();
+    steps[0].action = RebaseAction::Reword;
+    steps[0].message = "rewritten root".into();
+    repo.execute(Operation::Rebase {
+        context: Arc::new(preview),
+        steps,
+    })
+    .unwrap();
+    let r = raw(&repo);
+    let root = r
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .parent(0)
+        .unwrap()
+        .parent(0)
+        .unwrap();
+    assert_eq!(root.parent_count(), 0);
+    assert_eq!(root.message().unwrap(), "rewritten root");
+}
+
+#[test]
+fn graph_rebase_preserves_merge_parents_and_target_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.execute(Operation::SetIdentity(
+        "Graph".into(),
+        "graph@example.invalid".into(),
+    ))
+    .unwrap();
+    fs::write(repo.root.join("base"), "base").unwrap();
+    let base = commit(&repo, "base");
+    repo.execute(Operation::CreateBranch("feature".into()))
+        .unwrap();
+    fs::write(repo.root.join("feature"), "feature").unwrap();
+    commit(&repo, "feature");
+    repo.execute(Operation::Checkout("main".into())).unwrap();
+    fs::write(repo.root.join("main"), "main").unwrap();
+    commit(&repo, "main");
+    repo.execute(Operation::Merge("feature".into())).unwrap();
+    let r = raw(&repo);
+    let old = r.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(old.parent_count(), 2);
+    let base_commit = r.find_commit(base.parse().unwrap()).unwrap();
+    let mut builder = r.treebuilder(Some(&base_commit.tree().unwrap())).unwrap();
+    builder
+        .insert("upstream", r.blob(b"new target").unwrap(), 0o100644)
+        .unwrap();
+    let tree_id = builder.write().unwrap();
+    let tree = r.find_tree(tree_id).unwrap();
+    let sig = r.signature().unwrap();
+    let onto = r
+        .commit(None, &sig, &sig, "target", &tree, &[&base_commit])
+        .unwrap()
+        .to_string();
+    let preview = repo
+        .rebase_preview_preserving_merges(&base, Some(&onto))
+        .unwrap();
+    assert!(preview.preserve_merges);
+    assert_eq!(preview.steps.len(), 3);
+    let mut invalid = preview.steps.clone();
+    invalid.swap(0, 1);
+    assert!(
+        repo.execute(Operation::Rebase {
+            context: Arc::new(preview.clone()),
+            steps: invalid
+        })
+        .is_err()
+    );
+    repo.execute(Operation::Rebase {
+        context: Arc::new(preview.clone()),
+        steps: preview.steps,
+    })
+    .unwrap();
+    let head = r.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.parent_count(), 2);
+    for parent in head.parents() {
+        assert_eq!(parent.parent_id(0).unwrap().to_string(), onto);
+    }
+    for name in ["base", "main", "feature", "upstream"] {
+        assert!(repo.root.join(name).exists(), "{name}");
+    }
+    assert_eq!(head.parent(0).unwrap().summary().unwrap(), Some("main"));
+    assert_eq!(head.parent(1).unwrap().summary().unwrap(), Some("feature"));
+    assert!(repo.rebase_status().unwrap().is_none());
+}
+
+#[test]
+fn graph_rebase_conflicts_resume_after_reopening_or_abort() {
+    for abort in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.execute(Operation::SetIdentity(
+            "Graph".into(),
+            "graph@example.invalid".into(),
+        ))
+        .unwrap();
+        fs::write(repo.root.join("file"), "base\n").unwrap();
+        let base = commit(&repo, "base");
+        repo.execute(Operation::CreateBranch("feature".into()))
+            .unwrap();
+        fs::write(repo.root.join("file"), "feature\n").unwrap();
+        commit(&repo, "feature");
+        repo.execute(Operation::Checkout("main".into())).unwrap();
+        fs::write(repo.root.join("other"), "main").unwrap();
+        commit(&repo, "main");
+        repo.execute(Operation::Merge("feature".into())).unwrap();
+        let original = repo.snapshot(1).unwrap().head_id.unwrap();
+        let r = raw(&repo);
+        let base_commit = r.find_commit(base.parse().unwrap()).unwrap();
+        let mut builder = r.treebuilder(Some(&base_commit.tree().unwrap())).unwrap();
+        builder
+            .insert("file", r.blob(b"upstream\n").unwrap(), 0o100644)
+            .unwrap();
+        let tree = r.find_tree(builder.write().unwrap()).unwrap();
+        let sig = r.signature().unwrap();
+        let onto = r
+            .commit(None, &sig, &sig, "target", &tree, &[&base_commit])
+            .unwrap()
+            .to_string();
+        let preview = repo
+            .rebase_preview_preserving_merges(&base, Some(&onto))
+            .unwrap();
+        assert!(
+            repo.execute(Operation::Rebase {
+                context: Arc::new(preview.clone()),
+                steps: preview.steps
+            })
+            .is_err()
+        );
+        if abort {
+            Repository::open(&repo.root)
+                .unwrap()
+                .execute(Operation::AbortRebase)
+                .unwrap();
+            assert_eq!(repo.snapshot(1).unwrap().head_id.unwrap(), original);
+        } else {
+            for _ in 0..4 {
+                let reopened = Repository::open(&repo.root).unwrap();
+                if reopened.rebase_status().unwrap().is_none() {
+                    break;
+                }
+                for file in reopened.conflict_session().unwrap().files {
+                    let context = reopened.conflict_context(&file.path).unwrap();
+                    reopened
+                        .execute(Operation::ResolveConflict {
+                            context: Arc::new(context),
+                            resolution: gitbuddy::git::ConflictResolution::Theirs,
+                        })
+                        .unwrap();
+                }
+                let _ = reopened.execute(Operation::ContinueRebase);
+            }
+            assert!(repo.rebase_status().unwrap().is_none());
+            assert_eq!(
+                r.head().unwrap().peel_to_commit().unwrap().parent_count(),
+                2
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_merge_actions_pin_and_validate_mainline() {
+    for revert in [false, true] {
+        let (_dir, repo, base, old, tip) = setup();
+        let r = raw(&repo);
+        let sig = r.signature().unwrap();
+        let base_commit = r.find_commit(base.parse().unwrap()).unwrap();
+        let old_commit = r.find_commit(old.parse().unwrap()).unwrap();
+        let tip_commit = r.find_commit(tip.parse().unwrap()).unwrap();
+        let merge = r
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "merge for batch",
+                &tip_commit.tree().unwrap(),
+                &[&base_commit, &old_commit],
+            )
+            .unwrap()
+            .to_string();
+        assert!(
+            repo.prepare_cherry_batch(std::slice::from_ref(&merge))
+                .is_err()
+        );
+        assert!(
+            repo.prepare_revert_batch_with_mainline(std::slice::from_ref(&merge), 3)
+                .is_err()
+        );
+        if !revert {
+            r.reset(base_commit.as_object(), git2::ResetType::Hard, None)
+                .unwrap();
+        }
+        let op = if revert {
+            Operation::RevertBatch(Arc::new(
+                repo.prepare_revert_batch_with_mainline(&[merge], 2)
+                    .unwrap(),
+            ))
+        } else {
+            Operation::CherryPickBatch(Arc::new(
+                repo.prepare_cherry_batch_with_mainline(&[merge], 2)
+                    .unwrap(),
+            ))
+        };
+        repo.execute(op).unwrap();
+        assert_eq!(repo.root.join("later").exists(), !revert);
+        assert!(repo.rebase_status().unwrap().is_none());
+    }
+}
+
+#[test]
+fn history_search_pages_pinned_history_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let r = raw(&repo);
+    let tree = r
+        .find_tree(r.treebuilder(None).unwrap().write().unwrap())
+        .unwrap();
+    let sig = git2::Signature::now("Page", "page@example.invalid").unwrap();
+    let mut last = None;
+    for i in 0..1005 {
+        let parent = last.map(|id| r.find_commit(id).unwrap());
+        let parents = parent.as_ref().into_iter().collect::<Vec<_>>();
+        last = Some(
+            r.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                &format!("entry {i}"),
+                &tree,
+                &parents,
+            )
+            .unwrap(),
+        );
+    }
+    let cancel = gitbuddy::git::CancellationToken::default();
+    let first = repo.search_history("entry", &cancel).unwrap();
+    assert_eq!(first.commits.len(), 1000);
+    assert!(first.truncated);
+    let parent = r.find_commit(last.unwrap()).unwrap();
+    r.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "entry new after search",
+        &tree,
+        &[&parent],
+    )
+    .unwrap();
+    let next = repo
+        .search_history_next(first.next.as_ref().unwrap(), &cancel)
+        .unwrap();
+    assert_eq!(next.commits.len(), 5);
+    assert!(next.next.is_none());
+    let ids = first
+        .commits
+        .iter()
+        .chain(next.commits.iter())
+        .map(|c| &c.id)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 1005);
+    assert!(
+        next.commits
+            .iter()
+            .all(|c| c.subject != "entry new after search")
+    );
+    let other = Repository::init(&dir.path().join("other")).unwrap();
+    assert!(
+        other
+            .search_history_next(first.next.as_ref().unwrap(), &cancel)
+            .is_err()
+    );
+}
+
+#[test]
+fn skipping_graph_merge_finishes_at_its_rewritten_first_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.execute(Operation::SetIdentity(
+        "Test".into(),
+        "test@example.invalid".into(),
+    ))
+    .unwrap();
+    fs::write(repo.root.join("conflict"), "base\n").unwrap();
+    let base = commit(&repo, "base");
+    repo.execute(Operation::CreateBranch("feature".into()))
+        .unwrap();
+    fs::write(repo.root.join("feature"), "feature").unwrap();
+    commit(&repo, "feature");
+    repo.execute(Operation::Checkout("main".into())).unwrap();
+    fs::write(repo.root.join("main"), "main").unwrap();
+    commit(&repo, "main");
+    repo.execute(Operation::Merge("feature".into())).unwrap();
+    fs::write(repo.root.join("conflict"), "merge resolution\n").unwrap();
+    repo.execute(Operation::StageAll).unwrap();
+    let edit = repo.commit_edit().unwrap();
+    repo.execute(Operation::Amend {
+        context: Arc::new(edit),
+        message: "merge resolution".into(),
+    })
+    .unwrap();
+    let merge = repo.snapshot(1).unwrap().head_id.unwrap();
+    let r = raw(&repo);
+    let base_commit = r.find_commit(base.parse().unwrap()).unwrap();
+    let mut builder = r.treebuilder(Some(&base_commit.tree().unwrap())).unwrap();
+    builder
+        .insert("conflict", r.blob(b"onto\n").unwrap(), 0o100644)
+        .unwrap();
+    let tree = r.find_tree(builder.write().unwrap()).unwrap();
+    let sig = r.signature().unwrap();
+    let onto = r
+        .commit(None, &sig, &sig, "onto", &tree, &[&base_commit])
+        .unwrap()
+        .to_string();
+    let preview = repo
+        .rebase_preview_preserving_merges(&base, Some(&onto))
+        .unwrap();
+    assert!(
+        repo.execute(Operation::Rebase {
+            context: Arc::new(preview.clone()),
+            steps: preview.steps
+        })
+        .is_err()
+    );
+    assert_eq!(
+        repo.rebase_status().unwrap().unwrap().current.unwrap().id,
+        merge
+    );
+    repo.execute(Operation::RecoverRebaseStep {
+        expected: merge,
+        skip: true,
+    })
+    .unwrap();
+    let head = r.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.summary().unwrap(), Some("main"));
+    assert!(repo.root.join("main").exists());
+    assert!(!repo.root.join("feature").exists());
+    assert_eq!(
+        fs::read_to_string(repo.root.join("conflict")).unwrap(),
+        "onto\n"
+    );
+}
+
+#[test]
+fn batch_merge_commits_can_use_different_mainline_parents() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.execute(Operation::SetIdentity(
+        "Test".into(),
+        "test@example.invalid".into(),
+    ))
+    .unwrap();
+    fs::write(repo.root.join("base"), "base").unwrap();
+    let base = commit(&repo, "base");
+    let r = raw(&repo);
+    let root = r.find_commit(base.parse().unwrap()).unwrap();
+    let sig = r.signature().unwrap();
+    let tree = |names: &[&str]| {
+        let mut b = r.treebuilder(Some(&root.tree().unwrap())).unwrap();
+        for name in names {
+            b.insert(*name, r.blob(name.as_bytes()).unwrap(), 0o100644)
+                .unwrap();
+        }
+        r.find_tree(b.write().unwrap()).unwrap()
+    };
+    let a = r
+        .find_commit(
+            r.commit(None, &sig, &sig, "a", &tree(&["a"]), &[&root])
+                .unwrap(),
+        )
+        .unwrap();
+    let b = r
+        .find_commit(
+            r.commit(None, &sig, &sig, "b", &tree(&["b"]), &[&root])
+                .unwrap(),
+        )
+        .unwrap();
+    let c = r
+        .find_commit(
+            r.commit(None, &sig, &sig, "c", &tree(&["c"]), &[&root])
+                .unwrap(),
+        )
+        .unwrap();
+    let d = r
+        .find_commit(
+            r.commit(None, &sig, &sig, "d", &tree(&["d"]), &[&root])
+                .unwrap(),
+        )
+        .unwrap();
+    let one = r
+        .commit(None, &sig, &sig, "merge ab", &tree(&["a", "b"]), &[&a, &b])
+        .unwrap()
+        .to_string();
+    let two = r
+        .commit(None, &sig, &sig, "merge cd", &tree(&["c", "d"]), &[&c, &d])
+        .unwrap()
+        .to_string();
+    let mut parents = std::collections::BTreeMap::new();
+    parents.insert(one.clone(), 1);
+    parents.insert(two.clone(), 2);
+    let mut missing = parents.clone();
+    missing.remove(&two);
+    assert!(
+        repo.prepare_cherry_batch_with_mainlines(&[one.clone(), two.clone()], &missing)
+            .is_err()
+    );
+    let mut invalid = parents.clone();
+    invalid.insert(two.clone(), 3);
+    assert!(
+        repo.prepare_revert_batch_with_mainlines(&[one.clone(), two.clone()], &invalid)
+            .is_err()
+    );
+    let plan = repo
+        .prepare_cherry_batch_with_mainlines(&[one.clone(), two.clone()], &parents)
+        .unwrap();
+    repo.execute(Operation::CherryPickBatch(Arc::new(plan)))
+        .unwrap();
+    assert!(repo.root.join("b").exists() && repo.root.join("c").exists());
+    assert!(!repo.root.join("a").exists() && !repo.root.join("d").exists());
+    let plan = repo
+        .prepare_revert_batch_with_mainlines(&[two, one], &parents)
+        .unwrap();
+    repo.execute(Operation::RevertBatch(Arc::new(plan)))
+        .unwrap();
+    assert!(!repo.root.join("b").exists() && !repo.root.join("c").exists());
+}
+
+#[test]
+fn cancelled_history_search_does_not_open_the_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository {
+        root: dir.path().join("does-not-exist"),
+    };
+    let token = gitbuddy::git::CancellationToken::default();
+    token.cancel();
+    let error = repo.search_history("query", &token).unwrap_err();
+    assert!(gitbuddy::git::is_cancelled(&error));
 }

@@ -46,6 +46,8 @@ pub struct CommitFile {
 #[derive(Clone, Debug)]
 pub struct CommitDetail {
     pub id: String,
+    /// Immutable parent commit IDs in Git's original order.
+    pub parents: Vec<String>,
     pub subject: String,
     pub body: String,
     pub author: String,
@@ -358,7 +360,7 @@ mod image_preview;
 mod patch_batch;
 mod search;
 pub use image_preview::{ImageData, ImageKind, ImagePair};
-pub use search::HistorySearchResult;
+pub use search::{HistorySearchCursor, HistorySearchResult};
 #[path = "git/conflict_blocks.rs"]
 mod conflict_blocks;
 #[path = "git/conflicts.rs"]

@@ -1,4 +1,5 @@
 //! A resumable, editable sequencer. Commit replay and reference updates use libgit2.
+use super::integration::with_native_lfs;
 use super::libgit::{author, oid, raw};
 use super::recovery::head_state;
 use super::{HeadState, Repository};
@@ -7,7 +8,11 @@ use git2::{
     CherrypickOptions, Repository as Raw, RepositoryState, RevertOptions, build::CheckoutBuilder,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, io::Write};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    io::Write,
+};
 
 const STATE: &str = "gitbuddy-rebase.json";
 // Do not follow symlinks or descend into Git administrative directories.
@@ -125,13 +130,18 @@ pub struct RebasePreview {
     pub base: String,
     pub steps: Vec<RebaseStep>,
     pub root: bool,
+    pub empty_base: bool,
+    pub preserve_merges: bool,
 }
 #[derive(Clone, Debug)]
 pub struct BatchCherryPlan {
     preview: RebasePreview,
+    mainline: u32,
+    mainlines: BTreeMap<String, u32>,
 }
 #[derive(Clone, Debug)]
 pub struct RebaseStatus {
+    pub operation: &'static str,
     pub branch: String,
     pub original: String,
     pub onto: String,
@@ -145,8 +155,28 @@ pub struct RebaseStatus {
     pub interrupted: bool,
     pub recoverable: bool,
 }
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+enum SequenceKind {
+    #[default]
+    Legacy,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+impl SequenceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "History operation",
+            Self::Rebase => "Rebase",
+            Self::CherryPick => "Cherry-pick batch",
+            Self::Revert => "Revert batch",
+        }
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    kind: SequenceKind,
     version: u32,
     branch: String,
     original: String,
@@ -175,6 +205,20 @@ struct State {
     paused: bool,
     #[serde(default)]
     restarting: bool,
+    #[serde(default)]
+    empty_base: bool,
+    #[serde(default)]
+    graph_parents: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    rewritten: BTreeMap<String, String>,
+    #[serde(default)]
+    batch_mainline: u32,
+    #[serde(default)]
+    rewrite_hook: bool,
+    #[serde(default)]
+    finish_target: Option<String>,
+    #[serde(default)]
+    batch_mainlines: BTreeMap<String, u32>,
 }
 pub(super) fn active(repo: &Raw) -> bool {
     repo.path().join(STATE).exists()
@@ -194,6 +238,10 @@ fn load(repo: &Raw) -> Result<State> {
         oid(&step.id)?;
     }
     if let Some(id) = &state.prepared {
+        oid(id)?;
+    }
+    if let Some(id) = &state.finish_target {
+        ensure!(state.finishing, "Finish target outside completion phase");
         oid(id)?;
     }
     ensure!(
@@ -261,7 +309,12 @@ fn checked_branch(repo: &Raw, state: &State) -> Result<()> {
     let branch = repo.find_reference(&state.branch)?.target();
     ensure!(
         branch == Some(oid(&state.original)?)
-            || (state.finishing && branch == Some(oid(&state.current)?)),
+            || (state.finishing
+                && branch
+                    == Some(oid(state
+                        .finish_target
+                        .as_deref()
+                        .unwrap_or(&state.current))?)),
         "Original branch moved externally; rebase will not overwrite it"
     );
     let head = head_state(repo)?;
@@ -271,7 +324,8 @@ fn checked_branch(repo: &Raw, state: &State) -> Result<()> {
             && state.prepared.is_none()
             && head.id.as_deref() == Some(&state.original);
         let finishing = state.finishing
-            && (head.id.as_deref() == Some(&state.current)
+            && (head.id.as_deref()
+                == Some(state.finish_target.as_deref().unwrap_or(&state.current))
                 || head.id.as_deref() == Some(&state.original));
         ensure!(
             starting || finishing,
@@ -309,13 +363,80 @@ fn move_head(repo: &Raw, expected: &str, target: &str) -> Result<()> {
     Ok(())
 }
 impl Repository {
+    pub fn prepare_cherry_batch_with_mainlines(
+        &self,
+        ids: &[String],
+        parents: &BTreeMap<String, u32>,
+    ) -> Result<BatchCherryPlan> {
+        self.prepare_batch_parents(ids, RebaseAction::Pick, parents)
+    }
+    pub fn prepare_revert_batch_with_mainlines(
+        &self,
+        ids: &[String],
+        parents: &BTreeMap<String, u32>,
+    ) -> Result<BatchCherryPlan> {
+        self.prepare_batch_parents(ids, RebaseAction::Revert, parents)
+    }
+    fn prepare_batch_parents(
+        &self,
+        ids: &[String],
+        action: RebaseAction,
+        parents: &BTreeMap<String, u32>,
+    ) -> Result<BatchCherryPlan> {
+        let mut plan = self.prepare_batch(ids, action, 1)?;
+        ensure!(
+            parents.keys().all(|id| ids.contains(id)),
+            "Mainline mapping includes an unselected commit"
+        );
+        let repo = raw(self)?;
+        for step in &plan.preview.steps {
+            let commit = repo.find_commit(oid(&step.id)?)?;
+            if commit.parent_count() > 1 {
+                let parent = parents
+                    .get(&step.id)
+                    .context("Choose a parent for every selected merge commit")?;
+                ensure!(
+                    *parent > 0 && *parent as usize <= commit.parent_count(),
+                    "Invalid mainline for {}",
+                    step.id
+                );
+            } else {
+                ensure!(
+                    parents.get(&step.id).is_none_or(|parent| *parent == 1),
+                    "Single-parent commit requires parent 1"
+                );
+            }
+        }
+        plan.mainline = 0;
+        plan.mainlines = parents.clone();
+        Ok(plan)
+    }
     pub fn prepare_cherry_batch(&self, ids: &[String]) -> Result<BatchCherryPlan> {
-        self.prepare_batch(ids, RebaseAction::Pick)
+        self.prepare_batch(ids, RebaseAction::Pick, 0)
     }
     pub fn prepare_revert_batch(&self, ids: &[String]) -> Result<BatchCherryPlan> {
-        self.prepare_batch(ids, RebaseAction::Revert)
+        self.prepare_batch(ids, RebaseAction::Revert, 0)
     }
-    fn prepare_batch(&self, ids: &[String], action: RebaseAction) -> Result<BatchCherryPlan> {
+    pub fn prepare_cherry_batch_with_mainline(
+        &self,
+        ids: &[String],
+        mainline: u32,
+    ) -> Result<BatchCherryPlan> {
+        self.prepare_batch(ids, RebaseAction::Pick, mainline)
+    }
+    pub fn prepare_revert_batch_with_mainline(
+        &self,
+        ids: &[String],
+        mainline: u32,
+    ) -> Result<BatchCherryPlan> {
+        self.prepare_batch(ids, RebaseAction::Revert, mainline)
+    }
+    fn prepare_batch(
+        &self,
+        ids: &[String],
+        action: RebaseAction,
+        mainline: u32,
+    ) -> Result<BatchCherryPlan> {
         let repo = raw(self)?;
         clean(&repo)?;
         let head = head_state(&repo)?;
@@ -336,8 +457,11 @@ impl Repository {
                 "A commit was selected more than once"
             );
             ensure!(
-                commit.parent_count() == 1,
-                "Batch operations currently support single-parent commits only"
+                commit.parent_count() == 1
+                    || (commit.parent_count() > 1
+                        && mainline > 0
+                        && mainline as usize <= commit.parent_count()),
+                "Choose a valid mainline parent for merge commits; batch roots are unsupported"
             );
             steps.push(RebaseStep {
                 id: commit.id().to_string(),
@@ -347,12 +471,16 @@ impl Repository {
         }
         let original = head.id.clone().context("No HEAD commit")?;
         Ok(BatchCherryPlan {
+            mainline,
+            mainlines: BTreeMap::new(),
             preview: RebasePreview {
                 head,
                 onto: original.clone(),
                 base: original,
                 steps,
                 root: false,
+                empty_base: false,
+                preserve_merges: false,
             },
         })
     }
@@ -364,7 +492,13 @@ impl Repository {
                 .all(|s| s.action == RebaseAction::Pick),
             "Invalid cherry-pick plan"
         );
-        self.start_sequence(&plan.preview, plan.preview.steps.clone(), true)
+        self.start_sequence(
+            &plan.preview,
+            plan.preview.steps.clone(),
+            true,
+            plan.mainline,
+            &plan.mainlines,
+        )
     }
     pub(super) fn start_revert_batch(&self, plan: &BatchCherryPlan) -> Result<String> {
         ensure!(
@@ -374,7 +508,13 @@ impl Repository {
                 .all(|s| s.action == RebaseAction::Revert),
             "Invalid revert plan"
         );
-        self.start_sequence(&plan.preview, plan.preview.steps.clone(), true)
+        self.start_sequence(
+            &plan.preview,
+            plan.preview.steps.clone(),
+            true,
+            plan.mainline,
+            &plan.mainlines,
+        )
     }
     /// Restart only an uncommitted replay step. Keep a durable copy before any reset.
     pub(super) fn recover_rebase_step(&self, skip: bool, expected: &str) -> Result<String> {
@@ -448,6 +588,14 @@ impl Repository {
                 state.applied = false;
                 state.restarting = false;
                 if skip {
+                    if !state.graph_parents.is_empty() {
+                        let step = state
+                            .steps
+                            .get(state.cursor)
+                            .context("Missing graph step")?;
+                        let target = graph_targets(&state, step)?[0].to_string();
+                        state.rewritten.insert(step.id.clone(), target);
+                    }
                     state.cursor += 1;
                     if let Some(next) = state.steps.get_mut(state.cursor)
                         && matches!(next.action, RebaseAction::Squash | RebaseAction::Fixup)
@@ -474,6 +622,59 @@ impl Repository {
     pub fn rebase_preview(&self, upstream: &str) -> Result<RebasePreview> {
         self.rebase_preview_onto(upstream, None)
     }
+    /// Replay merge-result changes relative to the first parent while retaining
+    /// each original parent edge in the rewritten graph.
+    pub fn rebase_preview_preserving_merges(
+        &self,
+        upstream: &str,
+        target: Option<&str>,
+    ) -> Result<RebasePreview> {
+        let repo = raw(self)?;
+        clean(&repo)?;
+        let head = head_state(&repo)?;
+        ensure!(head.reference != "HEAD", "Check out a local branch first");
+        let original = oid(head.id.as_deref().context("No HEAD")?)?;
+        let upstream = repo
+            .revparse_single(upstream.trim())?
+            .peel_to_commit()?
+            .id();
+        let (base, onto) = if let Some(target) = target.filter(|s| !s.trim().is_empty()) {
+            ensure!(
+                upstream == original || repo.graph_descendant_of(original, upstream)?,
+                "Range boundary must be an ancestor"
+            );
+            (
+                upstream,
+                repo.revparse_single(target)?.peel_to_commit()?.id(),
+            )
+        } else {
+            (repo.merge_base(original, upstream)?, upstream)
+        };
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+        walk.push(original)?;
+        walk.hide(base)?;
+        let mut steps = Vec::new();
+        for id in walk {
+            ensure!(steps.len() < 2000, "Rebase is limited to 2,000 commits");
+            let c = repo.find_commit(id?)?;
+            steps.push(RebaseStep {
+                id: c.id().to_string(),
+                message: c.message()?.into(),
+                action: RebaseAction::Pick,
+            });
+        }
+        ensure!(!steps.is_empty(), "No commits to replay");
+        Ok(RebasePreview {
+            head,
+            onto: onto.to_string(),
+            base: base.to_string(),
+            steps,
+            root: false,
+            empty_base: false,
+            preserve_merges: true,
+        })
+    }
     /// With an explicit target, upstream is the exclusive range boundary.
     pub fn rebase_preview_onto(
         &self,
@@ -489,10 +690,21 @@ impl Repository {
         );
         let original = oid(head.id.as_deref().context("No commits to rebase")?)?;
         if upstream.trim() == "--root" {
-            let target = target
-                .filter(|s| !s.trim().is_empty())
-                .context("Root rebase requires an explicit onto target")?;
-            let onto = repo.revparse_single(target.trim())?.peel_to_commit()?.id();
+            let target = target.filter(|s| !s.trim().is_empty());
+            let onto = if let Some(target) = target {
+                repo.revparse_single(target.trim())?.peel_to_commit()?.id()
+            } else {
+                let tree = repo.find_tree(repo.treebuilder(None)?.write()?)?;
+                let signature = author(&repo)?;
+                repo.commit(
+                    None,
+                    &signature,
+                    &signature,
+                    "GitBuddy temporary empty rebase base",
+                    &tree,
+                    &[],
+                )?
+            };
             let mut current = original;
             let mut steps = Vec::new();
             loop {
@@ -519,6 +731,8 @@ impl Repository {
                 base: String::new(),
                 steps,
                 root: true,
+                empty_base: target.is_none(),
+                preserve_merges: false,
             });
         }
         let upstream = repo
@@ -568,6 +782,8 @@ impl Repository {
             base: base.to_string(),
             steps,
             root: false,
+            empty_base: false,
+            preserve_merges: false,
         })
     }
     pub fn rebase_status(&self) -> Result<Option<RebaseStatus>> {
@@ -577,6 +793,7 @@ impl Repository {
         }
         let s = load(&repo)?;
         Ok(Some(RebaseStatus {
+            operation: s.kind.label(),
             branch: s.branch,
             original: s.original,
             onto: s.onto,
@@ -618,16 +835,17 @@ impl Repository {
         preview: &RebasePreview,
         steps: Vec<RebaseStep>,
     ) -> Result<String> {
-        self.start_sequence(preview, steps, false)
+        self.start_sequence(preview, steps, false, 0, &BTreeMap::new())
     }
     fn start_sequence(
         &self,
         preview: &RebasePreview,
         steps: Vec<RebaseStep>,
         batch: bool,
+        batch_mainline: u32,
+        batch_mainlines: &BTreeMap<String, u32>,
     ) -> Result<String> {
         let repo = raw(self)?;
-        let _lock = Lock::acquire(&repo)?;
         clean(&repo)?;
         ensure!(
             head_state(&repo)? == preview.head,
@@ -640,16 +858,68 @@ impl Repository {
             "Each original commit must appear exactly once; use Drop to omit a commit"
         );
         let mut first = true;
+        if preview.empty_base {
+            ensure!(preview.root && !batch, "Invalid empty root base");
+            let base = repo.find_commit(oid(&preview.onto)?)?;
+            ensure!(
+                base.parent_count() == 0 && base.tree()?.is_empty(),
+                "Root base must be an empty root commit"
+            );
+            ensure!(
+                steps.iter().any(|s| s.action != RebaseAction::Drop),
+                "Retain at least one root-history commit"
+            );
+        }
         let mut parent = if preview.root {
             None
         } else {
             Some(oid(&preview.base)?)
         };
+        let mut graph_parents = BTreeMap::new();
+        if preview.preserve_merges {
+            ensure!(
+                !batch && !preview.root && !preview.empty_base,
+                "Invalid graph rebase plan"
+            );
+            ensure!(
+                steps.iter().zip(&preview.steps).all(|(a, b)| a.id == b.id
+                    && matches!(a.action, RebaseAction::Pick | RebaseAction::Reword)),
+                "Merge-preserving plans allow Pick / Reword in topological order"
+            );
+            let mut seen = HashSet::new();
+            let base = oid(&preview.base)?;
+            for s in &preview.steps {
+                let c = repo.find_commit(oid(&s.id)?)?;
+                let mut parents = Vec::new();
+                for p in c.parent_ids() {
+                    ensure!(
+                        seen.contains(&p) || p == base || repo.graph_descendant_of(base, p)?,
+                        "Graph plan omits a parent or changes topological order"
+                    );
+                    parents.push(p.to_string());
+                }
+                graph_parents.insert(s.id.clone(), parents);
+                seen.insert(c.id());
+            }
+            ensure!(
+                preview.steps.last().map(|s| s.id.as_str()) == preview.head.id.as_deref(),
+                "Graph plan does not end at HEAD"
+            );
+        }
         for step in &preview.steps {
             let commit = repo.find_commit(oid(&step.id)?)?;
+            let mainline = batch_mainlines
+                .get(&step.id)
+                .copied()
+                .unwrap_or(batch_mainline);
             ensure!(
-                if batch {
+                if preview.preserve_merges {
+                    true
+                } else if batch {
                     commit.parent_count() == 1
+                        || (commit.parent_count() > 1
+                            && mainline > 0
+                            && mainline as usize <= commit.parent_count())
                 } else if let Some(parent) = parent {
                     commit.parent_count() == 1 && commit.parent_id(0)? == parent
                 } else {
@@ -692,32 +962,32 @@ impl Repository {
             );
             if matches!(step.action, RebaseAction::Edit | RebaseAction::Split) {
                 let commit = repo.find_commit(oid(&step.id)?)?;
+                let changed = if commit.parent_count() == 0 {
+                    !commit.tree()?.is_empty()
+                } else {
+                    commit.tree_id() != commit.parent(0)?.tree_id()
+                };
                 ensure!(
-                    commit.parent_count() == 1,
-                    "Editing or splitting a root commit is not supported"
-                );
-                ensure!(
-                    commit.tree_id() != commit.parent(0)?.tree_id(),
+                    changed,
                     "Empty commits cannot be split or edited as changes; use Reword or Drop in the plan"
                 );
             }
             first = false;
         }
-        let signature = author(&repo)?;
         let original = preview.head.id.clone().context("No HEAD")?;
         let backup = format!(
             "refs/gitbuddy/rewrites/{}-{}",
             &original[..8],
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        repo.reference(&backup, oid(&original)?, false, "gitbuddy: before rebase")?;
-        repo.reference(
-            "ORIG_HEAD",
-            oid(&original)?,
-            true,
-            "gitbuddy: before rebase",
-        )?;
         let mut state = State {
+            kind: if !batch {
+                SequenceKind::Rebase
+            } else if steps.iter().all(|step| step.action == RebaseAction::Revert) {
+                SequenceKind::Revert
+            } else {
+                SequenceKind::CherryPick
+            },
             version: 1,
             branch: preview.head.reference.clone(),
             original: original.clone(),
@@ -735,7 +1005,16 @@ impl Repository {
             prepared_edit: false,
             paused: false,
             restarting: false,
+            empty_base: preview.empty_base,
+            graph_parents,
+            rewritten: BTreeMap::new(),
+            batch_mainline,
+            rewrite_hook: !batch,
+            finish_target: None,
+            batch_mainlines: batch_mainlines.clone(),
         };
+        let _lock = Lock::acquire(&repo)?;
+        let signature = author(&repo)?;
         // Lock both references through the initial checkout and detachment.
         let mut refs = repo.transaction()?;
         refs.lock_ref("HEAD")?;
@@ -744,60 +1023,42 @@ impl Repository {
             head_state(&repo)? == preview.head,
             "HEAD changed while starting rebase"
         );
-        save(&repo, &state)?;
-        let target = repo.find_commit(oid(&state.onto)?)?;
-        let mut checkout = CheckoutBuilder::new();
-        checkout.safe();
-        if let Err(error) = repo.checkout_tree(target.as_object(), Some(&mut checkout)) {
-            return Err(error.into());
-        }
-        repo.reference_ensure_log("HEAD")?;
-        refs.set_target(
-            "HEAD",
-            target.id(),
-            Some(&signature),
-            "gitbuddy: rebase start",
-        )?;
-        refs.commit()?;
-        run(&repo, &mut state)
+        clean(&repo)?;
+        with_native_lfs(&repo, || {
+            repo.reference(
+                &state.backup,
+                oid(&original)?,
+                false,
+                "gitbuddy: before rebase",
+            )?;
+            repo.reference(
+                "ORIG_HEAD",
+                oid(&original)?,
+                true,
+                "gitbuddy: before rebase",
+            )?;
+            save(&repo, &state)?;
+            let target = repo.find_commit(oid(&state.onto)?)?;
+            let mut checkout = CheckoutBuilder::new();
+            checkout.safe();
+            repo.checkout_tree(target.as_object(), Some(&mut checkout))?;
+            repo.reference_ensure_log("HEAD")?;
+            refs.set_target(
+                "HEAD",
+                target.id(),
+                Some(&signature),
+                "gitbuddy: rebase start",
+            )?;
+            refs.commit()?;
+            run(&repo, &mut state)
+        })
     }
     pub(super) fn continue_rebase(&self) -> Result<String> {
         let repo = raw(self)?;
         let _lock = Lock::acquire(&repo)?;
         let mut state = load(&repo)?;
         checked_branch(&repo, &state)?;
-        settle_prepared(&repo, &mut state)?;
-        ensure!(
-            !state.restarting,
-            "Recovery was interrupted; choose Retry step again. Saved recovery files are retained"
-        );
-        if state.paused {
-            ensure!(
-                repo.state() == RepositoryState::Clean
-                    && super::libgit::file_changes(&repo)?.is_empty(),
-                "Working tree changed while paused; preserve changes before continuing"
-            );
-            state.paused = false;
-            save(&repo, &state)?;
-        }
-        if state.editing {
-            ensure!(
-                state.replacement_commits > 0,
-                "Create at least one replacement commit before continuing (Abort and choose Drop to remove the commit)"
-            );
-            ensure!(
-                repo.state() == RepositoryState::Clean
-                    && super::libgit::file_changes(&repo)?.is_empty(),
-                "Commit all remaining staged, unstaged and untracked changes before continuing"
-            );
-            state.editing = false;
-            state.replacement_commits = 0;
-            state.cursor += 1;
-            state.pending = false;
-            state.applied = false;
-            save(&repo, &state)?;
-        }
-        run(&repo, &mut state)
+        with_native_lfs(&repo, || resume(&repo, &mut state))
     }
     pub(super) fn commit_rebase(&self, message: &str) -> Result<String> {
         ensure!(
@@ -829,7 +1090,11 @@ impl Repository {
             &author(&repo)?,
             message,
             &tree,
-            &[&parent],
+            &if state.empty_base && state.current == state.onto {
+                Vec::new()
+            } else {
+                vec![&parent]
+            },
         )?;
         state.prepared = Some(id.to_string());
         state.prepared_edit = true;
@@ -868,6 +1133,14 @@ impl Repository {
         for _ in 0..2000 {
             let id = current.id().to_string();
             remaining.remove(&id);
+            if current.parent_count() == 0 {
+                ensure!(
+                    remaining.is_empty(),
+                    "Selected commits are not in this branch's linear ancestry"
+                );
+                base = Some("--root".into());
+                break;
+            }
             ensure!(
                 current.parent_count() == 1,
                 "Selected range contains a root or merge commit; editing that range is not supported"
@@ -879,7 +1152,8 @@ impl Repository {
             }
             current = parent;
         }
-        let preview = self.rebase_preview(base.as_deref().context("Selected commits must belong to the current branch's first-parent history (maximum 2,000 commits)")?)?;
+        let boundary = base.as_deref().context("Selected commits must belong to the current branch's first-parent history (maximum 2,000 commits)")?;
+        let preview = self.rebase_preview_onto(boundary, None)?;
         let mut steps = preview.steps.clone();
         let positions: Vec<_> = steps
             .iter()
@@ -920,22 +1194,59 @@ impl Repository {
         refs.lock_ref(&state.branch)?;
         checked_branch(&repo, &state)?;
         let original = repo.find_commit(oid(&state.original)?)?;
-        let mut checkout = CheckoutBuilder::new();
-        checkout.force();
-        repo.checkout_tree(original.as_object(), Some(&mut checkout))?;
-        refs.set_symbolic_target(
-            "HEAD",
-            &state.branch,
-            Some(&author(&repo)?),
-            "gitbuddy: rebase abort",
-        )?;
-        refs.commit()?;
-        if repo.state() != RepositoryState::Clean {
-            repo.cleanup_state()?;
-        }
-        fs::remove_file(repo.path().join(STATE))?;
-        Ok("Rebase aborted; original branch and tracked files restored".into())
+        with_native_lfs(&repo, || {
+            let mut checkout = CheckoutBuilder::new();
+            checkout.force();
+            repo.checkout_tree(original.as_object(), Some(&mut checkout))?;
+            refs.set_symbolic_target(
+                "HEAD",
+                &state.branch,
+                Some(&author(&repo)?),
+                "gitbuddy: rebase abort",
+            )?;
+            refs.commit()?;
+            if repo.state() != RepositoryState::Clean {
+                repo.cleanup_state()?;
+            }
+            fs::remove_file(repo.path().join(STATE))?;
+            Ok(format!(
+                "{} aborted; original branch and tracked files restored",
+                state.kind.label()
+            ))
+        })
     }
+}
+fn resume(repo: &Raw, state: &mut State) -> Result<String> {
+    settle_prepared(repo, state)?;
+    ensure!(
+        !state.restarting,
+        "Recovery was interrupted; choose Retry step again. Saved recovery files are retained"
+    );
+    if state.paused {
+        ensure!(
+            repo.state() == RepositoryState::Clean && super::libgit::file_changes(repo)?.is_empty(),
+            "Working tree changed while paused; preserve changes before continuing"
+        );
+        state.paused = false;
+        save(repo, state)?;
+    }
+    if state.editing {
+        ensure!(
+            state.replacement_commits > 0,
+            "Create at least one replacement commit before continuing (Abort and choose Drop to remove the commit)"
+        );
+        ensure!(
+            repo.state() == RepositoryState::Clean && super::libgit::file_changes(repo)?.is_empty(),
+            "Commit all remaining staged, unstaged and untracked changes before continuing"
+        );
+        state.editing = false;
+        state.replacement_commits = 0;
+        state.cursor += 1;
+        state.pending = false;
+        state.applied = false;
+        save(repo, state)?;
+    }
+    run(repo, state)
 }
 fn settle_prepared(repo: &Raw, state: &mut State) -> Result<()> {
     if let Some(prepared) = state.prepared.clone() {
@@ -944,6 +1255,15 @@ fn settle_prepared(repo: &Raw, state: &mut State) -> Result<()> {
             move_head(repo, &state.current, &prepared)?;
         }
         state.current = prepared;
+        if state.rewrite_hook || !state.graph_parents.is_empty() {
+            let step = state
+                .steps
+                .get(state.cursor)
+                .context("Missing graph step")?;
+            state
+                .rewritten
+                .insert(step.id.clone(), state.current.clone());
+        }
         if state.prepared_edit {
             state.replacement_commits += 1;
         } else {
@@ -962,6 +1282,75 @@ fn settle_prepared(repo: &Raw, state: &mut State) -> Result<()> {
         state.prepared_edit = false;
         save(repo, state)?;
     }
+    Ok(())
+}
+fn graph_targets(state: &State, step: &RebaseStep) -> Result<Vec<git2::Oid>> {
+    let parents = state
+        .graph_parents
+        .get(&step.id)
+        .context("Missing original graph parents")?;
+    let mut result = Vec::new();
+    for parent in parents {
+        let target = if let Some(target) = state.rewritten.get(parent) {
+            target
+        } else {
+            ensure!(
+                !state.graph_parents.contains_key(parent),
+                "A graph parent has not been replayed"
+            );
+            &state.onto
+        };
+        let id = oid(target)?;
+        if !result.contains(&id) {
+            result.push(id);
+        }
+    }
+    if result.is_empty() {
+        result.push(oid(&state.onto)?);
+    }
+    Ok(result)
+}
+fn apply_graph_step(repo: &Raw, state: &State, step: &RebaseStep) -> Result<()> {
+    let picked = repo.find_commit(oid(&step.id)?)?;
+    let parents = graph_targets(state, step)?;
+    let first = repo.find_commit(parents[0])?;
+    let mut replay = repo.cherrypick_commit(
+        &picked,
+        &first,
+        if picked.parent_count() > 1 { 1 } else { 0 },
+        None,
+    )?;
+    let index = repo.index()?;
+    let index_path = index.path().context("Missing index")?.to_path_buf();
+    let mut lock = super::conflicts::IndexLock::acquire(&index_path)?;
+    ensure!(
+        super::libgit::file_changes(repo)?.is_empty(),
+        "Working tree changed during graph replay"
+    );
+    let scratch = tempfile::NamedTempFile::new_in(repo.path())?;
+    fs::copy(&index_path, scratch.path())?;
+    let mut next = git2::Index::open(scratch.path())?;
+    next.clear()?;
+    for entry in replay.iter() {
+        next.add(&entry)?;
+    }
+    next.write()?;
+    for (name, data) in [
+        ("CHERRY_PICK_HEAD", format!("{}\n", step.id)),
+        ("MERGE_MSG", step.message.clone()),
+    ] {
+        let mut file = fs::File::create(repo.path().join(name))?;
+        file.write_all(data.as_bytes())?;
+        file.sync_all()?;
+    }
+    let mut checkout = CheckoutBuilder::new();
+    checkout
+        .safe()
+        .allow_conflicts(true)
+        .conflict_style_merge(true)
+        .update_index(false);
+    repo.checkout_index(Some(&mut replay), Some(&mut checkout))?;
+    lock.write_and_install(&fs::read(scratch.path())?, &index_path)?;
     Ok(())
 }
 fn run(repo: &Raw, state: &mut State) -> Result<String> {
@@ -1021,12 +1410,32 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
                 .safe()
                 .allow_conflicts(true)
                 .conflict_style_merge(true);
-            if step.action == RebaseAction::Revert {
+            if !state.graph_parents.is_empty() {
+                apply_graph_step(repo, state, &step)?;
+            } else if step.action == RebaseAction::Revert {
                 let mut options = RevertOptions::new();
+                if picked.parent_count() > 1 {
+                    options.mainline(
+                        state
+                            .batch_mainlines
+                            .get(&step.id)
+                            .copied()
+                            .unwrap_or(state.batch_mainline),
+                    );
+                }
                 options.checkout_builder(checkout);
                 repo.revert(&picked, Some(&mut options))?;
             } else {
                 let mut options = CherrypickOptions::new();
+                if picked.parent_count() > 1 {
+                    options.mainline(
+                        state
+                            .batch_mainlines
+                            .get(&step.id)
+                            .copied()
+                            .unwrap_or(state.batch_mainline),
+                    );
+                }
                 options.checkout_builder(checkout);
                 repo.cherrypick(&picked, Some(&mut options))?;
             }
@@ -1097,7 +1506,14 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
             ),
             _ => step.message.clone(),
         };
-        let parents = if combine {
+        let parents = if !state.graph_parents.is_empty() {
+            graph_targets(state, &step)?
+                .into_iter()
+                .map(|id| repo.find_commit(id))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else if state.empty_base && state.current == state.onto {
+            Vec::new()
+        } else if combine {
             previous.parents().collect::<Vec<_>>()
         } else {
             vec![previous.clone()]
@@ -1129,13 +1545,33 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
     refs.lock_ref("HEAD")?;
     refs.lock_ref(&state.branch)?;
     checked_branch(repo, state)?;
+    let target = if state.graph_parents.is_empty() {
+        state.current.clone()
+    } else {
+        state
+            .rewritten
+            .get(&state.original)
+            .context("Missing rewritten graph tip")?
+            .clone()
+    };
+    let checkout_target = if target != state.current {
+        Some(repo.find_commit(oid(&target)?)?)
+    } else {
+        None
+    };
     state.finishing = true;
+    state.finish_target = Some(target.clone());
     save(repo, state)?;
+    if let Some(commit) = checkout_target {
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe();
+        repo.checkout_tree(commit.as_object(), Some(&mut checkout))?;
+    }
     repo.reference_ensure_log(&state.branch)?;
     let signature = author(repo)?;
     refs.set_target(
         &state.branch,
-        oid(&state.current)?,
+        oid(&target)?,
         Some(&signature),
         "gitbuddy: rebase finish",
     )?;
@@ -1147,10 +1583,30 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
     )?;
     refs.commit()?;
     fs::remove_file(repo.path().join(STATE))?;
-    Ok(format!(
-        "Rebase complete; original history kept at {}",
+    let mut message = format!(
+        "{} complete; original history kept at {}",
+        state.kind.label(),
         state.backup
-    ))
+    );
+    if state.rewrite_hook {
+        let input = state
+            .rewritten
+            .iter()
+            .map(|(old, new)| format!("{old} {new}\n"))
+            .collect::<String>();
+        if let Err(error) = super::commit_policy::run_hook_input(
+            repo,
+            "post-rewrite",
+            &[std::ffi::OsStr::new("rebase")],
+            input.as_bytes(),
+            &super::NetworkControl::default(),
+        ) {
+            message.push_str(&format!(
+                "; post-rewrite hook failed after rebase: {error:#}"
+            ));
+        }
+    }
+    Ok(message)
 }
 
 #[cfg(test)]
@@ -1287,6 +1743,7 @@ mod tests {
         let (_dir, repo, preview) = fixture();
         let raw = raw(&repo).unwrap();
         let state = State {
+            kind: SequenceKind::Rebase,
             version: 1,
             branch: preview.head.reference,
             original: preview.head.id.unwrap(),
@@ -1297,6 +1754,13 @@ mod tests {
             pending: false,
             applied: false,
             backup: "refs/gitbuddy/fixture".into(),
+            empty_base: false,
+            graph_parents: BTreeMap::new(),
+            rewritten: BTreeMap::new(),
+            batch_mainline: 0,
+            rewrite_hook: false,
+            finish_target: None,
+            batch_mainlines: BTreeMap::new(),
             editing: false,
             replacement_commits: 0,
             prepared_edit: false,
@@ -1369,5 +1833,63 @@ mod tests {
         assert_eq!(head_state(&r).unwrap().id, Some(s.current));
         repo.execute(Operation::AbortRebase).unwrap();
         assert_eq!(repo.snapshot(1).unwrap().head_id, Some(s.original));
+    }
+}
+
+#[cfg(test)]
+mod graph_finish_recovery_tests {
+    use super::*;
+    use crate::git::Operation;
+    #[test]
+    fn mapped_finish_target_recovers_before_or_after_branch_publication() {
+        for published in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = Repository::init(dir.path()).unwrap();
+            repo.execute(Operation::SetIdentity(
+                "Test".into(),
+                "test@example.invalid".into(),
+            ))
+            .unwrap();
+            fs::write(repo.root.join("base"), "base").unwrap();
+            repo.execute(Operation::StageAll).unwrap();
+            repo.execute(Operation::Commit("base".into())).unwrap();
+            let base = raw(&repo).unwrap().head().unwrap().target().unwrap();
+            fs::write(repo.root.join("tip"), "tip").unwrap();
+            repo.execute(Operation::StageAll).unwrap();
+            repo.execute(Operation::Commit("tip".into())).unwrap();
+            let r = raw(&repo).unwrap();
+            let original = r.head().unwrap().target().unwrap();
+            let preview = repo.rebase_preview(&base.to_string()).unwrap();
+            let mut steps = preview.steps.clone();
+            steps[0].action = RebaseAction::Break;
+            repo.execute(Operation::Rebase {
+                context: std::sync::Arc::new(preview),
+                steps,
+            })
+            .unwrap();
+            let mut state = load(&r).unwrap();
+            state.finishing = true;
+            state.finish_target = Some(base.to_string());
+            state
+                .graph_parents
+                .insert(original.to_string(), vec![base.to_string()]);
+            state
+                .rewritten
+                .insert(original.to_string(), base.to_string());
+            state.paused = false;
+            save(&r, &state).unwrap();
+            if published {
+                let target = r.find_commit(base).unwrap();
+                r.checkout_tree(target.as_object(), Some(CheckoutBuilder::new().force()))
+                    .unwrap();
+                r.reference(&state.branch, base, true, "simulate publication")
+                    .unwrap();
+                r.set_head(&state.branch).unwrap();
+            }
+            repo.execute(Operation::ContinueRebase).unwrap();
+            assert_eq!(repo.snapshot(1).unwrap().head_id, Some(base.to_string()));
+            assert!(!repo.root.join("tip").exists());
+            assert!(!active(&r));
+        }
     }
 }

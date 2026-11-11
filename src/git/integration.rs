@@ -168,6 +168,30 @@ fn lock_head<'r>(repo: &'r git2::Repository, head: &HeadState) -> Result<git2::T
     );
     Ok(transaction)
 }
+/// Wrap only an already reviewed native write. Encoded checkout owns its raw
+/// preimages and must not go through this LFS normalization first.
+pub(super) fn with_native_lfs(
+    repo: &git2::Repository,
+    work: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    let result = super::lfs::dehydrate(&git2::Repository::open(repo.path())?).and_then(|_| work());
+    let hydrated = super::lfs::hydrate(&git2::Repository::open(repo.path())?);
+    match (result, hydrated) {
+        (Ok(text), Ok(missing)) => Ok(with_missing_lfs(text, missing)),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.context(
+            "Integration changed the repository, but local LFS checkout failed; inspect the working tree",
+        )),
+    }
+}
+fn with_missing_lfs(text: String, missing: usize) -> String {
+    if missing > 0 {
+        format!("{text}; {missing} LFS objects missing locally (use LFS Fetch)")
+    } else {
+        text
+    }
+}
+
 impl Repository {
     pub fn prepare_merge(&self, branch: &str) -> Result<MergePreview> {
         let repo = raw(self)?;
@@ -336,7 +360,7 @@ impl Repository {
         );
         self.check_pull_configuration(preview)?;
         if let Some(context) = rebase {
-            return self.with_lfs(|| self.start_rebase(&context, context.steps.clone()));
+            return self.start_rebase(&context, context.steps.clone());
         }
         self.integrate_target(
             target,

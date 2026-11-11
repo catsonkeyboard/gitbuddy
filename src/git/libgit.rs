@@ -818,7 +818,8 @@ impl Repository {
             .single()
             .map_or_else(|| "Unknown date".to_string(), |date| date.to_rfc3339());
         Ok(CommitDetail {
-            id: id.into(),
+            id: commit.id().to_string(),
+            parents: commit.parent_ids().map(|id| id.to_string()).collect(),
             subject: commit
                 .summary()
                 .ok()
@@ -949,18 +950,12 @@ impl Repository {
                 | Operation::AbortCherryPick
                 | Operation::Stash(_)
                 | Operation::ApplyStash(_)
-                | Operation::Rebase { .. }
-                | Operation::CherryPickBatch(_)
-                | Operation::RevertBatch(_)
-                | Operation::ContinueRebase
-                | Operation::AbortRebase
                 | Operation::Discard(_)
-                | Operation::ContinueConflict(_)
                 | Operation::Reset {
                     mode: super::ResetMode::Hard,
                     ..
                 }
-        );
+        ) || matches!(&operation, Operation::ContinueConflict(session) if session.operation != ConflictOperation::Rebase);
         let initial = raw(self)?;
         let checkout_hook = matches!(
             &operation,

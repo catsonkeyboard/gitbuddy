@@ -359,6 +359,12 @@ pub(super) struct IndexLock {
     cleanup: bool,
 }
 impl IndexLock {
+    pub(super) fn write_and_install(&mut self, bytes: &[u8], target: &Path) -> Result<()> {
+        self.file.write_all(bytes)?;
+        self.file.sync_all()?;
+        self.install(target)?;
+        Ok(())
+    }
     pub(super) fn acquire(index: &Path) -> Result<Self> {
         let mut name = index.as_os_str().to_owned();
         name.push(".lock");

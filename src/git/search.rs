@@ -6,12 +6,23 @@ use super::{
 use anyhow::{Context, Result, ensure};
 use chrono::{Duration, NaiveDate};
 use git2::Sort;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub struct HistorySearchResult {
     pub commits: Vec<Commit>,
     pub scanned: usize,
     pub truncated: bool,
+    pub next: Option<Arc<HistorySearchCursor>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistorySearchCursor {
+    git_dir: PathBuf,
+    query: String,
+    roots: Vec<git2::Oid>,
+    refs: Arc<HashMap<git2::Oid, Vec<String>>>,
+    scanned: usize,
 }
 
 #[derive(Default)]
@@ -134,40 +145,83 @@ impl Repository {
         query: &str,
         cancel: &CancellationToken,
     ) -> Result<HistorySearchResult> {
-        let query = SearchQuery::parse(query)?;
+        cancel.check()?;
+        let parsed = SearchQuery::parse(query)?;
         let repo = raw(self)?;
-        let refs = refs_by_oid(&repo)?;
-        let mut walk = repo.revwalk()?;
-        walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
-        if let Some(reference) = &query.reference {
-            let commit = repo
-                .revparse_single(reference)
-                .context("Search reference not found")?
-                .peel_to_commit()
-                .context("Search reference does not resolve to a commit")?;
-            walk.push(commit.id())?;
+        let refs = Arc::new(refs_by_oid(&repo)?);
+        let mut roots = Vec::new();
+        if let Some(reference) = &parsed.reference {
+            roots.push(
+                repo.revparse_single(reference)
+                    .context("Search reference not found")?
+                    .peel_to_commit()?
+                    .id(),
+            );
         } else {
-            for id in refs.keys() {
-                walk.push(*id)?;
-            }
+            roots.extend(refs.keys().copied());
             if let Ok(head) = repo.head()
                 && let Some(id) = head.target()
             {
-                walk.push(id)?;
+                roots.push(id);
             }
         }
+        roots.sort();
+        roots.dedup();
+        self.search_history_next(
+            &HistorySearchCursor {
+                git_dir: repo.path().into(),
+                query: query.to_owned(),
+                roots,
+                refs,
+                scanned: 0,
+            },
+            cancel,
+        )
+    }
+    pub fn search_history_next(
+        &self,
+        cursor: &HistorySearchCursor,
+        cancel: &CancellationToken,
+    ) -> Result<HistorySearchResult> {
+        cancel.check()?;
+        let query = SearchQuery::parse(&cursor.query)?;
+        let repo = raw(self)?;
+        ensure!(
+            repo.path() == cursor.git_dir,
+            "Search cursor belongs to another repository"
+        );
+        let refs = &cursor.refs;
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+        for id in &cursor.roots {
+            cancel.check()?;
+            walk.push(*id)?;
+        }
+        let mut hide_cancelled = |_| cancel.is_requested();
+        let walk = walk.with_hide_callback(&mut hide_cancelled)?;
         let mut result = HistorySearchResult {
             commits: Vec::new(),
-            scanned: 0,
+            scanned: cursor.scanned,
             truncated: false,
+            next: None,
         };
-        for entry in walk {
+        let mut retained = 0usize;
+        for (position, entry) in walk.enumerate() {
             cancel.check()?;
-            if result.scanned >= 100_000 || result.commits.len() >= 1_000 {
+            if position < cursor.scanned {
+                let _ = entry?;
+                continue;
+            }
+            if result.scanned - cursor.scanned >= 100_000 || result.commits.len() >= 1_000 {
                 result.truncated = true;
                 break;
             }
-            let commit = repo.find_commit(entry?)?;
+            let id = entry?;
+            ensure!(
+                repo.odb()?.read_header(id)?.0 <= 16 * 1024 * 1024,
+                "Commit metadata exceeds the 16 MiB search limit"
+            );
+            let commit = repo.find_commit(id)?;
             result.scanned += 1;
             let time = commit.time().seconds();
             if query.after.is_some_and(|n| time < n) || query.before.is_some_and(|n| time >= n) {
@@ -207,15 +261,44 @@ impl Repository {
             {
                 continue;
             }
-            result.commits.push(Commit {
+            ensure!(
+                commit.parent_count() <= 256,
+                "Commit has more than 256 parents; narrow the search range"
+            );
+            let clip = |value: String| {
+                if value.chars().count() > 1024 {
+                    value.chars().take(1024).collect::<String>() + "…"
+                } else {
+                    value
+                }
+            };
+            let hit = Commit {
                 id,
                 parents: commit.parent_ids().map(|p| p.to_string()).collect(),
-                subject,
-                author,
+                subject: clip(subject),
+                author: clip(author),
                 date: relative_time(time),
-                refs: names,
-            });
+                refs: clip(names),
+            };
+            let size = hit.id.len()
+                + hit.subject.len()
+                + hit.author.len()
+                + hit.refs.len()
+                + hit.parents.iter().map(|p| p.len()).sum::<usize>();
+            if retained + size > 8 * 1024 * 1024 && !result.commits.is_empty() {
+                result.scanned -= 1;
+                result.truncated = true;
+                break;
+            }
+            retained += size;
+            result.commits.push(hit);
         }
+        if result.truncated {
+            let mut next = cursor.clone();
+            next.scanned = result.scanned;
+            result.next = Some(Arc::new(next));
+        }
+        cancel.check()?;
         Ok(result)
     }
 }
