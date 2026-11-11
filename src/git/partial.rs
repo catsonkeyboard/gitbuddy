@@ -1,10 +1,19 @@
 //! Partial staging uses libgit2's structured diff, never the lossy display text.
-//! Reconstruct just the index blob; the working tree is never written.
+//! Index edits use canonical blobs; discard keeps untouched working bytes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use super::conversion::WorkingLine;
+use super::conversion::{CleanPolicy, FileStamp, Limits, Snapshot, WorkingFile};
 use super::libgit::{diff_for_context, head_tree, raw};
 use super::{DIFF_LIMIT_LINES, DiffLine, FileChange, Repository, diff_preview};
 use anyhow::{Context, Result, ensure};
 use git2::{Delta, DiffFindOptions, FileMode, IndexEntry, IndexTime, Oid, Patch};
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct FilePatch {
@@ -38,6 +47,9 @@ impl FilePatch {
                 std::mem::size_of::<PartialPatch>()
                     + p.diff.capacity()
                     + p.path_bytes.capacity()
+                    + p.encoded
+                        .as_ref()
+                        .map_or(0, |_| std::mem::size_of::<EncodedPatch>())
                     + p.hunks.capacity() * std::mem::size_of::<Hunk>()
                     + p.hunks
                         .iter()
@@ -111,6 +123,57 @@ struct Hunk {
     lines: Vec<PatchLine>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkingVersion {
+    stamp: FileStamp,
+    hash: [u8; 32],
+}
+impl WorkingVersion {
+    fn read(repo: &git2::Repository, path: &Path) -> Result<Option<WorkingFile>> {
+        let absolute = repo.workdir().context("Missing worktree")?.join(path);
+        match fs::symlink_metadata(absolute) {
+            Ok(_) => Ok(Some(WorkingFile::read(
+                repo,
+                path,
+                Limits::ENCODED.max_bytes,
+            )?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn of(file: &WorkingFile) -> Self {
+        Self {
+            stamp: file.stamp.clone(),
+            hash: Sha256::digest(&file.bytes).into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EncodedPatch {
+    snapshot: Snapshot,
+    working: Option<WorkingVersion>,
+}
+impl EncodedPatch {
+    fn validate(
+        &self,
+        repo: &git2::Repository,
+        path: &Path,
+        staged: bool,
+    ) -> Result<Option<WorkingFile>> {
+        self.snapshot.validate_path(repo, path)?;
+        if staged {
+            return Ok(None);
+        }
+        let working = WorkingVersion::read(repo, path)?;
+        ensure!(
+            working.as_ref().map(WorkingVersion::of) == self.working,
+            "Working bytes changed; refresh the diff"
+        );
+        Ok(working)
+    }
+}
+
 /// An immutable selection source, tied to the repository and index version
 /// shown to the user. Fields stay private so callers cannot forge a patch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +189,7 @@ pub struct PartialPatch {
     mode: u32,
     remove_when_empty: bool,
     hunks: Vec<Hunk>,
+    encoded: Option<Box<EncodedPatch>>,
 }
 
 impl Repository {
@@ -145,8 +209,8 @@ impl Repository {
     ) -> Result<String> {
         use std::io::Write;
         ensure!(
-            !patch.staged && patch.index.is_some(),
-            "Partial discard requires an existing tracked worktree file"
+            !patch.staged && patch.file.worktree != 'D',
+            "Partial discard requires an existing working file"
         );
         let repo = raw(self)?;
         ensure!(
@@ -206,25 +270,70 @@ impl Repository {
             );
         }
         let selected = patch.selected_rows(selection)?;
-        let all = patch
-            .hunks
-            .iter()
-            .flat_map(|h| &h.lines)
-            .filter(|l| matches!(l.kind, '+' | '-'))
-            .map(|l| l.row)
-            .collect::<BTreeSet<_>>();
+        let all = patch.changed_rows();
         let remaining = all.difference(&selected).copied().collect::<BTreeSet<_>>();
-        let base = repo
-            .find_blob(patch.index.as_ref().unwrap().id)?
-            .content()
-            .to_vec();
+        let base = match &patch.index {
+            Some(entry) => repo.find_blob(entry.id)?.content().to_vec(),
+            None => Vec::new(),
+        };
         let expected = patch.selected_content(&base, &all)?;
-        let actual = std::fs::read(&path)?;
-        ensure!(
-            actual == expected,
-            "Working file differs from the displayed diff or uses a content filter; refresh or use whole-file discard"
-        );
-        let content = patch.selected_content(&base, &remaining)?;
+        let (actual, content) = if let Some(encoded) = &patch.encoded {
+            let working = encoded
+                .validate(&repo, &patch.file.path, false)?
+                .context("Working file was removed; refresh the diff")?;
+            ensure!(
+                encoded.snapshot.clean(
+                    &repo,
+                    &patch.file.path,
+                    &working.bytes,
+                    &base,
+                    CleanPolicy::PatchApply,
+                    Limits::ENCODED,
+                )? == expected,
+                "Working bytes differ from the displayed diff"
+            );
+            let mut lines = Vec::new();
+            let canonical =
+                patch.selected_content_with_lines(&base, &remaining, |bytes, working| {
+                    if let Some(line) = working {
+                        if let Some(WorkingLine::Keep(range)) = lines.last_mut()
+                            && range.end == line
+                        {
+                            range.end += 1;
+                        } else {
+                            lines.push(WorkingLine::Keep(line..line + 1));
+                        }
+                    } else {
+                        lines.push(WorkingLine::Restore(bytes));
+                    }
+                })?;
+            let raw = encoded.snapshot.splice_working_lines(
+                &patch.file.path,
+                &working.bytes,
+                &expected,
+                &canonical,
+                &lines,
+            )?;
+            ensure!(
+                encoded.snapshot.clean(
+                    &repo,
+                    &patch.file.path,
+                    &raw,
+                    &base,
+                    CleanPolicy::PatchApply,
+                    Limits::ENCODED,
+                )? == canonical,
+                "Selected edits cannot be written without changing other working lines"
+            );
+            (working.bytes, raw)
+        } else {
+            let actual = fs::read(&path)?;
+            ensure!(
+                actual == expected,
+                "Working file differs from the displayed diff or uses a content filter; refresh or use whole-file discard"
+            );
+            (actual, patch.selected_content(&base, &remaining)?)
+        };
         let mut temporary =
             tempfile::NamedTempFile::new_in(path.parent().context("Missing parent directory")?)?;
         #[cfg(target_os = "macos")]
@@ -251,12 +360,12 @@ impl Repository {
             .set_permissions(metadata.permissions())?;
         temporary.as_file().sync_all()?;
         ensure!(
-            std::fs::read(&path)? == actual
-                && self
-                    .worktree_patch_context(&patch.file, false, patch.full_context)?
-                    .partial
-                    .as_deref()
-                    == Some(patch),
+            self.worktree_patch_context(&patch.file, false, patch.full_context)?
+                .partial
+                .as_deref()
+                == Some(patch)
+                && WorkingFile::read(&repo, &patch.file.path, Limits::ENCODED.max_bytes)?.bytes
+                    == actual,
             "Working file changed; discard cancelled"
         );
         temporary.persist(&path).map_err(|e| e.error)?;
@@ -283,16 +392,44 @@ impl Repository {
         }
         let repo = raw(self)?;
         let index = repo.index()?;
+        let version = entry_version(index.get_path(&file.path, 0));
+        let working_metadata = fs::symlink_metadata(self.root.join(&file.path));
+        let regular_working = match &working_metadata {
+            Ok(meta) => meta.is_file() && !meta.file_type().is_symlink(),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        let mut encoded = None;
+        if version
+            .as_ref()
+            .is_none_or(|entry| matches!(entry.mode, 0o100644 | 0o100755))
+            && (staged || regular_working)
+        {
+            let snapshot = super::conversion::Snapshot::capture(
+                &repo,
+                &BTreeSet::from([file.path.clone()]),
+                super::lfs::AttributeLookup::WorktreeThenIndex,
+            )?;
+            if snapshot.has_encoding(&file.path) {
+                let working = if staged {
+                    None
+                } else {
+                    WorkingVersion::read(&repo, &file.path)?
+                        .as_ref()
+                        .map(WorkingVersion::of)
+                };
+                encoded = Some(Box::new(EncodedPatch { snapshot, working }));
+            }
+        }
         if super::lfs::tracked(&repo, &file.path)? {
             return Ok(FilePatch {
                 unavailable: Some("LFS files must be staged or unstaged as a whole file.".into()),
-                ..FilePatch::read_only(
-                    "LFS content is stored separately; use the file's Stage / Unstage action.",
-                )
+                ..FilePatch::read_only_context(
+                    &self.diff_context(file, staged, full_context)?,
+                    full_context,
+                )?
             });
         }
-        let version = entry_version(index.get_path(&file.path, 0));
-        if full_context {
+        if full_context || encoded.is_some() {
             if let Some(entry) = &version
                 && entry.mode != 0o160000
             {
@@ -304,7 +441,7 @@ impl Repository {
                     head_tree(&repo)?.as_ref(),
                     &[&file.path],
                 )?;
-            } else if let Ok(meta) = std::fs::symlink_metadata(self.root.join(&file.path)) {
+            } else if let Ok(meta) = working_metadata {
                 ensure!(
                     meta.len() <= super::diff_view::FULL_DIFF_BYTES as u64,
                     "Full context exceeds the safety limit (16 MB per file). Use compact context or an external editor."
@@ -428,6 +565,9 @@ impl Repository {
                 delta.new_file().mode().into()
             }
         });
+        if let Some(encoded) = &encoded {
+            encoded.validate(&repo, &file.path, staged)?;
+        }
         let partial = PartialPatch {
             git_dir: repo.path().to_path_buf(),
             file: file.clone(),
@@ -453,6 +593,7 @@ impl Repository {
                 delta.status() == Delta::Deleted
             },
             hunks,
+            encoded,
         };
         Ok(FilePatch {
             display: super::DiffDisplay::new(&lines),
@@ -472,12 +613,14 @@ impl Repository {
             repo.path() == patch.git_dir,
             "This diff belongs to a different repository. Refresh and select again."
         );
+        let mut index = repo.index()?;
+        let index_path = index.path().context("Missing index")?.to_path_buf();
+        let mut lock = super::conflicts::IndexLock::acquire(&index_path)?;
         let current = self.worktree_patch_context(&patch.file, patch.staged, patch.full_context)?;
         ensure!(
             current.partial.as_deref() == Some(patch),
             "The diff has changed. Refresh and select the changes again."
         );
-        let mut index = repo.index()?;
         index.read(true)?;
         ensure!(
             entry_version(index.get_path(&patch.file.path, 0)) == patch.index
@@ -492,8 +635,39 @@ impl Repository {
             .unwrap_or_default();
         let selected = patch.selected_rows(selection)?;
         let content = patch.selected_content(&base, &selected)?;
+        if let Some(encoded) = &patch.encoded {
+            ensure!(
+                content.len() <= Limits::ENCODED.max_bytes,
+                "Partial index result exceeds the conversion byte limit"
+            );
+            if let Some(working) = encoded.validate(&repo, &patch.file.path, patch.staged)? {
+                // Like git add -p, stage an already-cleaned canonical patch.
+                // The whole-file Add-only round-trip rules do not apply.
+                ensure!(
+                    encoded.snapshot.clean(
+                        &repo,
+                        &patch.file.path,
+                        &working.bytes,
+                        &base,
+                        CleanPolicy::PatchApply,
+                        Limits::ENCODED,
+                    )? == patch.selected_content(&base, &patch.changed_rows())?,
+                    "Working bytes differ from the displayed diff"
+                );
+            }
+        }
+        // A separate index preserves all unrelated entries while the standard
+        // lock excludes external Git writers between review and publication.
+        let scratch = tempfile::tempdir_in(repo.path())?;
+        let next_path = scratch.path().join("index");
+        match fs::copy(&index_path, &next_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !index_path.exists() => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut next = git2::Index::open(&next_path)?;
         if content.is_empty() && patch.remove_when_empty {
-            index.remove_path(&patch.file.path)?;
+            next.remove_path(&patch.file.path)?;
         } else {
             // Invalidate stat data: it describes the worktree, not this partial
             // blob. Retaining it can hide the remaining unstaged changes.
@@ -506,14 +680,25 @@ impl Repository {
                 uid: 0,
                 gid: 0,
                 file_size: 0,
-                id: Oid::ZERO_SHA1,
+                id: repo.blob(&content)?,
                 flags: 0,
                 flags_extended: 0,
                 path: patch.path_bytes.clone(),
             };
-            index.add_frombuffer(&entry, &content)?;
+            next.add(&entry)?;
         }
-        index.write()?;
+        next.write()?;
+        let next_bytes = fs::read(&next_path)?;
+        if patch.staged {
+            ensure!(
+                head_tree(&repo)?.map(|tree| tree.id()) == patch.head,
+                "HEAD changed; refresh the diff"
+            );
+        }
+        if let Some(encoded) = &patch.encoded {
+            encoded.validate(&repo, &patch.file.path, patch.staged)?;
+        }
+        lock.write_and_install(&next_bytes, &index_path)?;
         Ok(format!(
             "{} changed lines {}",
             selected.len(),
@@ -527,16 +712,18 @@ impl PartialPatch {
         &self.diff
     }
     pub fn can_discard(&self) -> bool {
-        !self.staged && self.index.is_some() && self.file.worktree != 'D'
+        !self.staged && self.file.worktree != 'D'
     }
-    fn selected_rows(&self, selection: &PatchSelection) -> Result<BTreeSet<usize>> {
-        let changes: BTreeSet<_> = self
-            .hunks
+    fn changed_rows(&self) -> BTreeSet<usize> {
+        self.hunks
             .iter()
             .flat_map(|h| &h.lines)
             .filter(|l| matches!(l.kind, '+' | '-'))
             .map(|l| l.row)
-            .collect();
+            .collect()
+    }
+    fn selected_rows(&self, selection: &PatchSelection) -> Result<BTreeSet<usize>> {
+        let changes = self.changed_rows();
         let selected: BTreeSet<_> = match selection {
             PatchSelection::Hunk(row) => self
                 .hunks
@@ -558,36 +745,61 @@ impl PartialPatch {
     }
 
     fn selected_content(&self, base: &[u8], selected: &BTreeSet<usize>) -> Result<Vec<u8>> {
-        let base_lines: Vec<_> = base.split_inclusive(|&b| b == b'\n').collect();
+        self.selected_content_with_lines(base, selected, |_, _| ())
+    }
+
+    fn selected_content_with_lines<'a>(
+        &'a self,
+        base: &'a [u8],
+        selected: &BTreeSet<usize>,
+        mut record_source: impl FnMut(&'a [u8], Option<usize>),
+    ) -> Result<Vec<u8>> {
+        let mut base_lines = base.split_inclusive(|&b| b == b'\n');
         let mut cursor = 0;
+        let mut working_line = 0;
         let mut output = Vec::with_capacity(base.len());
+        let mut append = |bytes: &'a [u8], working: Option<usize>| {
+            output.extend_from_slice(bytes);
+            record_source(bytes, working);
+        };
         for hunk in &self.hunks {
             ensure!(
-                hunk.base_start >= cursor && hunk.base_start <= base_lines.len(),
+                hunk.base_start >= cursor,
                 "Diff no longer matches the index."
             );
-            for line in &base_lines[cursor..hunk.base_start] {
-                output.extend_from_slice(line);
+            for _ in cursor..hunk.base_start {
+                let line = base_lines
+                    .next()
+                    .context("Diff no longer matches the index.")?;
+                append(line, Some(working_line));
+                working_line += 1;
             }
             cursor = hunk.base_start;
             for line in &hunk.lines {
                 let (remove, add) = if self.staged { ('+', '-') } else { ('-', '+') };
                 if line.kind == ' ' || line.kind == remove {
                     ensure!(
-                        base_lines.get(cursor).copied() == Some(line.bytes.as_slice()),
+                        base_lines.next() == Some(line.bytes.as_slice()),
                         "Diff no longer matches the index."
                     );
                     cursor += 1;
                     if line.kind == ' ' || !selected.contains(&line.row) {
-                        output.extend_from_slice(&line.bytes);
+                        append(&line.bytes, (line.kind == ' ').then_some(working_line));
                     }
-                } else if line.kind == add && selected.contains(&line.row) {
-                    output.extend_from_slice(&line.bytes);
+                    if line.kind == ' ' {
+                        working_line += 1;
+                    }
+                } else if line.kind == add {
+                    if selected.contains(&line.row) {
+                        append(&line.bytes, Some(working_line));
+                    }
+                    working_line += 1;
                 }
             }
         }
-        for line in &base_lines[cursor..] {
-            output.extend_from_slice(line);
+        for line in base_lines {
+            append(line, Some(working_line));
+            working_line += 1;
         }
         Ok(output)
     }

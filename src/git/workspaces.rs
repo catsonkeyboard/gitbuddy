@@ -1,4 +1,4 @@
-use super::libgit::{network_callbacks, raw};
+use super::libgit::{WriterLock, network_callbacks, raw};
 use super::{NetworkControl, Repository};
 use anyhow::{Context, Result, ensure};
 use git2::{
@@ -6,6 +6,8 @@ use git2::{
     WorktreeLockStatus, WorktreePruneOptions, build::CheckoutBuilder,
 };
 use std::path::{Component, Path, PathBuf};
+#[path = "workspaces/submodule_manage.rs"]
+mod submodule_manage;
 
 #[derive(Clone, Debug)]
 pub struct WorktreeInfo {
@@ -172,7 +174,15 @@ impl Repository {
         let mut options = WorktreeAddOptions::new();
         options.checkout_existing(false);
         repo.worktree(name, path, Some(&options))?;
-        let missing = super::lfs::hydrate(&git2::Repository::open(path)?).with_context(|| {
+        let child = git2::Repository::open(path)?;
+        super::worktree_conversion::initialize_worktree(&child, &NetworkControl::default())
+            .with_context(|| {
+                format!(
+                    "Worktree was created at {}; open it to inspect the checkout",
+                    path.display()
+                )
+            })?;
+        let missing = super::lfs::hydrate(&child).with_context(|| {
             format!(
                 "Worktree was created at {}; retry LFS checkout there",
                 path.display()
@@ -392,9 +402,16 @@ impl Repository {
         ));
         let mut options = SubmoduleUpdateOptions::new();
         options.fetch(fetch);
-        module.clone(Some(&mut options)).context(
+        let child = module.clone(Some(&mut options)).context(
             "Submodule clone failed; its registered entry may remain for Update / retry",
         )?;
+        let _child_writer = WriterLock::acquire(&child)?;
+        super::worktree_conversion::initialize_worktree(&child, &control).with_context(|| {
+            format!(
+                "Submodule was cloned at {}; open it to inspect the checkout",
+                self.root.join(path).display()
+            )
+        })?;
         control.cancellation.finish()?;
         module.add_finalize()?;
         let missing = super::lfs::hydrate(
@@ -456,6 +473,11 @@ fn update(
     for name in names {
         control.check()?;
         let mut module = repo.find_submodule(&name)?;
+        submodule_manage::restore_checkout(repo, &module)?;
+        module.reload(true)?;
+        if let Some(child) = checked_child(repo, &module)? {
+            clean_for_removal(&child, 0)?;
+        }
         module.init(false)?;
         // libgit2's module store is shared between linked worktrees. A fresh
         // embedded clone gives this worktree an independent submodule HEAD/index.
@@ -470,20 +492,29 @@ fn update(
             ));
             let mut builder = git2::build::RepoBuilder::new();
             builder.fetch_options(fetch);
-            builder
+            let child = builder
                 .clone(&url, &module_path(repo, &module)?)
                 .with_context(|| {
                     format!("Independent submodule clone {name} failed; retry Update")
                 })?;
+            let _child_writer = WriterLock::acquire(&child)?;
+            super::worktree_conversion::initialize_worktree(&child, control)?;
         }
+        let Some(target) = module.index_id() else {
+            // A configuration-only entry is not a recorded gitlink yet.
+            continue;
+        };
+        control.phase(&format!("Updating submodule {name}…"));
         if let Some(child) = checked_child(repo, &module)? {
-            clean(&child).with_context(|| format!("Submodule {name} has changes"))?;
-            if let Err(error) = super::lfs::dehydrate(&child) {
-                let _ = super::lfs::hydrate(&child);
-                return Err(error);
-            }
-        }
-        let result = (|| -> Result<()> {
+            missing +=
+                update_initialized(repo, &module, &child, target, control).with_context(|| {
+                    format!(
+                        "Cannot update submodule at {}",
+                        module_path(repo, &module)
+                            .map_or_else(|_| name.clone(), |p| p.display().to_string())
+                    )
+                })?;
+        } else {
             let mut fetch = FetchOptions::new();
             fetch.remote_callbacks(network_callbacks(
                 control.clone(),
@@ -493,15 +524,20 @@ fn update(
             checkout.safe();
             let mut options = SubmoduleUpdateOptions::new();
             options.fetch(fetch).checkout(checkout).allow_fetch(true);
-            control.phase(&format!("Updating submodule {name}…"));
             module.update(true, Some(&mut options))?;
-            Ok(())
-        })();
-        let hydration = checked_child(repo, &module)?
-            .map(|child| super::lfs::hydrate(&child))
-            .transpose();
-        result?;
-        missing += hydration?.unwrap_or_default();
+            let child = checked_child(repo, &module)?.context("Missing submodule checkout")?;
+            let _child_writer = WriterLock::acquire(&child)?;
+            super::worktree_conversion::initialize_worktree(&child, control).with_context(
+                || {
+                    format!(
+                        "Submodule was initialized at {}; open it to inspect the checkout",
+                        module_path(repo, &module)
+                            .map_or_else(|_| name.clone(), |p| p.display().to_string())
+                    )
+                },
+            )?;
+            missing += super::lfs::hydrate(&child)?;
+        }
         if recursive {
             missing += update(
                 &checked_child(repo, &module)?.context("Submodule checkout is missing")?,
@@ -513,6 +549,86 @@ fn update(
         }
     }
     Ok(missing)
+}
+
+fn update_initialized(
+    parent: &git2::Repository,
+    module: &git2::Submodule<'_>,
+    child: &git2::Repository,
+    target: git2::Oid,
+    control: &NetworkControl,
+) -> Result<usize> {
+    let _writer = WriterLock::acquire(child)?;
+    clean(child).context("Submodule has changes")?;
+    let before = super::recovery::head_state(child)?;
+    let commit = match child.find_commit(target) {
+        Ok(commit) => commit,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {
+            let configured = if let Some(name) = before.reference.strip_prefix("refs/heads/") {
+                match child.config()?.get_string(&format!("branch.{name}.remote")) {
+                    Ok(remote) => Some(remote),
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
+            let mut remote = match configured
+                .as_deref()
+                .map(|name| child.find_remote(name))
+                .transpose()
+            {
+                Ok(Some(remote)) => remote,
+                Ok(None) => child.find_remote("origin")?,
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                    child.find_remote("origin")?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut fetch = FetchOptions::new();
+            fetch.remote_callbacks(network_callbacks(
+                control.clone(),
+                child.config()?.snapshot()?,
+            ));
+            remote.fetch(&[] as &[&str], Some(&mut fetch), None)?;
+            child
+                .find_commit(target)
+                .context("Fetch did not provide the recorded gitlink commit")?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut refs = child.transaction()?;
+    refs.lock_ref("HEAD")?;
+    if before.reference != "HEAD" {
+        refs.lock_ref(&before.reference)?;
+    }
+    let mut parent_index = parent.index()?;
+    let _parent_index_lock =
+        super::conflicts::IndexLock::acquire(parent_index.path().context("Missing parent index")?)?;
+    parent_index.read(true)?;
+    ensure!(
+        parent_index
+            .get_path(module.path(), 0)
+            .is_some_and(|entry| entry.mode == 0o160000 && entry.id == target)
+            && super::recovery::head_state(child)? == before,
+        "Submodule gitlink or HEAD changed; refresh before updating"
+    );
+    clean(child).context("Submodule has changes after fetch")?;
+    let receipt = super::worktree_conversion::checkout_tree(
+        child,
+        commit.as_object(),
+        super::CheckoutOptions {
+            publication: Some(super::CheckoutHead {
+                reference: None,
+                id: target,
+            }),
+            ..Default::default()
+        },
+        control,
+    )?;
+    refs.set_target("HEAD", target, None, "checkout: update recorded submodule")?;
+    refs.commit()?;
+    super::worktree_conversion::acknowledge_checkout(child, &receipt)
 }
 
 fn preflight(

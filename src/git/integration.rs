@@ -1,11 +1,15 @@
 //! Explicit merge/pull policies and a durable, single-parent squash workflow.
 use super::libgit::{author, file_changes, oid, raw};
 use super::recovery::{editable, head_state};
+use super::worktree_conversion::{
+    CheckoutHead, CheckoutOptions, acknowledge_checkout, checkout_tree_with_orig_head,
+    guard_native_history_write, history_needs_encoded_checkout,
+};
 use super::{HeadState, NetworkControl, RemoteInfo, Repository};
 use anyhow::{Context, Result, ensure};
 use git2::{Oid, RepositoryState, build::CheckoutBuilder};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::PathBuf};
+use std::{collections::HashSet, fs, io::Write, path::PathBuf};
 
 pub(super) const SQUASH_STATE: &str = "gitbuddy-squash.json";
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -191,7 +195,158 @@ fn with_missing_lfs(text: String, missing: usize) -> String {
         text
     }
 }
+fn encoded_merge_policy(repo: &git2::Repository) -> Result<()> {
+    if let Some(hook) = super::commit_policy::active_merge_hook(repo)? {
+        anyhow::bail!(
+            "Merge with working-tree-encoding cannot run the active {hook} hook against a staged merge result yet"
+        );
+    }
+    let config = repo.config()?.snapshot()?;
+    match config.get_bool("merge.renormalize") {
+        Ok(true) => {
+            anyhow::bail!("Merge with working-tree-encoding does not support merge.renormalize yet")
+        }
+        Ok(false) => (),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(driver) = match config.get_entry("merge.default") {
+        Ok(entry) => Some(entry),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+        Err(error) => return Err(error.into()),
+    } {
+        ensure!(
+            driver.has_value() && matches!(driver.value_bytes(), b"text" | b"binary" | b"union"),
+            "Merge with working-tree-encoding does not support a custom default merge driver"
+        );
+    }
+    let mut entries = config.entries(None)?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let name = entry.name_bytes();
+        ensure!(
+            !(name.starts_with(b"merge.") && name.ends_with(b".driver")),
+            "Merge with working-tree-encoding does not support configured custom merge drivers"
+        );
+    }
+    Ok(())
+}
 
+fn prepare_encoded_merge_tree(repo: &git2::Repository, ours: Oid, theirs: Oid) -> Result<Oid> {
+    // A separate handle retains the real repository's config/attributes, but
+    // libgit2 writes any merged blobs to this handle's private memory backend.
+    // In particular, another file's conflict cannot leave loose objects behind.
+    let planner = git2::Repository::open(repo.path())?;
+    let source = planner.odb()?;
+    let _memory = source.add_new_mempack_backend(1000)?;
+    let mut result = planner.merge_commits(
+        &planner.find_commit(ours)?,
+        &planner.find_commit(theirs)?,
+        None,
+    )?;
+    ensure!(
+        !result.has_conflicts(),
+        "Merge with working-tree-encoding has conflicts; no merge was started"
+    );
+    let tree = result.write_tree_to(&planner)?;
+    let destination = repo.odb()?;
+    enum Pending {
+        VisitTree(Oid),
+        Write(Oid, git2::ObjectType),
+    }
+    let mut visited = HashSet::new();
+    let mut objects = vec![Pending::VisitTree(tree)];
+    while let Some(next) = objects.pop() {
+        match next {
+            Pending::VisitTree(id) => {
+                if !visited.insert(id) {
+                    continue;
+                }
+                // Persist dependencies before their parent. Visit existing
+                // trees too: an older interrupted write may have installed
+                // the tree before its newly merged children.
+                objects.push(Pending::Write(id, git2::ObjectType::Tree));
+                for entry in planner.find_tree(id)?.iter() {
+                    match entry.kind() {
+                        Some(git2::ObjectType::Tree) => {
+                            objects.push(Pending::VisitTree(entry.id()));
+                        }
+                        Some(kind @ git2::ObjectType::Blob) => {
+                            objects.push(Pending::Write(entry.id(), kind));
+                        }
+                        // A gitlink names an object in the submodule's database.
+                        Some(git2::ObjectType::Commit) if entry.filemode() == 0o160000 => (),
+                        _ => anyhow::bail!("Invalid entry in the planned merge tree"),
+                    }
+                }
+            }
+            Pending::Write(id, kind) => {
+                if destination.exists(id) {
+                    continue;
+                }
+                let object = source.read(id)?;
+                ensure!(
+                    object.kind() == kind,
+                    "Invalid object in the planned merge tree"
+                );
+                ensure!(
+                    destination.write(kind, object.data())? == id,
+                    "Object ID changed while preparing the merge tree"
+                );
+            }
+        }
+    }
+    Ok(tree)
+}
+
+fn publish_integrated_tree(
+    repo: &git2::Repository,
+    mut refs: git2::Transaction<'_>,
+    original: &HeadState,
+    commit: &git2::Commit<'_>,
+    signature: &git2::Signature<'_>,
+    reflog: &str,
+    control: &NetworkControl,
+) -> Result<usize> {
+    let before = oid(original.id.as_deref().context("HEAD has no commit")?)?;
+    let mut orig_ref = repo.transaction()?;
+    orig_ref.lock_ref("ORIG_HEAD")?;
+    orig_ref.set_target(
+        "ORIG_HEAD",
+        before,
+        Some(signature),
+        "gitbuddy: before integration",
+    )?;
+    refs.set_target(&original.reference, commit.id(), Some(signature), reflog)?;
+    let receipt = checkout_tree_with_orig_head(
+        repo,
+        commit.as_object(),
+        CheckoutOptions {
+            publication: Some(CheckoutHead {
+                reference: (original.reference != "HEAD").then(|| original.reference.clone()),
+                id: commit.id(),
+            }),
+            ..CheckoutOptions::default()
+        },
+        control,
+        before,
+    )?;
+    refs.commit()?;
+    let original = orig_ref
+        .commit()
+        .context("Integration published HEAD, but ORIG_HEAD could not be updated");
+    if super::worktree_conversion::pending(repo) {
+        // The journal can finish or restore either side of this ref update.
+        original?;
+        acknowledge_checkout(repo, &receipt)
+    } else {
+        // Native checkout hydrates LFS only after publishing the ref. Even if
+        // hydration fails the integration is committed and has its ORIG_HEAD.
+        let hydrated = acknowledge_checkout(repo, &receipt);
+        original?;
+        hydrated
+    }
+}
 impl Repository {
     pub fn prepare_merge(&self, branch: &str) -> Result<MergePreview> {
         let repo = raw(self)?;
@@ -296,7 +451,13 @@ impl Repository {
                 == oid(&preview.target)?,
             "Merge target moved; reopen Merge"
         );
-        self.integrate_target(oid(&preview.target)?, &preview.label, mode, false)
+        self.integrate_target(
+            oid(&preview.target)?,
+            &preview.label,
+            mode,
+            false,
+            &NetworkControl::default(),
+        )
     }
     pub(super) fn pull_with(
         &self,
@@ -367,6 +528,7 @@ impl Repository {
             &preview.upstream,
             MergeMode::Auto,
             strategy == PullStrategy::FastForwardOnly,
+            &control,
         )
     }
     fn check_pull_configuration(&self, expected: &PullPreview) -> Result<()> {
@@ -386,22 +548,13 @@ impl Repository {
         );
         Ok(())
     }
-    fn with_lfs(&self, work: impl FnOnce() -> Result<String>) -> Result<String> {
-        let repo = raw(self)?;
-        let result = super::lfs::dehydrate(&repo).and_then(|_| work());
-        let hydrated = super::lfs::hydrate(&raw(self)?);
-        match (result, hydrated) {
-            (Ok(text), Ok(missing)) => Ok(if missing > 0 { format!("{text}; {missing} LFS objects missing locally (use LFS Fetch)") } else { text }),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error.context("Integration changed the repository, but local LFS checkout failed; inspect the working tree")),
-        }
-    }
     fn integrate_target(
         &self,
         target: Oid,
         name: &str,
         mode: MergeMode,
         ff_only: bool,
+        control: &NetworkControl,
     ) -> Result<String> {
         let repo = raw(self)?;
         clean(&repo)?;
@@ -424,30 +577,103 @@ impl Repository {
             .id
             .as_deref()
             .context("HEAD has no commit")?)?)?;
-        let signature = if mode == MergeMode::Squash
-            || (mode == MergeMode::Auto && analysis.is_fast_forward())
-        {
+        if mode == MergeMode::Auto && analysis.is_fast_forward() {
+            let signature = repo
+                .signature()
+                .or_else(|_| git2::Signature::now("GitBuddy", "gitbuddy@localhost"))?;
+            let commit = repo.find_commit(target)?;
+            let missing = publish_integrated_tree(
+                &repo,
+                refs,
+                &original,
+                &commit,
+                &signature,
+                &format!("Fast-forward to {name}"),
+                control,
+            )?;
+            return Ok(with_missing_lfs(
+                format!("Fast-forwarded to {name}"),
+                missing,
+            ));
+        }
+
+        if history_needs_encoded_checkout(&repo, Some(target))? {
+            ensure!(
+                mode != MergeMode::Squash,
+                "Squash merge does not yet support working-tree-encoding"
+            );
+            encoded_merge_policy(&repo)?;
+            let reviewed = self.fingerprint()?;
+            let signature = author(&repo)?;
+            let other = repo.find_commit(target)?;
+            let tree = repo.find_tree(prepare_encoded_merge_tree(&repo, head.id(), target)?)?;
+            let id = super::commit_policy::create_object(
+                &repo,
+                &signature,
+                &signature,
+                &format!("Merge branch '{name}'"),
+                &tree,
+                &[&head, &other],
+            )?;
+            // Signing may run an external tool before the checkout begins.
+            // Revalidate the reviewed repository and the effective hooks.
+            let fresh = raw(self)?;
+            clean(&fresh)?;
+            ensure!(
+                self.fingerprint()? == reviewed && head_state(&fresh)? == original,
+                "Repository changed while preparing the encoded merge; reopen Merge"
+            );
+            encoded_merge_policy(&fresh)?;
+            let commit = repo.find_commit(id)?;
+            let missing = publish_integrated_tree(
+                &repo,
+                refs,
+                &original,
+                &commit,
+                &signature,
+                "gitbuddy: merge",
+                control,
+            )?;
+            return Ok(with_missing_lfs(
+                format!("Created merge commit {id}"),
+                missing,
+            ));
+        }
+
+        let signature = if mode == MergeMode::Squash {
             repo.signature()
                 .or_else(|_| git2::Signature::now("GitBuddy", "gitbuddy@localhost"))?
         } else {
             author(&repo)?
         };
         repo.reference("ORIG_HEAD", head.id(), true, "gitbuddy: before integration")?;
-        self.with_lfs(|| {
-            if mode == MergeMode::Auto && analysis.is_fast_forward() {
-                let commit = repo.find_commit(target)?;
-                refs.set_target(&original.reference, target, Some(&signature), &format!("Fast-forward to {name}"))?;
-                repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe().dry_run()))?;
-                repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe()))?;
-                refs.commit()?;
-                return Ok(format!("Fast-forwarded to {name}"));
-            }
+        with_native_lfs(&repo, || {
             let mut squash = if mode == MergeMode::Squash {
-                let state = SquashState { version: 1, git_dir: repo.path().into(), reference: original.reference.clone(), original: head.id().to_string(), target: target.to_string(), message: format!("Squash merge '{name}'"), applied: false, prepared: None };
+                let state = SquashState {
+                    version: 1,
+                    git_dir: repo.path().into(),
+                    reference: original.reference.clone(),
+                    original: head.id().to_string(),
+                    target: target.to_string(),
+                    message: format!("Squash merge '{name}'"),
+                    applied: false,
+                    prepared: None,
+                };
                 save(&repo, &state)?;
                 Some(state)
-            } else { None };
-            repo.merge(&[&annotated], None, Some(CheckoutBuilder::new().safe().allow_conflicts(true).conflict_style_merge(true)))?;
+            } else {
+                None
+            };
+            repo.merge(
+                &[&annotated],
+                None,
+                Some(
+                    CheckoutBuilder::new()
+                        .safe()
+                        .allow_conflicts(true)
+                        .conflict_style_merge(true),
+                ),
+            )?;
             if let Some(state) = squash.as_mut() {
                 // Squash must never advertise a second merge parent to commits.
                 repo.cleanup_state()?;
@@ -458,7 +684,10 @@ impl Repository {
                 state.applied = true;
                 save(&repo, state)?;
                 let mut index = repo.index()?;
-                ensure!(!index.has_conflicts(), "Squash has conflicts; resolve them, then commit or abort squash");
+                ensure!(
+                    !index.has_conflicts(),
+                    "Squash has conflicts; resolve them, then commit or abort squash"
+                );
                 if index.write_tree()? == head.tree_id() {
                     clear_squash(&repo)?;
                     return Ok("Squash has no changes; HEAD unchanged".into());
@@ -632,8 +861,9 @@ impl Repository {
                 "Merge target changed; preserve and inspect this operation"
             );
         }
-        self.with_lfs(|| {
-            let original = repo.find_commit(oid(&state.original)?)?;
+        let original = repo.find_commit(oid(&state.original)?)?;
+        guard_native_history_write(&repo, Some(original.id()))?;
+        with_native_lfs(&repo, || {
             repo.checkout_tree(original.as_object(), Some(CheckoutBuilder::new().force()))?;
             if repo.state() == RepositoryState::Merge {
                 repo.cleanup_state()?;

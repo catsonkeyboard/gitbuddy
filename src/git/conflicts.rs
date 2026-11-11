@@ -1,4 +1,6 @@
 //! Index-stage conflict inspection and guarded, per-file resolution.
+use super::conversion::{CleanPolicy, Limits, Snapshot as ConversionSnapshot};
+use super::lfs::{AttributeLookup, AttributeQuery, AttributeState, query_attributes};
 use super::libgit::{author, oid, raw};
 use super::recovery::head_state;
 use super::{HeadState, Repository};
@@ -11,6 +13,9 @@ use std::{
 };
 
 const EDIT_LIMIT: usize = 2 * 1024 * 1024;
+#[path = "conflicts/rename.rs"]
+mod rename;
+pub use rename::RenameConflict;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConflictOperation {
@@ -94,6 +99,7 @@ pub struct ConflictSession {
     pub operation: ConflictOperation,
     pub message: String,
     pub files: Vec<ConflictFile>,
+    pub renames: Vec<std::sync::Arc<RenameConflict>>,
     token: Token,
     index: Vec<u8>,
 }
@@ -115,6 +121,13 @@ pub struct ConflictContext {
     token: Token,
     work: WorkVersion,
     git_dir: PathBuf,
+    conversion: Result<Option<ConflictConversion>, String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConflictConversion {
+    attributes: AttributeQuery,
+    encoding: Option<ConversionSnapshot>,
+    lfs: Option<[u8; 32]>,
 }
 impl ConflictContext {
     pub fn is_index_only(&self) -> bool {
@@ -351,6 +364,35 @@ fn worktree(root: &Path, path: &Path) -> Result<(WorkVersion, Option<Vec<u8>>)> 
         Err(e) => Err(e.into()),
     }
 }
+
+fn conflict_conversion(repo: &git2::Repository, path: &Path) -> Result<ConflictConversion> {
+    let lookup = AttributeLookup::WorktreeThenIndex;
+    let attrs = query_attributes(repo, path, lookup, &["working-tree-encoding", "filter"])?;
+    if let Some(AttributeState::Value(filter)) = attrs.values.get("filter") {
+        super::conversion::validate_filter_driver(repo, filter)?;
+    }
+    let lfs = matches!(attrs.values.get("filter"), Some(AttributeState::Value(driver)) if driver == b"lfs");
+    let encoding = if matches!(
+        attrs.values.get("working-tree-encoding"),
+        Some(AttributeState::Value(_) | AttributeState::Set)
+    ) {
+        let conversion = ConversionSnapshot::capture(repo, &[path.to_path_buf()].into(), lookup)?;
+        ensure!(
+            !conversion.has_lfs(path),
+            "Conflict worktree writes do not support combining LFS and working-tree-encoding"
+        );
+        Some(conversion)
+    } else {
+        None
+    };
+    Ok(ConflictConversion {
+        attributes: attrs,
+        encoding,
+        lfs: lfs
+            .then(|| super::lfs::conversion_fingerprint(repo))
+            .transpose()?,
+    })
+}
 // Own the standard index lock before reading or replacing either file. A copy
 // of the latest index preserves unrelated staged entries and index extensions.
 pub(super) struct IndexLock {
@@ -431,6 +473,7 @@ impl Repository {
             operation,
             message,
             files: conflict_files(&index)?,
+            renames: rename::groups(&repo, &index)?,
             token,
             index: index_bytes(&index)?,
         })
@@ -469,13 +512,44 @@ impl Repository {
         } else {
             worktree(&self.root, path)?
         };
-        let result = bytes
+        let conversion = if index_only || !file.supported {
+            Ok(None)
+        } else {
+            conflict_conversion(&repo, path)
+                .map(Some)
+                .map_err(|error| format!("{error:#}"))
+        };
+        let encoding = conversion
             .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .and_then(|c| c.encoding.as_ref());
+        let decoded = match (encoding, &bytes) {
+            (Some(snapshot), Some(bytes)) if bytes.len() <= EDIT_LIMIT => snapshot
+                .clean(
+                    &repo,
+                    path,
+                    bytes,
+                    &[],
+                    CleanPolicy::PatchApply,
+                    Limits::ENCODED,
+                )
+                .ok(),
+            _ => None,
+        };
+        let display_bytes = if conversion.is_ok() && encoding.is_none() {
+            bytes.as_deref()
+        } else {
+            decoded.as_deref()
+        };
+        let result = display_bytes
             .filter(|b| b.len() <= EDIT_LIMIT && !b.contains(&0))
             .and_then(|b| std::str::from_utf8(b).ok())
             .map(str::to_owned);
-        let editable =
-            file.supported && !index_only && bytes.as_ref().is_none_or(|_| result.is_some());
+        let editable = file.supported
+            && !index_only
+            && conversion.is_ok()
+            && bytes.as_ref().is_none_or(|_| result.is_some());
         let description = if submodule {
             "Choose a gitlink commit; the submodule working directory will not be changed."
         } else if symlink {
@@ -484,6 +558,8 @@ impl Repository {
             "Choose a side to stage; the working path will not be changed."
         } else if !file.supported {
             "Renames, symlinks and submodules require an external resolution tool."
+        } else if let Err(error) = &conversion {
+            error
         } else if !editable {
             "Binary, non-UTF-8 or large file: choose a complete side or resolve externally."
         } else {
@@ -502,6 +578,7 @@ impl Repository {
             token: token(&repo)?,
             work,
             git_dir: repo.path().to_path_buf(),
+            conversion,
         })
     }
     pub(super) fn validate_tool_context(&self, context: &ConflictContext) -> Result<()> {
@@ -626,6 +703,17 @@ impl Repository {
             version == context.work,
             "The working file changed outside this view. Reload it before resolving."
         );
+        let conversion = context
+            .conversion
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .as_ref()
+            .context("Missing conflict conversion context")?;
+        ensure!(
+            &conflict_conversion(&repo, &context.file.path)? == conversion,
+            "Conversion rules changed. Reopen the conflict before resolving."
+        );
+        let from_worktree = matches!(resolution, ConflictResolution::Worktree);
         let fallback_mode = context.file.entries[1]
             .as_ref()
             .or(context.file.entries[2].as_ref())
@@ -676,6 +764,7 @@ impl Repository {
                 unreachable!("handled above")
             }
         };
+        let mut converted_result = None;
         next.conflict_remove(&context.file.path)?;
         if let Some(bytes) = &content {
             let e = context
@@ -686,8 +775,41 @@ impl Repository {
                 .next()
                 .context("Empty conflict")?;
             let clean;
-            let staged_bytes = if super::lfs::tracked(&repo, &context.file.path)? {
-                clean = super::lfs::clean_content(&repo, bytes)?;
+            let staged_bytes = if let Some(snapshot) = &conversion.encoding {
+                let path = &context.file.path;
+                if from_worktree {
+                    clean = snapshot.clean(
+                        &repo,
+                        path,
+                        bytes,
+                        &[],
+                        CleanPolicy::Add,
+                        Limits::ENCODED,
+                    )?;
+                    ensure!(
+                        !std::str::from_utf8(&clean).is_ok_and(has_conflict_markers),
+                        "Remove the remaining conflict markers first."
+                    );
+                    clean.as_slice()
+                } else {
+                    let id = Oid::hash_object(git2::ObjectType::Blob, bytes)?;
+                    let raw = snapshot.smudge(&repo, path, bytes, id, Limits::ENCODED)?;
+                    ensure!(
+                        snapshot.clean(
+                            &repo,
+                            path,
+                            &raw,
+                            bytes,
+                            CleanPolicy::PatchApply,
+                            Limits::ENCODED
+                        )? == *bytes,
+                        "The conflict result cannot round-trip in the working encoding"
+                    );
+                    converted_result = Some(raw);
+                    bytes.as_slice()
+                }
+            } else if conversion.lfs.is_some() {
+                clean = super::lfs::clean_content_at(&repo, bytes, &context.file.path)?;
                 clean.as_slice()
             } else {
                 bytes.as_slice()
@@ -700,7 +822,11 @@ impl Repository {
                 mode,
                 uid: 0,
                 gid: 0,
-                file_size: staged_bytes.len() as u32,
+                file_size: if conversion.encoding.is_some() {
+                    0
+                } else {
+                    staged_bytes.len() as u32
+                },
                 id: repo.blob(staged_bytes)?,
                 flags: 0,
                 flags_extended: 0,
@@ -714,7 +840,8 @@ impl Repository {
         lock.file.sync_all()?;
         // Build the replacement before changing the working file or index.
         let full = safe_path(&self.root, &context.file.path)?;
-        let mut replacement = if replace_worktree && let Some(bytes) = &content {
+        let working_result = converted_result.as_ref().or(content.as_ref());
+        let mut replacement = if replace_worktree && let Some(bytes) = working_result {
             let parent = full.parent().context("Missing parent directory")?;
             fs::create_dir_all(parent)?;
             let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -733,6 +860,7 @@ impl Repository {
         };
         ensure!(
             token(&repo)? == context.token
+                && &conflict_conversion(&repo, &context.file.path)? == conversion
                 && worktree(&self.root, &context.file.path)?.0 == version,
             "The conflict changed while saving. Reload it and retry."
         );
@@ -745,7 +873,9 @@ impl Repository {
         }
         if let Err(error) = lock.install(&index_path) {
             // If final index installation fails, restore only our own write.
-            if replace_worktree && worktree(&self.root, &context.file.path)?.1 == content {
+            if replace_worktree
+                && worktree(&self.root, &context.file.path)?.1.as_ref() == working_result
+            {
                 match old_bytes {
                     Some(bytes) => {
                         fs::write(&full, bytes)?;

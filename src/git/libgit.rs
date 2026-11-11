@@ -163,7 +163,7 @@ pub(super) fn diff_for_options<'a>(
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
-    if full {
+    if !paths.is_empty() {
         opts.disable_pathspec_match(true);
         for path in paths {
             opts.pathspec(*path);
@@ -173,18 +173,27 @@ pub(super) fn diff_for_options<'a>(
     if staged {
         Ok(repo.diff_tree_to_index(head_tree(repo)?.as_ref(), Some(&index), Some(&mut opts))?)
     } else {
-        Ok(repo.diff_index_to_workdir(Some(&index), Some(&mut opts))?)
+        super::conversion::working_diff(repo, &mut opts, paths, None)
     }
 }
 
 pub(super) fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
+    let recovering = super::worktree_conversion::pending(repo);
+    let (mut inspector, _native_config) = if recovering {
+        (None, None)
+    } else {
+        let (inspector, config) = super::conversion::Inspector::capture(repo)?;
+        (Some(inspector), Some(config))
+    };
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .renames_head_to_index(true)
-        .renames_index_to_workdir(true);
+        .renames_index_to_workdir(true)
+        .include_unmodified(!recovering);
     let statuses = repo.statuses(Some(&mut opts))?;
     let mut files = Vec::new();
+    let mut staged_only = std::collections::BTreeSet::new();
     for entry in statuses.iter() {
         let (index, worktree) = status_chars(entry.status());
         let indexed = entry.head_to_index();
@@ -209,6 +218,7 @@ pub(super) fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
             && worktree != ' '
             && indexed_path != working_path
         {
+            staged_only.insert(path_from_bytes(indexed_path));
             files.push(FileChange {
                 path: path_from_bytes(indexed_path),
                 original: indexed_original,
@@ -230,14 +240,107 @@ pub(super) fn file_changes(repo: &RawRepo) -> Result<Vec<FileChange>> {
             });
         }
     }
-    for file in &mut files {
-        if file.worktree == 'M'
-            && super::lfs::tracked(repo, &file.path)?
-            && super::lfs::matches_index(repo, &file.path)?
-        {
-            file.worktree = ' ';
-        }
+    // Recovery must remain visible even when intermediate bytes do not match
+    // the currently published attribute rules. Writers remain blocked above us.
+    if recovering {
+        files.retain(|file| file.index != ' ' || file.worktree != ' ');
+        return Ok(files);
     }
+    let index = repo.index()?;
+    for file in &mut files {
+        if !matches!(file.worktree, ' ' | 'M')
+            || file.conflict()
+            || (file.index != ' ' && file.worktree == ' ' && staged_only.contains(&file.path))
+        {
+            continue;
+        }
+        let Some(entry) = index.get_path(&file.path, 0) else {
+            continue;
+        };
+        if !matches!(entry.mode, 0o100644 | 0o100755)
+            || entry.flags & 0x8000 != 0
+            || entry.flags_extended & 0x4000 != 0
+        {
+            continue;
+        }
+        let metadata =
+            match fs::symlink_metadata(repo.workdir().context("No working tree")?.join(&file.path))
+            {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    metadata
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    file.worktree = 'D';
+                    continue;
+                }
+                Err(_) => {
+                    file.worktree = 'M';
+                    continue;
+                }
+            };
+        let read = match inspector
+            .as_mut()
+            .context("Missing content inspector")?
+            .for_path(repo, &file.path)
+        {
+            Ok(read) => read,
+            Err(_) => {
+                file.worktree = 'M';
+                continue;
+            }
+        };
+        #[cfg(unix)]
+        let actual_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        };
+        #[cfg(not(unix))]
+        let actual_mode = 0o100644;
+        if read.mode(actual_mode, Some(entry.mode)) != entry.mode {
+            file.worktree = 'M';
+            continue;
+        }
+        if read.has_lfs(&file.path) && !read.has_encoding(&file.path) {
+            let stamp = super::conversion::FileStamp::new(&metadata);
+            file.worktree = if super::lfs::matches_index(repo, &file.path).unwrap_or(false)
+                && stamp.validate(repo, &file.path).is_ok()
+            {
+                ' '
+            } else {
+                'M'
+            };
+            continue;
+        }
+        if read.native() {
+            continue;
+        }
+        let canonical = (|| -> Result<bool> {
+            ensure!(
+                repo.odb()?.read_header(entry.id)?.0
+                    <= super::conversion::Limits::ENCODED.max_bytes,
+                "Indexed conversion base exceeds its resource limit"
+            );
+            let blob = repo.find_blob(entry.id)?;
+            let (bytes, mode) = read.canonical_file(
+                repo,
+                &file.path,
+                blob.content(),
+                Some(entry.mode),
+                super::conversion::Limits::ENCODED,
+            )?;
+            Ok(bytes == blob.content() && mode == entry.mode)
+        })();
+        file.worktree = if canonical.unwrap_or(false) { ' ' } else { 'M' };
+    }
+    inspector
+        .as_ref()
+        .context("Missing content inspector")?
+        .validate(repo)?;
     files.retain(|f| f.index != ' ' || f.worktree != ' ');
     Ok(files)
 }
@@ -280,6 +383,7 @@ fn fingerprint_of(
     }
     format!("{:?}", repo.state()).hash(&mut hasher);
     super::patch_batch::recovery_pending(repo).hash(&mut hasher);
+    super::worktree_conversion::pending(repo).hash(&mut hasher);
     for name in [
         "gitbuddy-rebase.json",
         super::integration::SQUASH_STATE,
@@ -559,13 +663,20 @@ impl Repository {
                 .clone_local(git2::build::CloneLocal::None);
             control.phase("Clone: connecting…");
             control.check()?;
-            builder.clone(url, &clone_path)?;
+            let staged_repo = builder.clone(url, &clone_path)?;
+            if staged_repo.head().is_ok() {
+                control.phase("Clone: preparing working-tree encoding…");
+                super::worktree_conversion::initialize_worktree(&staged_repo, &control)?;
+            }
+            drop(staged_repo);
             control.cancellation.finish()?;
             control.phase("Clone: installing repository…");
             #[cfg(windows)]
             fs::remove_dir(&destination)?;
             fs::rename(&clone_path, &destination)?;
-            Self::open(destination)
+            let repository = Self::open(destination)?;
+            repository.auto_lfs_fetch("origin","HEAD",&control).context("Clone was installed, but automatic LFS download failed; open the repository and retry LFS Fetch")?;
+            Ok(repository)
         })();
         control.normalize(result)
     }
@@ -675,6 +786,7 @@ impl Repository {
         let squash = super::integration::squash_status(&repo)?;
         Ok(Snapshot {
             patch_recovery: super::patch_batch::recovery_pending(&repo),
+            worktree_recovery: super::worktree_conversion::pending(&repo),
             squash_pending: squash.as_ref().is_some_and(|s| !s.0),
             squash_message: squash.as_ref().map(|s| s.1.clone()),
             rebase_editing: self.rebase_status()?.is_some_and(|s| s.editing),
@@ -720,20 +832,6 @@ impl Repository {
                 meta.len() <= 2 * 1024 * 1024,
                 "Untracked file is larger than 2 MB"
             );
-            let content = fs::read(path)?;
-            if content.contains(&0) {
-                return Ok("Binary files differ\n".into());
-            }
-            let content = String::from_utf8_lossy(&content);
-            let lines = content.lines().count();
-            return Ok(format!(
-                "diff --git a/{0} b/{0}\nnew file mode 100644\n--- /dev/null\n+++ b/{0}\n@@ -0,0 +1,{lines} @@\n{1}",
-                file.path.display(),
-                content
-                    .lines()
-                    .map(|line| format!("+{line}\n"))
-                    .collect::<String>()
-            ));
         }
         let repo = raw(self)?;
         let mut paths = vec![file.path.clone()];
@@ -773,6 +871,7 @@ impl Repository {
         diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
         patch_text(&diff, Some(&paths))
     }
+
     pub fn show(&self, id: &str) -> Result<String> {
         let detail = self.commit_detail(id)?;
         let mut output = format!("{}\n{}\n", detail.subject, detail.body);
@@ -957,6 +1056,19 @@ impl Repository {
                 }
         ) || matches!(&operation, Operation::ContinueConflict(session) if session.operation != ConflictOperation::Rebase);
         let initial = raw(self)?;
+        // These operations now prepare their raw preimages before any LFS
+        // normalization. Legacy writers keep the existing outer wrapper.
+        let converted_checkout = matches!(
+            &operation,
+            Operation::Checkout(_)
+                | Operation::TrackBranch(_)
+                | Operation::CreateBranch(_)
+                | Operation::Discard(_)
+                | Operation::Reset {
+                    mode: super::ResetMode::Hard,
+                    ..
+                }
+        );
         let checkout_hook = matches!(
             &operation,
             Operation::Checkout(_)
@@ -984,36 +1096,47 @@ impl Repository {
         } else {
             None
         };
+        let squash = super::integration::squash_active(&initial);
+        let checkout = checkout && !squash;
+        // A conflict choice may install a complete LFS pointer. Squash
+        // continuation must hydrate it without dehydrating the reviewed index.
+        let hydrate = (checkout && !converted_checkout)
+            || matches!(&operation, Operation::ResolveConflict { .. })
+            || (squash
+                && matches!(
+                    &operation,
+                    Operation::Commit(_) | Operation::ContinueConflict(_)
+                ));
+        // Linked worktrees share refs and the LFS object store. This advisory
+        // lock serializes GitBuddy writers without blocking unrelated repos.
+        let _writer = WriterLock::acquire(&initial)?;
         ensure!(
             matches!(&operation, Operation::RecoverPatch)
                 || !super::patch_batch::recovery_pending(&initial),
             "A patch application was interrupted; use Repository → Recover patch before modifying this repository"
         );
-        let squash = super::integration::squash_active(&initial);
-        let checkout = checkout && !squash;
-        // A conflict choice may install a complete LFS pointer. Squash
-        // continuation must hydrate it without dehydrating the reviewed index.
-        let hydrate = checkout
-            || matches!(&operation, Operation::ResolveConflict { .. })
-            || (squash
-                && matches!(
-                    &operation,
-                    Operation::Commit(_) | Operation::ContinueConflict(_) | Operation::Discard(_)
-                ));
-        // Linked worktrees share refs and the LFS object store. This advisory
-        // lock serializes GitBuddy writers without blocking unrelated repos.
-        let _writer = WriterLock::acquire(&initial)?;
+        let checkout_recovery = matches!(
+            &operation,
+            Operation::ContinueWorktreeCheckout { .. } | Operation::AbortWorktreeCheckout { .. }
+        );
+        ensure!(
+            !super::worktree_conversion::pending(&initial) || checkout_recovery,
+            "An interrupted checkout needs recovery; open Repository → Checkout recovery before repository writes"
+        );
         if super::integration::squash_active(&initial) {
             ensure!(
                 matches!(
                     &operation,
                     Operation::Stage(_)
+                        | Operation::ContinueWorktreeCheckout { .. }
+                        | Operation::AbortWorktreeCheckout { .. }
                         | Operation::Unstage(_)
                         | Operation::StageAll
                         | Operation::UnstageAll
                         | Operation::ApplyPartial { .. }
                         | Operation::Discard(_)
                         | Operation::ResolveConflict { .. }
+                        | Operation::ResolveRenameConflict { .. }
                         | Operation::ContinueConflict(_)
                         | Operation::AbortMerge
                         | Operation::Commit(_)
@@ -1027,6 +1150,8 @@ impl Repository {
                 matches!(
                     &operation,
                     Operation::ContinueRebase
+                        | Operation::ContinueWorktreeCheckout { .. }
+                        | Operation::AbortWorktreeCheckout { .. }
                         | Operation::RecoverRebaseStep { .. }
                         | Operation::CommitRebase(_)
                         | Operation::AbortRebase
@@ -1037,12 +1162,47 @@ impl Repository {
                         | Operation::ApplyPartial { .. }
                         | Operation::Discard(_)
                         | Operation::ResolveConflict { .. }
+                        | Operation::ResolveRenameConflict { .. }
                         | Operation::ContinueConflict(_)
                 ),
                 "A GitBuddy rebase is in progress; resolve, continue or abort it first"
             );
         }
+        // Native multi-file writers without a conversion transaction must
+        // reject affected encoded files before even normalizing LFS content.
+        match &operation {
+            Operation::Revert(id)
+            | Operation::CherryPick(id)
+            | Operation::RevertMerge { id, .. }
+            | Operation::CherryPickMerge { id, .. } => {
+                let commit = initial.find_commit(oid(id)?)?;
+                super::worktree_conversion::guard_native_history_write(
+                    &initial,
+                    Some(commit.id()),
+                )?;
+                for parent in commit.parent_ids() {
+                    super::worktree_conversion::guard_native_history_write(&initial, Some(parent))?;
+                }
+            }
+            Operation::AbortMerge | Operation::AbortRevert | Operation::AbortCherryPick
+                if !squash =>
+            {
+                super::worktree_conversion::guard_native_history_write(
+                    &initial,
+                    Some(initial.head()?.peel_to_commit()?.id()),
+                )?;
+            }
+            Operation::Stash(_) => {
+                super::worktree_conversion::guard_native_history_write(
+                    &initial,
+                    Some(initial.head()?.peel_to_commit()?.id()),
+                )?;
+            }
+            Operation::ApplyStash(id) => super::stash::guard_native_stash_restore(&initial, id)?,
+            _ => {}
+        }
         if checkout
+            && !converted_checkout
             && !matches!(&operation, Operation::Reset { .. })
             && let Err(error) = super::lfs::dehydrate(&initial)
         {
@@ -1055,6 +1215,12 @@ impl Repository {
             }
             let mut repo = raw(self)?;
             match operation {
+                Operation::ContinueWorktreeCheckout { expected } => {
+                    super::worktree_conversion::continue_checkout(&repo, &expected)
+                }
+                Operation::AbortWorktreeCheckout { expected } => {
+                    super::worktree_conversion::abort_checkout(&repo, &expected, &control)
+                }
                 Operation::Rebase { context, steps } => self.start_rebase(&context, steps),
                 Operation::CherryPickBatch(plan) => self.start_cherry_batch(&plan),
                 Operation::RevertBatch(plan) => self.start_revert_batch(&plan),
@@ -1084,6 +1250,10 @@ impl Repository {
                 Operation::StageSubmoduleAt(expected) => self.stage_submodule_at(&expected),
                 Operation::LfsTrack { pattern, track } => self.lfs_track(&pattern, track),
                 Operation::LfsCheckout => self.lfs_checkout(),
+                Operation::SetLfsAutoFetch(enabled) => {
+                    repo.config()?.set_bool("gitbuddy.lfsAutoFetch", enabled)?;
+                    Ok("LFS auto-fetch preference saved for this repository".into())
+                }
                 Operation::LfsFetch(remote) => self.lfs_transfer(false, &remote, control.clone()),
                 Operation::LfsPush(remote) => self.lfs_transfer(true, &remote, control.clone()),
                 Operation::LfsLock { remote, path } => {
@@ -1119,6 +1289,9 @@ impl Repository {
                     context,
                     resolution,
                 } => self.resolve_conflict(&context, resolution),
+                Operation::ResolveRenameConflict { context, ours } => {
+                    self.resolve_rename_conflict(&context, ours)
+                }
                 Operation::ContinueConflict(session) => self.continue_conflict(&session),
                 Operation::Stage(paths) => {
                     ensure!(!paths.is_empty(), "没有选择文件");
@@ -1162,15 +1335,43 @@ impl Repository {
                     Ok("All files unstaged".into())
                 }
                 Operation::Discard(path) => {
-                    let index = repo.index()?;
+                    let mut index = repo.index()?;
                     ensure!(
                         index.get_path(&path, 0).is_some(),
                         "只能丢弃已跟踪文件的工作区修改"
                     );
-                    let mut checkout = CheckoutBuilder::new();
-                    checkout.force().disable_pathspec_match(true).path(&path);
-                    repo.checkout_index(None, Some(&mut checkout))?;
-                    Ok("Working tree changes discarded".into())
+                    if index.has_conflicts() {
+                        super::worktree_conversion::guard_native_write(
+                            &repo,
+                            None,
+                            Some(std::slice::from_ref(&path)),
+                        )?;
+                        let mut checkout = CheckoutBuilder::new();
+                        checkout.force().disable_pathspec_match(true).path(&path);
+                        repo.checkout_index(None, Some(&mut checkout))?;
+                        return Ok(checkout_notice(
+                            "Working tree changes discarded".into(),
+                            super::lfs::hydrate_paths(&repo, std::slice::from_ref(&path))?,
+                        ));
+                    }
+                    let tree = repo.find_tree(index.write_tree()?)?;
+                    let receipt = super::worktree_conversion::checkout_tree(
+                        &repo,
+                        tree.as_object(),
+                        super::CheckoutOptions {
+                            paths: vec![path],
+                            mode: super::CheckoutMode::Force,
+                            update_index: false,
+                            publication: None,
+                        },
+                        &control,
+                    )?;
+                    let missing =
+                        super::worktree_conversion::acknowledge_checkout(&repo, &receipt)?;
+                    Ok(checkout_notice(
+                        "Working tree changes discarded".into(),
+                        missing,
+                    ))
                 }
                 Operation::Commit(message) => {
                     if super::integration::squash_active(&repo) {
@@ -1216,15 +1417,15 @@ impl Repository {
                     validate_branch(&name)?;
                     let head = repo.head()?.peel_to_commit()?;
                     repo.branch(&name, &head, false)?;
-                    checkout_branch(&repo, &name, BranchType::Local)?;
-                    Ok(format!("Switched to {name}"))
+                    let missing = checkout_branch(&repo, &name, BranchType::Local, &control)?;
+                    Ok(checkout_notice(format!("Switched to {name}"), missing))
                 }
                 Operation::CreateBranchAt { name, target } => self.create_branch_at(&name, &target),
                 Operation::Reset { context, mode } => self.reset_history(&context, mode),
                 Operation::Checkout(name) => {
                     validate_branch(&name)?;
-                    checkout_branch(&repo, &name, BranchType::Local)?;
-                    Ok(format!("Switched to {name}"))
+                    let missing = checkout_branch(&repo, &name, BranchType::Local, &control)?;
+                    Ok(checkout_notice(format!("Switched to {name}"), missing))
                 }
                 Operation::CheckoutDetached(expected) => self.checkout_detached(&expected),
                 Operation::RenameBranch { expected, name } => self.rename_branch(&expected, &name),
@@ -1239,8 +1440,8 @@ impl Repository {
                     let commit = remote.get().peel_to_commit()?;
                     let mut local = repo.branch(local_name, &commit, false)?;
                     local.set_upstream(Some(&name))?;
-                    checkout_branch(&repo, local_name, BranchType::Local)?;
-                    Ok(format!("Tracking {name}"))
+                    let missing = checkout_branch(&repo, local_name, BranchType::Local, &control)?;
+                    Ok(checkout_notice(format!("Tracking {name}"), missing))
                 }
                 Operation::DeleteBranch(name) => {
                     validate_branch(&name)?;
@@ -1373,11 +1574,27 @@ impl Repository {
                     fetch_all(&repo, control.clone())?;
                     control.cancellation.finish()?;
                     control.phase("Fetch: updating repository view…");
+                    let names = repo.remotes()?;
+                    let remote = if names.iter().any(|n| n.ok().flatten() == Some("origin")) {
+                        Some("origin")
+                    } else {
+                        names.get(0).ok().flatten()
+                    };
+                    if let Some(remote) = remote {
+                        self.auto_lfs_fetch(remote, "HEAD", &control)
+                            .context("Git refs were fetched, but automatic LFS download failed")?;
+                    }
                     Ok("Remotes fetched".into())
                 }
                 Operation::FetchFrom(plan) => {
                     let id = self.fetch_selected(&plan, control.clone())?;
                     control.cancellation.finish()?;
+                    self.auto_lfs_fetch(
+                        &plan.remote.name,
+                        id.as_deref().unwrap_or("HEAD"),
+                        &control,
+                    )
+                    .context("Git refs were fetched, but automatic LFS download failed")?;
                     Ok(format!(
                         "Fetched {}{}",
                         plan.remote.name,
@@ -1406,7 +1623,12 @@ impl Repository {
                     context,
                     paths,
                     message,
-                } => self.save_stash_files(&context, &paths, &message),
+                } => self.save_stash_files(&context, &paths, &message, false),
+                Operation::SaveStashKeepingIndex {
+                    context,
+                    paths,
+                    message,
+                } => self.save_stash_files(&context, &paths, &message, true),
                 Operation::RestoreStash {
                     context,
                     id,
@@ -1480,7 +1702,9 @@ impl Repository {
                 }
             }
         })();
-        let result = if hydrate {
+        let conversion_pending =
+            raw(self).is_ok_and(|repo| super::worktree_conversion::pending(&repo));
+        let result = if hydrate && !conversion_pending {
             match super::lfs::hydrate(&raw(self)?) {
                 Ok(missing) => result.map(|text| {
                     if missing > 0 {
@@ -1825,15 +2049,53 @@ fn commit_index(
     Ok(outcome)
 }
 
-fn checkout_branch(repo: &RawRepo, name: &str, kind: BranchType) -> Result<()> {
-    super::workspaces::branch_available(repo, &format!("refs/heads/{name}"))?;
+pub(super) fn checkout_notice(message: String, missing: usize) -> String {
+    if missing > 0 {
+        format!("{message}; {missing} LFS objects missing locally (use LFS Fetch)")
+    } else {
+        message
+    }
+}
+
+fn checkout_branch(
+    repo: &RawRepo,
+    name: &str,
+    kind: BranchType,
+    control: &NetworkControl,
+) -> Result<usize> {
+    let reference = format!("refs/heads/{name}");
+    super::workspaces::branch_available(repo, &reference)?;
+    let mut transaction = repo.transaction()?;
+    transaction.lock_ref("HEAD")?;
+    transaction.lock_ref(&reference)?;
+    let old = super::recovery::head_state(repo)?;
+    if old.reference != "HEAD" && old.reference != reference {
+        transaction.lock_ref(&old.reference)?;
+    }
     let branch = repo.find_branch(name, kind)?;
     let commit = branch.get().peel_to_commit()?;
-    let mut checkout = CheckoutBuilder::new();
-    checkout.safe();
-    repo.checkout_tree(commit.as_object(), Some(&mut checkout))?;
-    repo.set_head(&format!("refs/heads/{name}"))?;
-    Ok(())
+    let receipt = super::worktree_conversion::checkout_tree(
+        repo,
+        commit.as_object(),
+        super::CheckoutOptions {
+            publication: Some(super::CheckoutHead {
+                reference: Some(reference.clone()),
+                id: commit.id(),
+            }),
+            ..Default::default()
+        },
+        control,
+    )?;
+    super::workspaces::branch_available(repo, &reference)?;
+    repo.reference_ensure_log("HEAD")?;
+    transaction.set_symbolic_target(
+        "HEAD",
+        &reference,
+        None,
+        &format!("checkout: moving to {name}"),
+    )?;
+    transaction.commit()?;
+    super::worktree_conversion::acknowledge_checkout(repo, &receipt)
 }
 
 fn abort_operation(repo: &RawRepo) -> Result<()> {

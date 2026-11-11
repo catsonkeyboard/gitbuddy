@@ -168,6 +168,15 @@ impl Drop for HydrateOnExit<'_> {
     }
 }
 
+pub(super) fn guard_native_stash_restore(repo: &RawRepo, id: &str) -> Result<()> {
+    let stash = repo.find_commit(oid(id)?)?;
+    super::worktree_conversion::guard_native_history_write(repo, Some(stash.id()))?;
+    for parent in stash.parent_ids() {
+        super::worktree_conversion::guard_native_history_write(repo, Some(parent))?;
+    }
+    Ok(())
+}
+
 fn drop_locked(repo: &RawRepo, mut lock: git2::Transaction<'_>, id: &str) -> Result<()> {
     let mut log = repo.reflog("refs/stash")?;
     let position = stash_position(&log, id)?;
@@ -294,6 +303,7 @@ impl Repository {
         context: &StashContext,
         selected: &[PathBuf],
         message: &str,
+        keep_index: bool,
     ) -> Result<String> {
         let repo = raw(self)?;
         let mut head_lock = repo.transaction()?;
@@ -330,13 +340,32 @@ impl Repository {
         for path in &paths {
             replace_entry(&mut staged, &current, path)?;
         }
+        let staged_tree = repo.find_tree(staged.write_tree_to(&repo)?)?;
+        let cleanup_tree = if keep_index {
+            staged_tree.clone()
+        } else {
+            tree.clone()
+        };
+        let selected_paths: Vec<_> = paths.iter().cloned().collect();
+        if paths.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == ".gitattributes")
+        }) {
+            super::worktree_conversion::guard_native_history_write(&repo, Some(cleanup_tree.id()))?;
+        } else {
+            super::worktree_conversion::guard_native_write(
+                &repo,
+                Some(cleanup_tree.id()),
+                Some(&selected_paths),
+            )?;
+        }
         let signature = author(&repo)?;
         let index_commit = repo.commit(
             None,
             &signature,
             &signature,
             "index on GitBuddy stash",
-            &repo.find_tree(staged.write_tree_to(&repo)?)?,
+            &staged_tree,
             &[&base],
         )?;
         // Associate scratch indexes with their own repository handle, never the
@@ -399,8 +428,9 @@ impl Repository {
         let temp = tempfile::NamedTempFile::new_in(repo.path())?;
         fs::copy(&index_path, temp.path())?;
         let mut cleaned = Index::open(temp.path())?;
+        let clean_source = if keep_index { &current } else { &base_index };
         for path in &paths {
-            replace_entry(&mut cleaned, &base_index, path)?;
+            replace_entry(&mut cleaned, clean_source, path)?;
         }
         cleaned.write()?;
         let cleaned_bytes = fs::read(temp.path())?;
@@ -418,15 +448,15 @@ impl Repository {
                 .update_index(false)
                 .disable_pathspec_match(true);
             for path in &paths {
-                if base_index.get_path(path, 0).is_some() {
+                if clean_source.get_path(path, 0).is_some() {
                     checkout.path(path);
                 }
             }
-            if paths.iter().any(|p| base_index.get_path(p, 0).is_some()) {
-                repo.checkout_tree(tree.as_object(), Some(&mut checkout))?;
+            if paths.iter().any(|p| clean_source.get_path(p, 0).is_some()) {
+                repo.checkout_tree(cleanup_tree.as_object(), Some(&mut checkout))?;
             }
             for path in &paths {
-                if base_index.get_path(path, 0).is_none() {
+                if clean_source.get_path(path, 0).is_none() {
                     let full = self.root.join(path);
                     match fs::remove_file(&full) {
                         Ok(()) => {}
@@ -460,6 +490,7 @@ impl Repository {
         stash_lock.lock_ref("refs/stash")?;
         self.validate_stash_context(&repo, context)?;
         let position = stash_position(&repo.reflog("refs/stash")?, id)?;
+        guard_native_stash_restore(&repo, id)?;
         let branch = if let StashAction::Branch(name) = action {
             ensure!(
                 !name.is_empty()

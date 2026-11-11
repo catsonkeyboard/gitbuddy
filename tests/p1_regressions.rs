@@ -449,9 +449,9 @@ fn malformed_lfs_conflict_pointer_does_not_modify_index_or_worktree() {
     assert!(raw(&repo).index().unwrap().has_conflicts());
 }
 
-// B07: quoted patterns cannot sneak through an indirect macro assignment.
+// B07: quoted patterns and indirect macros must stage pointers, never raw files.
 #[test]
-fn quoted_lfs_macros_fail_before_any_index_change() {
+fn quoted_lfs_macros_stage_pointers_without_changing_other_index_entries() {
     for all in [false, true] {
         let (_dir, repo) = setup();
         write(&repo, "base", "base");
@@ -462,14 +462,28 @@ fn quoted_lfs_macros_fail_before_any_index_change() {
             "[attr]bigfile filter=lfs diff=lfs merge=lfs -text\n\"my file.bin\" bigfile\n",
         );
         write(&repo, "my file.bin", "must not enter Git");
-        let before = fs::read(raw(&repo).path().join("index")).unwrap();
+        let before = raw(&repo)
+            .index()
+            .unwrap()
+            .get_path(Path::new("base"), 0)
+            .unwrap()
+            .id;
         let op = if all {
             Operation::StageAll
         } else {
             Operation::Stage(vec!["my file.bin".into()])
         };
-        assert!(repo.execute(op).unwrap_err().to_string().contains("Quoted"));
-        assert_eq!(fs::read(raw(&repo).path().join("index")).unwrap(), before);
+        repo.execute(op).unwrap();
+        let raw = raw(&repo);
+        let index = raw.index().unwrap();
+        let entry = index.get_path(Path::new("my file.bin"), 0).unwrap();
+        assert!(
+            raw.find_blob(entry.id)
+                .unwrap()
+                .content()
+                .starts_with(b"version https://git-lfs.github.com/spec/v1\n")
+        );
+        assert_eq!(index.get_path(Path::new("base"), 0).unwrap().id, before);
         assert_eq!(
             fs::read(repo.root.join("my file.bin")).unwrap(),
             b"must not enter Git"
@@ -494,7 +508,7 @@ fn unquoted_lfs_macro_still_stages_a_pointer() {
 }
 
 #[test]
-fn quoted_macros_in_index_global_and_info_attributes_cannot_bypass_guard() {
+fn quoted_macros_in_index_global_and_info_attributes_stage_pointers() {
     for source in ["index", "global", "info", "non_utf8"] {
         let (dir, repo) = setup();
         write(&repo, "base", "base");
@@ -504,7 +518,7 @@ fn quoted_macros_in_index_global_and_info_attributes_cannot_bypass_guard() {
         match source {
             "index" => {
                 fs::write(repo.root.join(".gitattributes"), rules).unwrap();
-                // External Git may have added attribute syntax we cannot interpret.
+                // Indexed rules remain available when their worktree file is absent.
                 let mut index = r.index().unwrap();
                 index.add_path(Path::new(".gitattributes")).unwrap();
                 index.write().unwrap();
@@ -529,14 +543,28 @@ fn quoted_macros_in_index_global_and_info_attributes_cannot_bypass_guard() {
             }
         }
         write(&repo, "my file.bin", "raw body");
-        let before = fs::read(r.path().join("index")).unwrap();
+        let before = r
+            .index()
+            .unwrap()
+            .get_path(Path::new("base"), 0)
+            .unwrap()
+            .id;
+        repo.execute(Operation::Stage(vec!["my file.bin".into()]))
+            .unwrap();
+        let mut index = r.index().unwrap();
+        index.read(true).unwrap();
+        let entry = index.get_path(Path::new("my file.bin"), 0).unwrap();
         assert!(
-            repo.execute(Operation::Stage(vec!["my file.bin".into()]))
-                .unwrap_err()
-                .to_string()
-                .contains("Quoted")
+            r.find_blob(entry.id)
+                .unwrap()
+                .content()
+                .starts_with(b"version https://git-lfs.github.com/spec/v1\n")
         );
-        assert_eq!(fs::read(r.path().join("index")).unwrap(), before);
+        assert_eq!(index.get_path(Path::new("base"), 0).unwrap().id, before);
+        assert_eq!(
+            fs::read(repo.root.join("my file.bin")).unwrap(),
+            b"raw body"
+        );
     }
 }
 

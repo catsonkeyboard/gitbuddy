@@ -2,6 +2,7 @@
 use super::integration::with_native_lfs;
 use super::libgit::{author, oid, raw};
 use super::recovery::head_state;
+use super::worktree_conversion::guard_native_history_write;
 use super::{HeadState, Repository};
 use anyhow::{Context, Result, bail, ensure};
 use git2::{
@@ -9,7 +10,7 @@ use git2::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     io::Write,
 };
@@ -304,6 +305,47 @@ fn clean(repo: &Raw) -> Result<()> {
     );
     Ok(())
 }
+fn step_trees(repo: &Raw, state: &State, step: &RebaseStep) -> Result<Vec<git2::Oid>> {
+    let picked = repo.find_commit(oid(&step.id)?)?;
+    let mut trees = vec![picked.tree_id()];
+    if picked.parent_count() > 0 {
+        let mainline = if picked.parent_count() == 1 || !state.graph_parents.is_empty() {
+            1
+        } else {
+            state
+                .batch_mainlines
+                .get(&step.id)
+                .copied()
+                .unwrap_or(state.batch_mainline)
+        };
+        let parent = mainline.checked_sub(1).context("Missing replay mainline")?;
+        // Revert can reintroduce rules from the selected parent even if the
+        // reverted commit and the current branch both have plain files.
+        trees.push(picked.parent(parent as usize)?.tree_id());
+    }
+    Ok(trees)
+}
+fn guard_sequence(repo: &Raw, state: &State) -> Result<()> {
+    let mut trees = BTreeSet::new();
+    for id in [&state.original, &state.onto, &state.current]
+        .into_iter()
+        .chain(state.prepared.iter())
+        .chain(state.finish_target.iter())
+    {
+        trees.insert(repo.find_commit(oid(id)?)?.tree_id());
+    }
+    for step in &state.steps[state.cursor..] {
+        if step.action != RebaseAction::Drop {
+            trees.extend(step_trees(repo, state, step)?);
+        }
+    }
+    // Check the whole plan before it writes recovery refs or detaches HEAD.
+    // An intermediate commit can require encoding even when both tips do not.
+    for tree in trees {
+        guard_native_history_write(repo, Some(tree))?;
+    }
+    Ok(())
+}
 fn checked_branch(repo: &Raw, state: &State) -> Result<()> {
     super::workspaces::branch_available(repo, &state.branch)?;
     let branch = repo.find_reference(&state.branch)?.target();
@@ -537,6 +579,7 @@ impl Repository {
             !repo.path().join("index.lock").exists(),
             "An index lock exists; verify no Git process is running before recovering. The lock was not removed"
         );
+        guard_sequence(&repo, &state)?;
         let backup = repo.path().join("gitbuddy-rebase-recovery").join(format!(
             "{}-{}",
             state.cursor,
@@ -1013,6 +1056,7 @@ impl Repository {
             finish_target: None,
             batch_mainlines: batch_mainlines.clone(),
         };
+        guard_sequence(&repo, &state)?;
         let _lock = Lock::acquire(&repo)?;
         let signature = author(&repo)?;
         // Lock both references through the initial checkout and detachment.
@@ -1058,6 +1102,7 @@ impl Repository {
         let _lock = Lock::acquire(&repo)?;
         let mut state = load(&repo)?;
         checked_branch(&repo, &state)?;
+        guard_sequence(&repo, &state)?;
         with_native_lfs(&repo, || resume(&repo, &mut state))
     }
     pub(super) fn commit_rebase(&self, message: &str) -> Result<String> {
@@ -1194,6 +1239,7 @@ impl Repository {
         refs.lock_ref(&state.branch)?;
         checked_branch(&repo, &state)?;
         let original = repo.find_commit(oid(&state.original)?)?;
+        guard_native_history_write(&repo, Some(original.tree_id()))?;
         with_native_lfs(&repo, || {
             let mut checkout = CheckoutBuilder::new();
             checkout.force();
@@ -1314,6 +1360,7 @@ fn apply_graph_step(repo: &Raw, state: &State, step: &RebaseStep) -> Result<()> 
     let picked = repo.find_commit(oid(&step.id)?)?;
     let parents = graph_targets(state, step)?;
     let first = repo.find_commit(parents[0])?;
+    guard_native_history_write(repo, Some(first.tree_id()))?;
     let mut replay = repo.cherrypick_commit(
         &picked,
         &first,
@@ -1363,6 +1410,7 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
         refs.lock_ref(&state.branch)?;
         checked_branch(repo, state)?;
         let target = repo.find_commit(oid(&state.onto)?)?;
+        guard_native_history_write(repo, Some(target.tree_id()))?;
         let mut checkout = CheckoutBuilder::new();
         checkout.safe();
         repo.checkout_tree(target.as_object(), Some(&mut checkout))?;
@@ -1402,6 +1450,9 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
                     && super::libgit::file_changes(repo)?.is_empty(),
                 "Working tree changed during rebase; review it before continuing"
             );
+            for tree in step_trees(repo, state, &step)? {
+                guard_native_history_write(repo, Some(tree))?;
+            }
             state.pending = true;
             state.applied = false;
             save(repo, state)?;
@@ -1559,6 +1610,9 @@ fn run(repo: &Raw, state: &mut State) -> Result<String> {
     } else {
         None
     };
+    if let Some(commit) = &checkout_target {
+        guard_native_history_write(repo, Some(commit.tree_id()))?;
+    }
     state.finishing = true;
     state.finish_target = Some(target.clone());
     save(repo, state)?;

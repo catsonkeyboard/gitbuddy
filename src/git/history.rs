@@ -3,7 +3,6 @@ use super::libgit::{oid, raw};
 use super::recovery::{editable, head_state, rewrite_head};
 use super::{HeadState, Repository};
 use anyhow::{Context, Result, ensure};
-use git2::build::CheckoutBuilder;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResetMode {
@@ -52,6 +51,7 @@ impl Repository {
     }
     pub(super) fn reset_history(&self, context: &ResetContext, mode: ResetMode) -> Result<String> {
         let repo = raw(self)?;
+        let mut checkout_receipt = None;
         rewrite_head(
             &repo,
             &context.head,
@@ -78,19 +78,37 @@ impl Repository {
                         index.write()?;
                     }
                     ResetMode::Hard => {
-                        super::lfs::dehydrate(&repo)?;
-                        let mut checkout = CheckoutBuilder::new();
-                        checkout.force();
-                        repo.checkout_tree(target.as_object(), Some(&mut checkout))?;
+                        checkout_receipt = Some(super::worktree_conversion::checkout_tree(
+                            &repo,
+                            target.as_object(),
+                            super::CheckoutOptions {
+                                mode: super::CheckoutMode::Force,
+                                publication: Some(super::CheckoutHead {
+                                    reference: (context.head.reference != "HEAD")
+                                        .then(|| context.head.reference.clone()),
+                                    id: target.id(),
+                                }),
+                                ..Default::default()
+                            },
+                            &super::NetworkControl::default(),
+                        )?);
                     }
                 }
                 Ok(Some(target.id()))
             },
         )?;
-        Ok(format!(
-            "{} reset to {}; original commit kept in reflog and a backup reference",
-            mode.label(),
-            &context.target[..8]
+        let missing = if let Some(receipt) = &checkout_receipt {
+            super::worktree_conversion::acknowledge_checkout(&repo, receipt)?
+        } else {
+            0
+        };
+        Ok(super::libgit::checkout_notice(
+            format!(
+                "{} reset to {}; original commit kept in reflog and a backup reference",
+                mode.label(),
+                &context.target[..8]
+            ),
+            missing,
         ))
     }
     pub(super) fn create_branch_at(&self, name: &str, target: &str) -> Result<String> {

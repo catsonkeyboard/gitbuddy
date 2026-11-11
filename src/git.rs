@@ -83,12 +83,13 @@ pub struct Snapshot {
     pub rebase_editing: bool,
     pub squash_pending: bool,
     pub patch_recovery: bool,
+    pub worktree_recovery: bool,
     pub squash_message: Option<String>,
 }
 impl Snapshot {
     /// Shared eligibility for the button, keyboard action and backend entry.
     pub fn can_commit(&self) -> bool {
-        if self.squash_pending || self.patch_recovery {
+        if self.squash_pending || self.patch_recovery || self.worktree_recovery {
             return false;
         }
         Self::commit_allowed(
@@ -123,6 +124,12 @@ pub enum Operation {
     },
     CommitRebase(String),
     AbortRebase,
+    ContinueWorktreeCheckout {
+        expected: String,
+    },
+    AbortWorktreeCheckout {
+        expected: String,
+    },
     CreateWorktree {
         name: String,
         path: PathBuf,
@@ -150,6 +157,7 @@ pub enum Operation {
         track: bool,
     },
     LfsCheckout,
+    SetLfsAutoFetch(bool),
     LfsFetch(String),
     LfsPush(String),
     LfsLock {
@@ -179,6 +187,10 @@ pub enum Operation {
     ResolveConflict {
         context: std::sync::Arc<ConflictContext>,
         resolution: ConflictResolution,
+    },
+    ResolveRenameConflict {
+        context: std::sync::Arc<RenameConflict>,
+        ours: bool,
     },
     ContinueConflict(std::sync::Arc<ConflictSession>),
     StageAll,
@@ -252,6 +264,11 @@ pub enum Operation {
     ApplyStash(String),
     DropStash(String),
     SaveStash {
+        context: std::sync::Arc<StashContext>,
+        paths: Vec<PathBuf>,
+        message: String,
+    },
+    SaveStashKeepingIndex {
         context: std::sync::Arc<StashContext>,
         paths: Vec<PathBuf>,
         message: String,
@@ -352,6 +369,7 @@ pub use inspect::{
     BlameLine, BlameView, Comparison, FileHistory, FileHistoryEntry, Revision, TreeFiles,
 };
 mod commit_policy;
+mod conversion;
 mod external_editor;
 pub use external_editor::ExternalEditor;
 mod patch_file;
@@ -370,7 +388,7 @@ pub use conflict_blocks::{BlockChoice, ConflictBlock, choose_conflict_block, con
 mod merge_tool;
 pub use conflicts::{
     ConflictContext, ConflictFile, ConflictOperation, ConflictResolution, ConflictSession,
-    ConflictSide, has_conflict_markers,
+    ConflictSide, RenameConflict, has_conflict_markers,
 };
 pub use merge_tool::MergeTool;
 
@@ -400,6 +418,11 @@ pub use lfs::{LfsFile, LfsStatus};
 #[path = "git/lfs_maintenance.rs"]
 mod lfs_maintenance;
 pub use lfs_maintenance::{LfsLock, LfsLockOwner, LfsLocks, LfsMaintenance};
+#[path = "git/worktree_conversion.rs"]
+pub(in crate::git) mod worktree_conversion;
+pub use worktree_conversion::{
+    CheckoutHead, CheckoutMode, CheckoutOptions, CheckoutReceipt, WorktreeRecoveryStatus,
+};
 
 impl Operation {
     pub fn is_cancellable(&self) -> bool {
@@ -433,6 +456,8 @@ impl Operation {
         match self {
             Self::ApplyPatch(_) => "Apply patch",
             Self::RecoverPatch => "Recover interrupted patch",
+            Self::ContinueWorktreeCheckout { .. } => "Continue interrupted checkout",
+            Self::AbortWorktreeCheckout { .. } => "Restore interrupted checkout",
             Self::CommitEmpty(_) => "Create empty commit",
             Self::Fetch => "Fetch",
             Self::CreateTag(plan) => match plan.kind() {

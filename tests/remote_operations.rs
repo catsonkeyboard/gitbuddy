@@ -1049,3 +1049,359 @@ fn github_https_private_authenticated_refs_smoke() {
             .is_ok()
     );
 }
+
+#[test]
+#[ignore = "writes and deletes unique QA references; requires GITBUDDY_TEST_WRITE_REMOTE"]
+fn github_https_push_lease_tags_and_cleanup_smoke() -> anyhow::Result<()> {
+    use gitbuddy::git::PushSelection;
+    let url = std::env::var("GITBUDDY_TEST_WRITE_REMOTE")?;
+    anyhow::ensure!(
+        url == "https://github.com/catsonkeyboard/gitbuddy.git",
+        "Use the dedicated project test endpoint"
+    );
+    let dir = tempfile::tempdir()?;
+    let repo = Repository::init(dir.path())?;
+    let r = raw(&repo);
+    let mut cfg = r.config()?;
+    cfg.set_str(
+        "credential.https://github.com.helper",
+        "!gh auth git-credential",
+    )?;
+    cfg.set_str("core.hooksPath", "/dev/null")?;
+    cfg.set_bool("commit.gpgsign", false)?;
+    repo.execute(Operation::SetIdentity(
+        "catsonkeyboard".into(),
+        "124647734+catsonkeyboard@users.noreply.github.com".into(),
+    ))?;
+    r.remote("origin", &url)?;
+    let name = format!(
+        "codex/gitbuddy-qa-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let tag = name.replace('/', "-");
+    let first = commit(&repo, "fixture", "GitBuddy isolated remote QA\n");
+    let origin = repo.remote_info()?.remove(0);
+    let selection = |lease| PushSelection {
+        remote: "origin".into(),
+        branch: Some("main".into()),
+        target: name.clone(),
+        force_with_lease: lease,
+        ..Default::default()
+    };
+    let result = (|| -> anyhow::Result<()> {
+        repo.execute(Operation::PushTo(Arc::new(
+            repo.prepare_push(selection(true))?,
+        )))?;
+        repo.execute(Operation::FetchFrom(Arc::new(
+            repo.prepare_fetch(&origin, Some(&name))?,
+        )))?;
+        commit(&repo, "fixture", "Updated QA content\n");
+        let stale = repo.prepare_push(selection(true))?;
+        repo.execute(Operation::PushTo(Arc::new(
+            repo.prepare_push(selection(false))?,
+        )))?;
+        anyhow::ensure!(
+            repo.execute(Operation::PushTo(Arc::new(stale))).is_err(),
+            "Stale lease was accepted"
+        );
+        repo.execute(Operation::FetchFrom(Arc::new(
+            repo.prepare_fetch(&origin, Some(&name))?,
+        )))?;
+        r.reset(
+            &r.find_object(first.parse()?, None)?,
+            git2::ResetType::Hard,
+            None,
+        )?;
+        repo.execute(Operation::PushTo(Arc::new(
+            repo.prepare_push(selection(true))?,
+        )))?;
+        let refs = repo.remote_refs(&origin, control())?;
+        anyhow::ensure!(
+            refs.branches
+                .iter()
+                .any(|b| b.name == name && b.id == first),
+            "Lease push result differs"
+        );
+        r.tag_lightweight(&tag, &r.find_object(first.parse()?, None)?, false)?;
+        repo.execute(Operation::PushTo(Arc::new(repo.prepare_push(
+            PushSelection {
+                remote: "origin".into(),
+                tags: vec![tag.clone()],
+                ..Default::default()
+            },
+        )?)))?;
+        anyhow::ensure!(
+            repo.remote_refs(&origin, control())?
+                .tags
+                .iter()
+                .any(|t| t.name == tag),
+            "Tag push missing"
+        );
+        Ok(())
+    })();
+    // Query exact current IDs before deleting only this run's references.
+    let refs = repo.remote_refs(&origin, control())?;
+    if refs.tags.iter().any(|t| t.name == tag) {
+        repo.execute(Operation::DeleteRemoteTag(Arc::new(
+            repo.prepare_remote_tag_delete(&refs, &tag)?,
+        )))?;
+    }
+    if refs.branches.iter().any(|b| b.name == name) {
+        repo.execute(Operation::FetchFrom(Arc::new(
+            repo.prepare_fetch(&origin, Some(&name))?,
+        )))?;
+        repo.execute(Operation::DeleteRemoteBranch(Arc::new(
+            repo.prepare_remote_branch_delete(&format!("origin/{name}"))?,
+        )))?;
+    }
+    let refs = repo.remote_refs(&origin, control())?;
+    anyhow::ensure!(
+        !refs.branches.iter().any(|b| b.name == name) && !refs.tags.iter().any(|t| t.name == tag),
+        "QA references were not cleaned up"
+    );
+    result
+}
+
+#[test]
+#[ignore = "uploads a tiny LFS fixture and creates/removes its own lock; needs official git-lfs and GITBUDDY_TEST_WRITE_REMOTE"]
+fn github_lfs_transfer_and_lock_smoke() -> anyhow::Result<()> {
+    let url = std::env::var("GITBUDDY_TEST_WRITE_REMOTE")?;
+    anyhow::ensure!(
+        url == "https://github.com/catsonkeyboard/gitbuddy.git",
+        "Use the dedicated endpoint"
+    );
+    let dir = tempfile::tempdir()?;
+    let repo = Repository::init(dir.path())?;
+    let r = raw(&repo);
+    let mut cfg = r.config()?;
+    cfg.set_str(
+        "credential.https://github.com.helper",
+        "!gh auth git-credential",
+    )?;
+    cfg.set_str("core.hooksPath", "/dev/null")?;
+    cfg.set_bool("commit.gpgsign", false)?;
+    repo.execute(Operation::SetIdentity(
+        "catsonkeyboard".into(),
+        "124647734+catsonkeyboard@users.noreply.github.com".into(),
+    ))?;
+    r.remote("origin", &url)?;
+    repo.execute(Operation::LfsTrack {
+        pattern: "*.bin".into(),
+        track: true,
+    })?;
+    let path = format!(
+        "gitbuddy-qa-{}.bin",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    fs::write(
+        repo.root.join(&path),
+        b"GitBuddy isolated LFS network fixture\n",
+    )?;
+    repo.execute(Operation::StageAll)?;
+    repo.execute(Operation::Commit("Isolated LFS network QA".into()))?;
+    repo.execute(Operation::LfsPush("origin".into()))?;
+    let file = repo
+        .lfs_status()?
+        .files
+        .into_iter()
+        .find(|f| f.path == std::path::Path::new(&path))
+        .unwrap();
+    let object = r
+        .commondir()
+        .join("lfs/objects")
+        .join(&file.oid[..2])
+        .join(&file.oid[2..4])
+        .join(&file.oid);
+    let backup = dir.path().join("cached-backup");
+    fs::rename(&object, &backup)?;
+    repo.execute(Operation::LfsFetch("origin".into()))?;
+    anyhow::ensure!(
+        fs::read(&object)? == fs::read(&backup)?,
+        "Downloaded LFS object differs"
+    );
+    let result = repo.execute(Operation::LfsLock {
+        remote: "origin".into(),
+        path: path.clone().into(),
+    });
+    let locks = repo.lfs_locks("origin", control())?;
+    if let Some(lock) = locks.ours.into_iter().find(|l| l.path == path) {
+        repo.execute(Operation::LfsUnlock {
+            remote: "origin".into(),
+            lock,
+            force: false,
+        })?;
+    }
+    result?;
+    anyhow::ensure!(
+        !repo
+            .lfs_locks("origin", control())?
+            .ours
+            .iter()
+            .any(|l| l.path == path),
+        "QA lock was not cleaned up"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_fetch_can_automatically_download_lfs_for_the_actual_fetched_commit() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let id = f.publish("topic", "new", "new remote content");
+    let program = f.dir.path().join("fake-lfs");
+    fs::write(&program,"#!/bin/sh\nif [ \"$1\" = version ]; then echo 'git-lfs/test'; exit 0; fi\n[ \"$1\" = fetch ] || exit 9\nprintf '%s\\n' \"$@\" > auto-lfs-args\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let r = raw(&f.client);
+    let mut cfg = r.config().unwrap();
+    cfg.set_bool("gitbuddy.lfsAutoFetch", true).unwrap();
+    cfg.set_str("gitbuddy.lfsProgram", program.to_str().unwrap())
+        .unwrap();
+    f.fetch(Some("topic")).unwrap();
+    assert_eq!(
+        fs::read_to_string(f.client.root.join("auto-lfs-args")).unwrap(),
+        format!("fetch\norigin\n{id}\n")
+    );
+    assert_eq!(
+        r.find_reference("refs/remotes/origin/topic")
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string(),
+        id
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_lfs_failure_reports_that_git_refs_were_already_fetched() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let id = f.publish("topic", "new", "new");
+    let program = f.dir.path().join("fail-lfs");
+    fs::write(
+        &program,
+        "#!/bin/sh\necho deliberate-LFS-failure >&2\nexit 7\n",
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let r = raw(&f.client);
+    let mut cfg = r.config().unwrap();
+    cfg.set_bool("gitbuddy.lfsAutoFetch", true).unwrap();
+    cfg.set_str("gitbuddy.lfsProgram", program.to_str().unwrap())
+        .unwrap();
+    let error = f.fetch(Some("topic")).unwrap_err();
+    assert!(format!("{error:#}").contains("Git refs were fetched"));
+    assert!(format!("{error:#}").contains("deliberate-LFS-failure"));
+    assert_eq!(
+        r.find_reference("refs/remotes/origin/topic")
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string(),
+        id
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_lfs_network_phase_can_be_cancelled_after_git_ref_update() {
+    let f = Fixture::new();
+    let id = f.publish("topic", "new", "new");
+    let r = raw(&f.client);
+    r.config()
+        .unwrap()
+        .set_bool("gitbuddy.lfsAutoFetch", true)
+        .unwrap();
+    let token = CancellationToken::default();
+    let requested = token.clone();
+    let sink: gitbuddy::git::ProgressSink = Arc::new(Mutex::new(move |text: &str| {
+        if text.starts_with("LFS:") {
+            assert!(requested.cancel());
+        }
+    }));
+    let plan = f.client.prepare_fetch(&f.info(), Some("topic")).unwrap();
+    let error = f
+        .client
+        .execute_with_control(
+            Operation::FetchFrom(Arc::new(plan)),
+            NetworkControl::new(Some(sink), token),
+        )
+        .unwrap_err();
+    assert!(is_cancelled(&error));
+    assert_eq!(
+        r.find_reference("refs/remotes/origin/topic")
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string(),
+        id
+    );
+}
+
+#[test]
+#[ignore = "internal child fixture; launched by clone_can_download_lfs_after_installation"]
+fn clone_auto_lfs_internal_child() {
+    let config = std::env::var_os("GITBUDDY_CLONE_QA_CONFIG").unwrap();
+    // This test process owns libgit2's global configuration search path.
+    unsafe {
+        git2::opts::set_search_path(
+            git2::ConfigLevel::Global,
+            std::path::Path::new(&config).parent().unwrap(),
+        )
+        .unwrap();
+    }
+    let source = std::env::var("GITBUDDY_CLONE_QA_SOURCE").unwrap();
+    let destination = std::env::var("GITBUDDY_CLONE_QA_DEST").unwrap();
+    let repo = Repository::clone_repo(&source, std::path::Path::new(&destination)).unwrap();
+    let raw = raw(&repo);
+    assert!(
+        raw.config()
+            .unwrap()
+            .get_bool("gitbuddy.lfsAutoFetch")
+            .unwrap(),
+        "Clone did not inherit automatic LFS configuration"
+    );
+    assert!(raw.head().is_ok(), "Cloned HEAD is missing");
+}
+
+#[cfg(unix)]
+#[test]
+fn clone_can_download_lfs_after_installation() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let program = f.dir.path().join("clone-lfs");
+    fs::write(
+        &program,
+        "#!/bin/sh\n[ \"$1\" = fetch ] || exit 9\nprintf '%s\\n' \"$@\" > clone-lfs-args\n",
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = f.dir.path().join(".gitconfig");
+    fs::write(&config, "").unwrap();
+    let mut cfg = git2::Config::open(&config).unwrap();
+    cfg.set_bool("gitbuddy.lfsAutoFetch", true).unwrap();
+    cfg.set_str("gitbuddy.lfsProgram", program.to_str().unwrap())
+        .unwrap();
+    let destination = f.dir.path().join("auto-clone");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "clone_auto_lfs_internal_child", "--ignored"])
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GITBUDDY_CLONE_QA_CONFIG", &config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GITBUDDY_CLONE_QA_SOURCE", &f.source.root)
+        .env("GITBUDDY_CLONE_QA_DEST", &destination)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("clone-lfs-args")).unwrap(),
+        format!("fetch\norigin\n{}\n", f.base)
+    );
+    assert!(destination.join(".git").is_dir());
+}

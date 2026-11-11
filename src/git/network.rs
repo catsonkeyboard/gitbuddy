@@ -33,6 +33,12 @@ impl CancellationToken {
     pub fn is_finishing(&self) -> bool {
         self.0.load(Ordering::Acquire) == FINISHING
     }
+    pub(super) fn next_network_phase(&self) -> anyhow::Result<()> {
+        let _ = self
+            .0
+            .compare_exchange(FINISHING, RUNNING, Ordering::AcqRel, Ordering::Acquire);
+        self.check()
+    }
     pub(super) fn check(&self) -> anyhow::Result<()> {
         if self.is_requested() {
             Err(Cancelled.into())

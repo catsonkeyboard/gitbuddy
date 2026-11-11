@@ -561,3 +561,27 @@ fn saved_index_change_with_worktree_back_at_head_round_trips() {
     assert_eq!(text(&repo, "a"), "base a\n");
     assert_eq!(index_text(&repo, "a").unwrap(), "staged change\n");
 }
+
+#[test]
+fn keep_index_stash_preserves_staged_content_and_unselected_work() {
+    let (_dir, repo) = setup();
+    write(&repo, "a", "staged a\n");
+    repo.execute(Operation::Stage(vec!["a".into()])).unwrap();
+    write(&repo, "a", "unstaged a\n");
+    write(&repo, "b", "unselected b\n");
+    write(&repo, "new", "untracked\n");
+    let context = Arc::new(repo.stash_context().unwrap());
+    repo.execute(Operation::SaveStashKeepingIndex {
+        context,
+        paths: vec!["a".into(), "new".into()],
+        message: "keep index".into(),
+    })
+    .unwrap();
+    assert_eq!(index_text(&repo, "a").unwrap(), "staged a\n");
+    assert_eq!(text(&repo, "a"), "staged a\n");
+    assert_eq!(text(&repo, "b"), "unselected b\n");
+    assert!(!repo.root.join("new").exists());
+    let id = repo.snapshot(1).unwrap().stashes[0].0.clone();
+    let preview = repo.stash_preview(&id).unwrap();
+    assert!(preview.sections.iter().any(|s| !s.files.is_empty()));
+}

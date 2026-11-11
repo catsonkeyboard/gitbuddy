@@ -36,7 +36,7 @@ fn history(repo: &Repository) -> (String, String, String) {
 }
 
 #[test]
-fn unsupported_lfs_pointer_is_not_staged_as_another_lfs_object() {
+fn malformed_lfs_extension_pointer_is_not_staged_as_another_lfs_object() {
     let (_dir, repo) = setup();
     write(&repo, "base", "base");
     commit(&repo, "base");
@@ -48,7 +48,7 @@ fn unsupported_lfs_pointer_is_not_staged_as_another_lfs_object() {
     repo.execute(Operation::StageAll).unwrap();
     let before = std::fs::read(raw(&repo).path().join("index")).unwrap();
     let extension = format!(
-        "version https://git-lfs.github.com/spec/v1\next-0-test sha256:{}\noid sha256:{}\nsize 12\n",
+        "version https://git-lfs.github.com/spec/v1\next-0-test sha1:{}\noid sha256:{}\nsize 12\n",
         "a".repeat(64),
         "b".repeat(64)
     );
@@ -491,20 +491,30 @@ fn lfs_globs_match_spaced_paths_and_untrack_without_touching_history() {
             .unwrap()
             .contains("filter=lfs")
     );
-    assert!(
-        repo.execute(Operation::LfsTrack {
-            pattern: "*.bin\n*.txt".into(),
-            track: true
-        })
-        .is_err()
-    );
-    assert!(
-        repo.execute(Operation::LfsTrack {
-            pattern: "my file.bin".into(),
-            track: true
-        })
-        .is_err()
-    );
+    let attributes = std::fs::read(repo.root.join(".gitattributes")).unwrap();
+    let index = std::fs::read(raw(&repo).path().join("index")).unwrap();
+    for pattern in ["!*.bin", "[attr]large", "contains\0nul"] {
+        assert!(
+            repo.execute(Operation::LfsTrack {
+                pattern: pattern.into(),
+                track: true
+            })
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(repo.root.join(".gitattributes")).unwrap(),
+            attributes
+        );
+        assert_eq!(
+            std::fs::read(raw(&repo).path().join("index")).unwrap(),
+            index
+        );
+        assert_eq!(head(&repo), before);
+        assert_eq!(
+            std::fs::read(repo.root.join("my file.bin")).unwrap(),
+            b"content"
+        );
+    }
 }
 #[test]
 fn lfs_corrupt_object_never_overwrites_pointer() {
@@ -638,27 +648,38 @@ fn lfs_rebase_and_discard_keep_files_materialized() {
     );
 }
 #[test]
-fn quoted_lfs_rules_refuse_staging_without_modifying_index() {
+fn quoted_lfs_rules_stage_pointer_without_modifying_other_index_entries() {
     let (_dir, repo) = setup();
     write(&repo, "base", "base");
     commit(&repo, "base");
     let r = raw(&repo);
-    let before = std::fs::read(r.index().unwrap().path().unwrap()).unwrap();
+    let before = r
+        .index()
+        .unwrap()
+        .get_path(Path::new("base"), 0)
+        .unwrap()
+        .id;
     write(
         &repo,
         ".gitattributes",
         "\"my file.bin\" filter=lfs diff=lfs merge=lfs -text\n",
     );
     write(&repo, "my file.bin", "raw content");
+    repo.execute(Operation::Stage(vec!["my file.bin".into()]))
+        .unwrap();
+    let mut index = r.index().unwrap();
+    index.read(true).unwrap();
+    let entry = index.get_path(Path::new("my file.bin"), 0).unwrap();
     assert!(
-        repo.execute(Operation::Stage(vec!["my file.bin".into()]))
-            .unwrap_err()
-            .to_string()
-            .contains("Quoted")
+        r.find_blob(entry.id)
+            .unwrap()
+            .content()
+            .starts_with(b"version https://git-lfs.github.com/spec/v1\n")
     );
+    assert_eq!(index.get_path(Path::new("base"), 0).unwrap().id, before);
     assert_eq!(
-        std::fs::read(r.index().unwrap().path().unwrap()).unwrap(),
-        before
+        std::fs::read(repo.root.join("my file.bin")).unwrap(),
+        b"raw content"
     );
 }
 #[test]
@@ -726,4 +747,47 @@ fn lfs_stash_requires_staging_and_hydrates_restored_working_files() {
         std::fs::read_to_string(repo.root.join("new.bin")).unwrap(),
         "new"
     );
+}
+
+#[test]
+fn custom_lfs_storage_supports_relative_and_absolute_paths() {
+    for absolute in [false, true] {
+        let (dir, repo) = setup();
+        history(&repo);
+        let custom = dir.path().join("custom-lfs");
+        let value = if absolute {
+            custom.to_str().unwrap()
+        } else {
+            "relative-lfs"
+        };
+        let r = raw(&repo);
+        r.config().unwrap().set_str("lfs.storage", value).unwrap();
+        repo.execute(Operation::LfsTrack {
+            pattern: "*.bin".into(),
+            track: true,
+        })
+        .unwrap();
+        write(&repo, "custom.bin", "custom object bytes");
+        repo.execute(Operation::StageAll).unwrap();
+        let status = repo.lfs_status().unwrap();
+        let file = status
+            .files
+            .iter()
+            .find(|f| f.path == std::path::Path::new("custom.bin"))
+            .unwrap();
+        assert!(file.available);
+        let root = if absolute {
+            custom
+        } else {
+            r.commondir().join("relative-lfs")
+        };
+        assert!(
+            root.join("objects")
+                .join(&file.oid[..2])
+                .join(&file.oid[2..4])
+                .join(&file.oid)
+                .is_file()
+        );
+        assert!(!r.commondir().join("lfs/objects").exists());
+    }
 }

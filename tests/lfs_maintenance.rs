@@ -231,12 +231,12 @@ fn symlinked_quarantine_is_not_followed_or_written() {
     assert_eq!(fs::read_dir(external).unwrap().count(), 0);
 }
 #[test]
-fn unsupported_pointer_in_history_blocks_pruning_instead_of_hiding_its_object() {
+fn malformed_pointer_in_history_blocks_pruning_instead_of_hiding_its_object() {
     let (_dir, repo) = setup();
     let oid = orphan(&repo, "orphan");
     let raw = git2::Repository::open(&repo.root).unwrap();
     let text = format!(
-        "version https://git-lfs.github.com/spec/v1\next-0-test sha256:{}\noid sha256:{oid}\nsize 6\n",
+        "version https://git-lfs.github.com/spec/v1\next-0-test sha1:{}\noid sha256:{oid}\nsize 6\n",
         "1".repeat(64)
     );
     fs::write(repo.root.join("extension.bin"), text).unwrap();

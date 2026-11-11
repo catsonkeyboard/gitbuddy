@@ -130,17 +130,16 @@ fn partial_discard_selected_lines_rejects_untracked_and_changed_files() {
     );
     write(&repo, "new.txt", "new\n");
     let new = patch(&repo, "new.txt", false);
-    assert!(
-        repo.execute(Operation::DiscardPartial {
-            patch: new.partial.clone().unwrap(),
-            selection: PatchSelection::Lines(changed_rows(&new))
-        })
-        .is_err()
-    );
+    repo.execute(Operation::DiscardPartial {
+        patch: new.partial.clone().unwrap(),
+        selection: PatchSelection::Lines(changed_rows(&new)),
+    })
+    .unwrap();
     assert_eq!(
         std::fs::read_to_string(repo.root.join("new.txt")).unwrap(),
-        "new\n"
+        ""
     );
+    assert!(index_content(&repo, "new.txt").is_none());
 }
 
 #[cfg(target_os = "macos")]

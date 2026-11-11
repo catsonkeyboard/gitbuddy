@@ -3,7 +3,7 @@ use super::libgit::{oid, raw};
 use super::recovery::{editable, head_state};
 use super::{HeadState, Repository};
 use anyhow::{Context, Result, ensure};
-use git2::{BranchType, Oid, build::CheckoutBuilder};
+use git2::{BranchType, Oid};
 use std::{io::Write, path::PathBuf};
 
 struct ConfigLock {
@@ -363,31 +363,28 @@ impl Repository {
             None,
             &format!("checkout: moving to {} (detached)", expected.label),
         )?;
-        // Manage LFS inside this operation: stale checks must precede dehydrate.
-        let result = (|| {
-            super::lfs::dehydrate(&repo)?;
-            repo.checkout_tree(
-                commit.as_object(),
-                Some(CheckoutBuilder::new().safe().dry_run()),
-            )?;
-            repo.reference_ensure_log("HEAD")?;
-            repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe()))?;
-            transaction.commit()?;
-            anyhow::Ok(())
-        })();
-        let hydrated = super::lfs::hydrate(&repo);
-        result?;
-        let missing =
-            hydrated.context("HEAD detached, but LFS checkout failed; inspect the working tree")?;
-        Ok(format!(
-            "Detached HEAD at {} · {}{}",
-            &expected.id[..8],
-            expected.label,
-            if missing > 0 {
-                format!("; {missing} LFS objects missing (use LFS Fetch)")
-            } else {
-                String::new()
-            }
+        let receipt = super::worktree_conversion::checkout_tree(
+            &repo,
+            commit.as_object(),
+            super::CheckoutOptions {
+                publication: Some(super::CheckoutHead {
+                    reference: None,
+                    id: commit.id(),
+                }),
+                ..Default::default()
+            },
+            &super::NetworkControl::default(),
+        )?;
+        repo.reference_ensure_log("HEAD")?;
+        transaction.commit()?;
+        let missing = super::worktree_conversion::acknowledge_checkout(&repo, &receipt)?;
+        Ok(super::libgit::checkout_notice(
+            format!(
+                "Detached HEAD at {} · {}",
+                &expected.id[..8],
+                expected.label
+            ),
+            missing,
         ))
     }
 }

@@ -671,3 +671,66 @@ fn rename_rename_conflicts_can_be_resolved_per_path_without_worktree_changes() {
     assert_eq!(std::fs::read(repo.root.join("ours")).unwrap(), before_ours);
     assert_eq!(std::fs::read(repo.root.join("theirs")).ok(), before_theirs);
 }
+
+#[test]
+fn rename_group_resolution_is_atomic_and_rejects_stale_index() {
+    for ours in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.execute(Operation::SetIdentity(
+            "Test".into(),
+            "test@example.invalid".into(),
+        ))
+        .unwrap();
+        std::fs::write(repo.root.join("old"), "rename content\n").unwrap();
+        commit(&repo, "base");
+        repo.execute(Operation::CreateBranch("feature".into()))
+            .unwrap();
+        std::fs::rename(repo.root.join("old"), repo.root.join("theirs")).unwrap();
+        commit(&repo, "rename theirs");
+        repo.execute(Operation::Checkout("main".into())).unwrap();
+        std::fs::rename(repo.root.join("old"), repo.root.join("ours")).unwrap();
+        commit(&repo, "rename ours");
+        let _ = repo.execute(Operation::Merge("feature".into()));
+        if !ours {
+            let r = git2::Repository::open(&repo.root).unwrap();
+            let mut index = r.index().unwrap();
+            index.set_version(4).unwrap();
+            index.write().unwrap();
+        }
+        let session = repo.conflict_session().unwrap();
+        assert_eq!(session.renames.len(), 1);
+        let group = session.renames[0].clone();
+        std::fs::write(repo.root.join("unrelated"), "keep").unwrap();
+        repo.execute(Operation::Stage(vec!["unrelated".into()]))
+            .unwrap();
+        assert!(
+            repo.execute(Operation::ResolveRenameConflict {
+                context: group,
+                ours
+            })
+            .is_err()
+        );
+        let group = repo.conflict_session().unwrap().renames[0].clone();
+        repo.execute(Operation::ResolveRenameConflict {
+            context: group,
+            ours,
+        })
+        .unwrap();
+        assert!(repo.conflict_session().unwrap().files.is_empty());
+        let r = git2::Repository::open(&repo.root).unwrap();
+        let index = r.index().unwrap();
+        assert!(
+            index
+                .get_path(Path::new(if ours { "ours" } else { "theirs" }), 0)
+                .is_some()
+        );
+        assert!(
+            index
+                .get_path(Path::new(if ours { "theirs" } else { "ours" }), 0)
+                .is_none()
+        );
+        assert!(index.get_path(Path::new("unrelated"), 0).is_some());
+        assert!(repo.root.join("ours").exists() && repo.root.join("theirs").exists());
+    }
+}

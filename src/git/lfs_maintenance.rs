@@ -152,6 +152,13 @@ impl Repository {
     }
     fn inspect_lfs_cache(&self, control: NetworkControl) -> Result<LfsMaintenance> {
         let repo = raw(self)?;
+        match repo.config()?.get_entry("lfs.storage") {
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => anyhow::bail!(
+                "Maintenance of custom lfs.storage is disabled because other repositories may share that cache; use the official tool after auditing all owners"
+            ),
+        }
         let objects = storage(&repo)?;
         let roots = repositories(&repo)?;
         let mut protected = BTreeSet::new();

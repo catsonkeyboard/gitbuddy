@@ -43,6 +43,17 @@ fn executable_hook(repo: &RawRepo, name: &str) -> Result<Option<std::path::PathB
     Ok(Some(path))
 }
 
+/// A commit prepared before its index is installed cannot run these hooks
+/// against the reviewed index and worktree, as a normal merge does.
+pub(super) fn active_merge_hook(repo: &RawRepo) -> Result<Option<&'static str>> {
+    for name in ["pre-merge-commit", "prepare-commit-msg", "commit-msg"] {
+        if executable_hook(repo, name)?.is_some() {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 fn run_hook(repo: &RawRepo, name: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
     run_hook_input(repo, name, args, b"", &NetworkControl::default())
 }
